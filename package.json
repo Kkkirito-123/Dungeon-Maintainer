@@ -1,0 +1,33 @@
+{
+  "name": "dungeon-maintainer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "基于 Pi Core 的受限代码维护 Agent 与 SQL Dungeon 适配器",
+  "engines": {
+    "node": ">=22.19"
+  },
+  "packageManager": "pnpm@11.9.0",
+  "bin": {
+    "dungeon-maintain": "dist/src/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "test": "pnpm build && node --test \"dist/tests/*.test.js\"",
+    "check": "pnpm lint && pnpm typecheck && pnpm test"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.84.1",
+    "@earendil-works/pi-ai": "0.84.1",
+    "playwright": "1.62.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.2",
+    "@types/node": "26.2.0",
+    "eslint": "9.39.2",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.67.0"
+  }
+}

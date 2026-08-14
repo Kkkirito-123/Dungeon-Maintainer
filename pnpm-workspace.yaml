@@ -1,0 +1,7 @@
+packages:
+  - .
+
+# 维护器只注册 OpenAI 兼容 provider；这些可选传递依赖的构建脚本既不需要也不放行。
+allowBuilds:
+  "@google/genai": false
+  protobufjs: false
