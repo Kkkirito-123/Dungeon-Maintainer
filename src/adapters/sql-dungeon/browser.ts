@@ -14,6 +14,7 @@ import { createServer } from "node:net";
 import { join } from "node:path";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { redactText } from "../../safety/redact.js";
+import type { HarnessEvent } from "../../harness/events.js";
 
 /** 浏览器、开发服务器或桥无法完成请求。 */
 export class BrowserError extends Error {}
@@ -39,6 +40,29 @@ export interface BrowserResult { ok: boolean; event: string; steps: number; view
 export interface PlayJudge {
   floor: number; mode: string; lessons: number; requiredLessons: number;
   bossDefeated: boolean; migrationSteps: number; migrationComplete: boolean; advanced: boolean;
+}
+
+/** Dashboard 命令是否被本地控制器接受。 */
+export interface CommandAck {
+  schemaVersion: 1;
+  accepted: boolean;
+  reason: "started" | "busy" | "closed" | "invalid_state";
+}
+
+/** 三个网页按钮绑定的无参数处理器。 */
+export interface DashboardBindings {
+  diagnose(): Promise<CommandAck>;
+  fix(): Promise<CommandAck>;
+  apply(): Promise<CommandAck>;
+}
+
+/** 隐藏健康裁判使用的有限运行状态，不含页面正文或游戏快照。 */
+export interface BrowserHealth {
+  bridge: boolean;
+  runtime: boolean;
+  errors: number;
+  floor: number;
+  mode: string;
 }
 
 async function freePort(): Promise<number> {
@@ -113,7 +137,10 @@ export class GameBrowser {
   private browser: Browser | null = null;
   private context: BrowserContext | null = null;
   private page: Page | null = null;
+  private floor: number | null = null;
+  private checkpointView: PlayView | null = null;
   private readonly console: string[] = [];
+  private errors = 0;
 
   constructor(private readonly baseUrl: string, private readonly headed: boolean, private readonly output: string) {}
 
@@ -124,8 +151,25 @@ export class GameBrowser {
     this.context = await this.browser.newContext({ reducedMotion: "reduce", viewport: { width: 1440, height: 900 } });
     this.page = await this.context.newPage();
     this.page.setDefaultTimeout(15_000);
-    this.page.on("console", (message) => this.log(`CONSOLE ${message.type()}: ${message.text()}`));
-    this.page.on("pageerror", (error) => this.log(`PAGE ERROR: ${error.name}`));
+    this.page.on("console", (message) => {
+      if (message.type() === "error") this.errors += 1;
+      this.log(`CONSOLE ${message.type()}: ${message.text()}`);
+    });
+    this.page.on("pageerror", (error) => {
+      this.errors += 1;
+      this.log(`PAGE ERROR: ${error.name}`);
+    });
+  }
+
+  /**
+   * 在页面导航前注册三个无参数 Dashboard binding。
+   * @param bindings 只闭包持有当前任务，不接受网页传入路径、Prompt、SQL 或命令。
+   */
+  async bindDashboard(bindings: DashboardBindings): Promise<void> {
+    const page = this.needPage();
+    await page.exposeBinding("__DUNGEON_QUICK_CHECK__", async () => await bindings.diagnose());
+    await page.exposeBinding("__DUNGEON_QUICK_FIX__", async () => await bindings.fix());
+    await page.exposeBinding("__DUNGEON_APPLY_FIX__", async () => await bindings.apply());
   }
 
   /** 关闭并写入脱敏控制台。 */
@@ -147,10 +191,63 @@ export class GameBrowser {
   /** 打开一个隔离楼层并等待正式 UI 与 v2 桥。 */
   async openFloor(floor: number): Promise<PlayView> {
     const page = this.needPage();
+    this.floor = floor;
     await page.goto(`${this.baseUrl}/?playtest=agent&floor=${String(floor)}`, { waitUntil: "domcontentloaded" });
     await page.waitForFunction(() => (window as unknown as { __DUNGEON_PLAYTEST__?: { version: number } }).__DUNGEON_PLAYTEST__?.version === 2);
     await page.waitForFunction(() => document.querySelector("#app")?.getAttribute("data-runtime-state") === "active");
     return await this.look();
+  }
+
+  /**
+   * 在源码写入前保存当前临时页面状态。
+   * @throws 桥或 sessionStorage 无法建立检查点时抛出，调用方不得继续写补丁。
+   */
+  async checkpoint(): Promise<void> {
+    const page = this.needPage();
+    if (this.floor === null) throw new BrowserError("尚未打开试玩楼层");
+    const before = await this.look();
+    const saved = await page.evaluate(() => {
+      const bridge = (window as unknown as {
+        __DUNGEON_PLAYTEST__?: { checkpoint?: () => boolean };
+      }).__DUNGEON_PLAYTEST__;
+      return bridge?.checkpoint?.() ?? false;
+    });
+    if (!saved) throw new BrowserError("当前游戏状态无法建立刷新检查点");
+    this.checkpointView = before;
+  }
+
+  /** 补丁后重新加载当前临时页面，使 Vite/浏览器使用最新 worktree 代码。 */
+  async reload(preserve = false): Promise<PlayView> {
+    const page = this.needPage();
+    if (this.floor === null) throw new BrowserError("尚未打开试玩楼层");
+    if (preserve && !this.checkpointView) await this.checkpoint();
+    const before = preserve ? this.checkpointView : null;
+    try {
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForFunction(() => (window as unknown as { __DUNGEON_PLAYTEST__?: { version: number } }).__DUNGEON_PLAYTEST__?.version === 2);
+      await page.waitForFunction(() => document.querySelector("#app")?.getAttribute("data-runtime-state") === "active");
+      const restored = await page.evaluate(() => (
+        (window as unknown as {
+          __DUNGEON_PLAYTEST__?: { checkpointRestored?: boolean };
+        }).__DUNGEON_PLAYTEST__?.checkpointRestored === true
+      ));
+      if (preserve && !restored) {
+        throw new BrowserError("刷新后未消费一次性游戏检查点");
+      }
+      const after = await this.look();
+      if (before && (
+        after.floor !== before.floor
+        || after.mode !== before.mode
+        || after.hp.current !== before.hp.current
+        || after.hp.armor !== before.hp.armor
+        || JSON.stringify(after.progress) !== JSON.stringify(before.progress)
+      )) {
+        throw new BrowserError("刷新后游戏检查点未完整恢复");
+      }
+      return after;
+    } finally {
+      if (preserve) this.checkpointView = null;
+    }
   }
 
   /** 读取玩家投影。 */
@@ -163,8 +260,40 @@ export class GameBrowser {
   async query(): Promise<BrowserResult> { return await this.call<BrowserResult>("query", []); }
   /** 读取隐藏裁判结果，仅供 Runner 断言。 */
   async judge(floor: number): Promise<PlayJudge> { return await this.call<PlayJudge>("judge", [floor]); }
+  /** 读取当前楼层，不重置或推进游戏。 */
+  async currentFloor(): Promise<number> { return (await this.look()).floor; }
+  /** 返回供隐藏健康裁判使用的计数，不暴露控制台正文。 */
+  async health(): Promise<BrowserHealth> {
+    const page = this.needPage();
+    const state = await page.evaluate(() => ({
+      bridge: (window as unknown as { __DUNGEON_PLAYTEST__?: { version?: number } }).__DUNGEON_PLAYTEST__?.version === 2,
+      runtime: document.querySelector("#app")?.getAttribute("data-runtime-state") === "active",
+    }));
+    const view = await this.look();
+    return { ...state, errors: this.errors, floor: view.floor, mode: view.mode };
+  }
+  /** 等待用户关闭 Dashboard 页面；取消信号只结束等待，不执行页面脚本。 */
+  async waitUntilClosed(signal?: AbortSignal): Promise<void> {
+    const page = this.needPage();
+    if (page.isClosed()) return;
+    await new Promise<void>((resolve) => {
+      const done = () => {
+        signal?.removeEventListener("abort", done);
+        resolve();
+      };
+      page.once("close", done);
+      signal?.addEventListener("abort", done, { once: true });
+    });
+  }
   /** 等待游戏自身的动画、死亡或换层计时器。 */
   async wait(ms = 150): Promise<void> { await new Promise((resolve) => setTimeout(resolve, ms)); }
+
+  /** 将脱敏的模型回合事件推送到同一游戏窗口的左侧控制台。 */
+  async emitAgent(event: HarnessEvent): Promise<void> {
+    await this.needPage().evaluate((value) => {
+      window.dispatchEvent(new CustomEvent("dungeon:agent-log", { detail: value }));
+    }, event);
+  }
 
   /** 保存隐藏 SQL 编辑器、管理员 UI 后的客观截图。 */
   async screenshot(path: string): Promise<void> {

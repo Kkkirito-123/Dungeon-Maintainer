@@ -12,7 +12,6 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Type, type Static } from "@earendil-works/pi-ai";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { checkSpec } from "../adapters/sql-dungeon/adapter.js";
 import { hashWorktree } from "../safety/worktree.js";
 import { redactText } from "../safety/redact.js";
 import { audit, checkAbort, type ToolContext, type ToolOutput } from "./context.js";
@@ -26,6 +25,27 @@ export const CheckParams = Type.Object({
 }, { additionalProperties: false });
 /** 固定检查参数类型。 */
 export type CheckInput = Static<typeof CheckParams>;
+
+/** 维护器公开给模型的固定检查标识。 */
+export type CheckId = CheckInput["id"];
+
+/** 一个不含 Shell 字符串拼接的固定检查定义。 */
+export interface CheckSpec {
+  id: CheckId;
+  file: string;
+  args: readonly string[];
+}
+
+/**
+ * 项目适配器注入的检查目录。
+ *
+ * 目录只能由维护器源码静态创建；目标仓库配置和模型均不能增加命令、参数或环境变量。
+ * `required` 只决定完成补丁前必须真实通过哪些检查，不执行任何命令。
+ */
+export interface CheckCatalog {
+  spec(id: CheckId): CheckSpec;
+  required(paths: readonly string[]): CheckId[];
+}
 
 /** 检查摘要。 */
 export interface CheckResult {
@@ -82,7 +102,8 @@ export async function check(
     await audit(context, "check", "cache");
     return { text: `[CACHE] ${input.id}: ${cached.status}\n${log.split(/\r?\n/u).slice(-80).join("\n")}`, details: { ...cached, cached: true } };
   }
-  const spec = checkSpec(input.id);
+  if (!context.checks) throw new Error("当前任务没有配置固定检查目录");
+  const spec = context.checks.spec(input.id);
   if (task.state === "diagnosing" || task.state === "editing" || task.state === "approved") {
     await context.store.transition(task, "verifying");
   }

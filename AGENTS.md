@@ -7,15 +7,17 @@
 本仓库只实现一个轻量、受限、面向 SQL Dungeon 的本地代码维护 Agent：
 
 ```text
-CLI -> Pi Runtime -> inspect / patch / check / play / finish
-                         |                 |
-                  safety + worktree   sql-dungeon adapter
+CLI / Dashboard -> Pi Runtime -> inspect / patch / check / finish
+                               -> Harness -> look / go / use / query
+                                      |              |
+                               safety + worktree   sql-dungeon adapter
 ```
 
 - `src/runtime/` 只负责 Pi 模型循环、任务事实、用量和上下文压缩。
 - `src/safety/` 是路径权限、符号链接、Hash、Git worktree、应用和回滚的唯一权威。
-- `src/tools/` 只暴露五个固定工具，不得新增 Shell、任意命令或通用写文件能力。
+- `src/tools/` 只暴露四个通用维护工具；试玩命令另行注入固定游戏工具，不得新增 Shell、任意命令或通用写文件能力。
 - `src/adapters/sql-dungeon/` 是通用维护器与游戏桥、固定检查之间的唯一连接点。
+- `src/dashboard/` 是三枚无参数网页命令、互斥作业和状态回传的唯一控制面；不得建立 HTTP 服务或第二套任务状态机。
 - `tests/` 使用 Node 原生测试，安全规则优先使用真实临时 Git 仓库验证。
 
 不要把 SQL Dungeon 的在线 Campfire、Scribe 或 Main Agent 迁入本仓库，也不要让本仓库成为
@@ -46,9 +48,10 @@ HTTP 服务。不要引入完整 `pi-coding-agent`、TUI、XState、PydanticAI�
 
 - 依赖版本：`@earendil-works/pi-agent-core` 与 `@earendil-works/pi-ai` 为 `0.84.1`，
   `playwright` 为 `1.62.1`。
-- 单任务最多 20 个模型回合、40 次工具调用、64000 Token、3 个修改文件和 120 行补丁成本。
+- 普通维护会话最多 20 回合/40 工具，完整 Harness 每层最多 64/64，快速排查最多 6/6/8000 新增 Token；整个任务最多 64000 Token、3 个修改文件和 120 行补丁成本。
+- Dashboard 必须在源码写入前建立一次性浏览器检查点；恢复信号或公开进度核对失败时停止复测。
 - `inspect` 每次最多 400 行或 48 KiB；`go` 每批最多 64 个真实移动步。
-- 检查和试玩缓存绑定完整 worktree Hash，代码变化后必须失效。
+- 检查和 PASS 结果缓存绑定完整 worktree Hash，代码变化后必须失效；决策缓存只能重放适配器白名单动作。
 - SQL Dungeon 项目文件 `.maintainer/project.json` 只能声明版本和适配器，不能声明命令或权限。
 
 ## 验证

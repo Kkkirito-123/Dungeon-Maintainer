@@ -15,7 +15,9 @@ import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { verifyProject } from "./adapters/sql-dungeon/adapter.js";
+import {
+  floorFromScenarioId, sqlDungeonChecks, verifyProject,
+} from "./adapters/sql-dungeon/adapter.js";
 import { runAgent, type RunResult } from "./runtime/agent.js";
 import { loadConfig, type RuntimeConfig } from "./runtime/config.js";
 import type { RuntimeModel } from "./runtime/model.js";
@@ -23,7 +25,8 @@ import { TaskStore, type TaskMode, type TaskRecord } from "./runtime/task.js";
 import {
   applyTaskPatch, createTaskWorktree, readRepo, revertTaskPatch,
 } from "./safety/worktree.js";
-import { play } from "./tools/play.js";
+import { runAgentPlaytest } from "./adapters/sql-dungeon/agentPlay.js";
+import { DashboardController } from "./dashboard/controller.js";
 
 /** CLI 依赖，测试可注入隔离配置和输出。 */
 export interface CliDeps {
@@ -44,7 +47,7 @@ function positional(args: string[]): string[] {
     const value = args[index];
     if (!value) continue;
     if (["--repo", "--floor", "--url"].includes(value)) { index += 1; continue; }
-    if (["--suite", "--headed"].includes(value)) continue;
+    if (["--suite", "--headed", "--fresh"].includes(value)) continue;
     output.push(value);
   }
   return output;
@@ -61,8 +64,10 @@ function help(): string {
   dungeon-maintain status <task-id>
   dungeon-maintain apply <task-id>
   dungeon-maintain revert <task-id>
-  dungeon-maintain play --repo <path> --floor <1-8> [--headed] [--url <localhost>]
-  dungeon-maintain play --repo <path> --suite game-v1 [--headed] [--url <localhost>]`;
+  dungeon-maintain review --repo <path> --floor <1-8> [--headed] [--fresh] [--url <localhost>]
+  dungeon-maintain review --repo <path> --suite game-v1 [--headed] [--fresh] [--url <localhost>]
+  dungeon-maintain play ...    # review 的兼容别名
+  dungeon-maintain dashboard --repo <path> [--floor 1..8]`;
 }
 
 async function modelRun(
@@ -75,6 +80,7 @@ async function modelRun(
   try {
     return await runAgent(config, store, task, {
       signal,
+      checks: sqlDungeonChecks,
       ...(model ? { model } : {}),
     });
   } catch (error) {
@@ -123,6 +129,40 @@ async function approve(args: string[], deps: CliDeps, signal: AbortSignal): Prom
   const task = await store.read(taskId);
   await store.approve(task, token);
   deps.write(`核心路径已批准：${task.approval?.paths.join(", ") ?? "无"}`);
+  if (task.source === "dashboard") {
+    deps.write("返回 Dashboard，点击“继续修复”恢复同一浏览器会话。");
+    return 0;
+  }
+  const playKey = task.plays.at(-1)?.key;
+  if (playKey?.startsWith("agent:") || playKey?.startsWith("harness:sql-dungeon:")) {
+    const floors = playKey.startsWith("agent:")
+      ? playKey.slice("agent:".length).split("-")
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value >= 1 && value <= 8)
+      : playKey.slice("harness:sql-dungeon:".length).split(",")
+        .map((value) => {
+          try { return floorFromScenarioId(value); }
+          catch { return 0; }
+        })
+        .filter((value) => value >= 1 && value <= 8);
+    const agentOutput = await runAgentPlaytest({
+      task,
+      store,
+      config: deps.config,
+      floors: floors.length > 0 ? floors : [1],
+      headed: false,
+      signal,
+      ...(deps.model ? { model: deps.model } : {}),
+    });
+    task.conclusion = agentOutput.summary;
+    await store.save(task);
+    deps.write(agentOutput.summary);
+    deps.write(`报告：${agentOutput.reportPath}`);
+    if (agentOutput.approvalToken) {
+      deps.write(`核心代码修改已暂停，批准命令：dungeon-maintain approve ${task.id} ${agentOutput.approvalToken}`);
+    }
+    return agentOutput.status === "PASS" ? 0 : 1;
+  }
   const result = await modelRun(deps.config, store, task, signal, deps.model);
   if (result.approvalToken) {
     deps.write(`新增核心修改计划：\n${task.plan.map((line) => `- ${line}`).join("\n")}`);
@@ -170,34 +210,87 @@ async function revert(taskId: string | undefined, deps: CliDeps): Promise<number
   return 0;
 }
 
-async function playCommand(args: string[], deps: CliDeps, signal: AbortSignal): Promise<number> {
+/** 黑盒诊断入口；环境操作由工具执行，观察、纠错与修复决策由 Pi 模型完成。 */
+async function reviewCommand(args: string[], deps: CliDeps, signal: AbortSignal): Promise<number> {
   const repoArg = valueAfter(args, "--repo");
-  if (!repoArg) throw new Error("play 需要 --repo");
+  if (!repoArg) throw new Error("review 需要 --repo");
   const state = await readRepo(resolve(repoArg));
   await verifyProject(state.root);
   const rawFloor = valueAfter(args, "--floor");
   const suite = args.includes("--suite");
   const floor = rawFloor ? Number(rawFloor) : undefined;
   if (!suite && (!Number.isInteger(floor) || (floor ?? 0) < 1 || (floor ?? 0) > 8)) {
-    throw new Error("play 需要 --floor 1..8 或 --suite game-v1");
+    throw new Error("review 需要 --floor 1..8 或 --suite game-v1");
   }
   if (suite && valueAfter(args, "--suite") !== "game-v1") throw new Error("只支持 --suite game-v1");
   const store = new TaskStore(deps.config.dataDir);
-  const task = await store.create({ mode: "diagnose", objective: suite ? "执行八层确定性试玩" : `执行第 ${String(floor)} 层确定性试玩`, repoRoot: state.root, baseHead: state.head });
+  const task = await store.create({
+    mode: "diagnose",
+    objective: suite ? "执行八层 Pi Agent 黑盒诊断" : `执行第 ${String(floor)} 层 Pi Agent 黑盒诊断`,
+    repoRoot: state.root,
+    baseHead: state.head,
+  });
+  task.worktreeRoot = await createTaskWorktree(task, join(deps.config.dataDir, "worktrees"), true);
+  await store.save(task);
   await store.transition(task, "diagnosing");
   deps.write(`任务：${task.id}`);
   const url = valueAfter(args, "--url");
-  const output = await play({ task, store }, {
-    scope: suite ? "suite" : "floor",
-    ...(floor ? { floor } : {}),
+  const agentOutput = await runAgentPlaytest({
+    task,
+    store,
+    config: deps.config,
+    floors: suite ? [1, 2, 3, 4, 5, 6, 7, 8] : [floor ?? 1],
     headed: args.includes("--headed"),
+    fresh: args.includes("--fresh"),
     ...(url ? { url } : {}),
-  }, signal);
-  task.conclusion = output.text;
+    signal,
+    ...(deps.model ? { model: deps.model } : {}),
+  });
+  task.conclusion = agentOutput.summary;
   await store.save(task);
-  deps.write(output.text);
-  deps.write(`报告：${output.details.reportPath}`);
-  return output.details.status === "PASS" ? 0 : 1;
+  deps.write(agentOutput.summary);
+  deps.write(`报告：${agentOutput.reportPath}`);
+  if (agentOutput.approvalToken) {
+    deps.write(`核心代码修改已暂停，批准命令：dungeon-maintain approve ${task.id} ${agentOutput.approvalToken}`);
+  }
+  return agentOutput.status === "PASS" ? 0 : 1;
+}
+
+/** 创建隔离 worktree 并运行同窗诊断页面，直到页面关闭或用户取消。 */
+async function dashboardCommand(args: string[], deps: CliDeps, signal: AbortSignal): Promise<number> {
+  const repoArg = valueAfter(args, "--repo");
+  if (!repoArg) throw new Error("dashboard 需要 --repo");
+  const floor = Number(valueAfter(args, "--floor") ?? "1");
+  if (!Number.isInteger(floor) || floor < 1 || floor > 8) {
+    throw new Error("dashboard 的 --floor 必须是 1..8");
+  }
+  const state = await readRepo(resolve(repoArg));
+  if (!state.clean) throw new Error("dashboard 要求目标仓库工作区干净，以便安全应用补丁");
+  await verifyProject(state.root);
+  const store = new TaskStore(deps.config.dataDir);
+  const task = await store.create({
+    mode: "fix",
+    source: "dashboard",
+    objective: "排查当前游戏状态，给出最小方案，并在用户点击后现场修复",
+    repoRoot: state.root,
+    baseHead: state.head,
+  });
+  task.worktreeRoot = await createTaskWorktree(task, join(deps.config.dataDir, "worktrees"));
+  await store.save(task);
+  await store.transition(task, "diagnosing");
+  deps.write(`任务：${task.id}`);
+  deps.write(`隔离 worktree：${task.worktreeRoot}`);
+  deps.write("关闭游戏窗口或按 Ctrl+C 可结束 Dashboard；目标工作区在应用前保持不变。");
+  await new DashboardController({
+    task,
+    store,
+    config: deps.config,
+    floor,
+    signal,
+    write: (line) => deps.write(line),
+    ...(deps.model ? { model: deps.model } : {}),
+  }).run();
+  return 0;
 }
 
 /**
@@ -218,7 +311,8 @@ export async function runCommand(args: string[], deps: CliDeps, signal: AbortSig
   if (command === "status") return await status(rest[0], deps);
   if (command === "apply") return await apply(rest[0], deps);
   if (command === "revert") return await revert(rest[0], deps);
-  if (command === "play") return await playCommand(rest, deps, signal);
+  if (command === "review" || command === "play") return await reviewCommand(rest, deps, signal);
+  if (command === "dashboard") return await dashboardCommand(rest, deps, signal);
   throw new Error(`未知命令：${command}`);
 }
 

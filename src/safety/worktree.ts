@@ -8,11 +8,11 @@
 
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { access, lstat, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, copyFile, lstat, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { TaskRecord } from "../runtime/task.js";
-import { normalizeProjectPath } from "./policy.js";
+import { classifyPath, normalizeProjectPath } from "./policy.js";
 
 const exec = promisify(execFile);
 
@@ -48,6 +48,33 @@ async function linkGameDependencies(repoRoot: string, worktreeRoot: string): Pro
   await symlink(source, target, process.platform === "win32" ? "junction" : "dir");
 }
 
+/** 将目标工作区的当前未提交快照复制进试玩 worktree，避免试玩读取旧 HEAD。 */
+async function copyDirtySnapshot(repoRoot: string, worktreeRoot: string, patchDir: string): Promise<void> {
+  const patch = await gitRaw(repoRoot, ["diff", "--binary", "HEAD", "--"]);
+  let patchPath: string | null = null;
+  try {
+    if (patch) {
+      patchPath = join(patchDir, "dirty.patch");
+      await writeFile(patchPath, patch, "utf8");
+      await git(worktreeRoot, ["apply", "--binary", patchPath]);
+    }
+    const untracked = (await git(repoRoot, ["ls-files", "--others", "--exclude-standard"]))
+      .split(/\r?\n/u).filter(Boolean);
+    for (const value of untracked) {
+      const relativePath = normalizeProjectPath(value);
+      if (classifyPath(relativePath, "write") === "denied") continue;
+      const source = resolve(repoRoot, relativePath);
+      const target = resolve(worktreeRoot, relativePath);
+      const info = await lstat(source);
+      if (!info.isFile()) continue;
+      await mkdir(dirname(target), { recursive: true });
+      await copyFile(source, target);
+    }
+  } finally {
+    if (patchPath) await rm(patchPath, { force: true });
+  }
+}
+
 /** Git 仓库的规范根目录、当前提交和脏状态。 */
 export interface RepoState {
   root: string;
@@ -78,15 +105,21 @@ export async function readRepo(path: string): Promise<RepoState> {
  * @returns 新 worktree 的绝对路径；若目标已有游戏依赖，会以忽略目录链接复用。
  * @throws 当目标仓库不干净、HEAD 漂移或目录已存在时拒绝。
  */
-export async function createTaskWorktree(task: TaskRecord, worktreesDir: string): Promise<string> {
+export async function createTaskWorktree(
+  task: TaskRecord,
+  worktreesDir: string,
+  allowDirtyTarget = false,
+): Promise<string> {
   const state = await readRepo(task.repoRoot);
-  if (!state.clean) throw new Error("修改任务要求目标仓库工作区干净");
+  // 试玩只从 baseHead 创建隔离副本，不读取或覆盖目标工作区的未提交修改。
+  if (!state.clean && !allowDirtyTarget) throw new Error("修改任务要求目标仓库工作区干净");
   if (state.head !== task.baseHead) throw new Error("目标仓库 HEAD 已变化，不能沿用旧任务基线");
   const target = resolve(worktreesDir, task.id);
   if (await exists(target)) throw new Error("任务 worktree 已存在");
   await mkdir(dirname(target), { recursive: true });
   await git(state.root, ["worktree", "add", "--detach", target, task.baseHead]);
   await linkGameDependencies(state.root, target);
+  if (allowDirtyTarget) await copyDirtySnapshot(state.root, target, worktreesDir);
   return target;
 }
 

@@ -11,6 +11,7 @@ function task(): TaskRecord {
     schemaVersion: 1,
     id: "context-task",
     mode: "fix",
+    source: "cli",
     objective: "修复第一层路线阻断",
     repoRoot: "C:\\repo",
     baseHead: "a".repeat(40),
@@ -39,6 +40,7 @@ function task(): TaskRecord {
     appliedHashes: {},
     usage: { turns: 1, toolCalls: 1, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     conclusion: null,
+    diagnosis: null,
   };
 }
 

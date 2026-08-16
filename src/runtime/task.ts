@@ -29,6 +29,26 @@ export type TaskState =
 /** 任务是否允许产生代码补丁。 */
 export type TaskMode = "diagnose" | "fix";
 
+/** 任务由普通 CLI 还是同窗 Dashboard 创建。 */
+export type TaskSource = "cli" | "dashboard";
+
+/**
+ * Dashboard 展示的结构化诊断结论。
+ *
+ * 这里只持久化经过 `finish` 净化的短文本、证据引用和项目相对路径，不保存模型原始
+ * 回复、代码正文、SQL、地图或浏览器状态。`result=fault` 也不代表允许修改，真正的
+ * 写权限仍由路径策略和核心审批决定。
+ */
+export interface Diagnosis {
+  result: "fault" | "healthy" | "blocked";
+  issue: string;
+  cause: string;
+  evidence: string[];
+  fix: string;
+  paths: string[];
+  risk: "low" | "medium" | "high";
+}
+
 /** 一次固定检查的可审计结果。 */
 export interface CheckRecord {
   id: string;
@@ -62,6 +82,7 @@ export interface TaskRecord {
   schemaVersion: 1;
   id: string;
   mode: TaskMode;
+  source: TaskSource;
   objective: string;
   repoRoot: string;
   baseHead: string;
@@ -82,6 +103,7 @@ export interface TaskRecord {
   appliedHashes: Record<string, string>;
   usage: { turns: number; toolCalls: number; input: number; output: number; cacheRead: number; cacheWrite: number };
   conclusion: string | null;
+  diagnosis: Diagnosis | null;
 }
 
 /** 追加到 `events.ndjson` 的低敏审计事件。 */
@@ -141,12 +163,17 @@ export class TaskStore {
    * @param input 已验证的模式、目标仓库、目标和 Git 基线。
    * @returns 已持久化的新任务。
    */
-  async create(input: Pick<TaskRecord, "mode" | "objective" | "repoRoot" | "baseHead">): Promise<TaskRecord> {
+  async create(
+    input: Pick<TaskRecord, "mode" | "objective" | "repoRoot" | "baseHead"> & { source?: TaskSource },
+  ): Promise<TaskRecord> {
     const now = new Date().toISOString();
     const task: TaskRecord = {
       schemaVersion: 1,
       id: randomUUID(),
-      ...input,
+      mode: input.mode,
+      source: input.source ?? "cli",
+      repoRoot: input.repoRoot,
+      baseHead: input.baseHead,
       objective: redactText(input.objective).slice(0, 2_000),
       worktreeRoot: null,
       state: "created",
@@ -164,6 +191,7 @@ export class TaskStore {
       appliedHashes: {},
       usage: { turns: 0, toolCalls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       conclusion: null,
+      diagnosis: null,
     };
     await this.save(task);
     await this.append(task.id, { at: now, type: "task.created", detail: { mode: task.mode } });
@@ -192,6 +220,8 @@ export class TaskStore {
     // V1 开发期已经生成过少量本地任务。旧记录没有累计预算字段时按零恢复；之后的
     // 每次 patch 都会重新持久化该字段，避免要求用户删除已有诊断和试玩证据。
     if (typeof (value as { patchLines?: unknown }).patchLines !== "number") task.patchLines = 0;
+    if ((value as { source?: unknown }).source !== "dashboard") task.source = "cli";
+    if (!("diagnosis" in value)) task.diagnosis = null;
     return task;
   }
 
