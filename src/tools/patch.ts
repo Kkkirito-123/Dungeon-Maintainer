@@ -55,7 +55,7 @@ function lineCost(oldText: string, newText: string): number {
 
 /**
  * 在 worktree 中应用一批精确文本改动。
- * @param context 修改任务；诊断任务永远不能调用本函数。
+ * @param context 修改任务；普通诊断任务不能调用，试玩任务只能在隔离 worktree 中调用。
  * @param input 最多三个文件的唯一替换或新文件内容。
  * @param signal 用户取消信号。
  * @returns 修改路径、最新 Hash 和行数预算。
@@ -68,7 +68,9 @@ export async function patch(
 ): Promise<ToolOutput<PatchResult>> {
   checkAbort(signal);
   const task = context.task;
-  if (task.mode !== "fix" || !task.worktreeRoot) throw new Error("只有 fix 任务的隔离 worktree 可以修改");
+  if ((!context.allowPatch && task.mode !== "fix") || !task.worktreeRoot) {
+    throw new Error("只有 fix 或试玩任务的隔离 worktree 可以修改");
+  }
   const paths = input.edits.map((edit) => edit.path);
   if (new Set(paths).size !== paths.length) throw new Error("同一批补丁不能重复修改同一路径");
   const decision = decidePatch(task, paths);
@@ -111,6 +113,9 @@ export async function patch(
     staged.push({ ...target, content: current.slice(0, first) + edit.newText + current.slice(first + edit.oldText.length) });
   }
 
+  // 检查点必须先于第一字节源码写入。Vite 即使立即触发刷新，也只能恢复这份
+  // 已确认状态；检查点失败会在 worktree 仍保持原样时终止补丁。
+  await context.beforePatch?.();
   for (const item of staged) {
     checkAbort(signal);
     await mkdir(dirname(item.absolute), { recursive: true });
@@ -126,6 +131,7 @@ export async function patch(
     [item.relative, hashBytes(Buffer.from(item.content, "utf8"))] as const
   )));
   await audit(context, "patch", "ok");
+  await context.onPatch?.();
   return { text: `已在隔离 worktree 修改 ${String(staged.length)} 个文件；目标分支未变化。`, details: { paths: staged.map((x) => x.relative), hashes, changedLines: totalLines } };
 }
 

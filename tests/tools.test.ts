@@ -7,12 +7,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
-import { check } from "../src/tools/check.js";
+import { check, type CheckCatalog } from "../src/tools/check.js";
 import { finish } from "../src/tools/finish.js";
 import { inspect } from "../src/tools/inspect.js";
 import { patch } from "../src/tools/patch.js";
 import { TaskStore } from "../src/runtime/task.js";
 import { createTaskWorktree, hashFile } from "../src/safety/worktree.js";
+import { sqlDungeonChecks } from "../src/adapters/sql-dungeon/adapter.js";
 
 const exec = promisify(execFile);
 
@@ -99,6 +100,30 @@ void test("patch 校验 baseHash、唯一文本和核心一次性批准", async 
   );
 });
 
+void test("Dashboard 检查点失败发生在源码写入前", async (context) => {
+  const value = await fixture(context);
+  const task = await value.store.create({ mode: "fix", objective: "验证刷新检查点", repoRoot: value.repo, baseHead: value.head });
+  task.worktreeRoot = await createTaskWorktree(task, join(value.data, "worktrees"));
+  await value.store.transition(task, "diagnosing");
+  const path = "game/tests/view.test.ts";
+  const baseHash = await hashFile(task.worktreeRoot, path);
+
+  await assert.rejects(patch({
+    task,
+    store: value.store,
+    beforePatch: async () => {
+      const current = await readFile(join(task.worktreeRoot ?? "", path), "utf8");
+      assert.match(current, /'old'/u);
+      throw new Error("检查点不可用");
+    },
+  }, {
+    edits: [{ path, baseHash, oldText: "'old'", newText: "'new'" }],
+  }), /检查点不可用/u);
+
+  assert.match(await readFile(join(task.worktreeRoot, path), "utf8"), /'old'/u);
+  assert.deepEqual(task.changedPaths, []);
+});
+
 void test("固定检查按 worktree Hash 缓存且 ready 生成可应用补丁", async (context) => {
   const value = await fixture(context);
   const task = await value.store.create({ mode: "fix", objective: "修复测试展示", repoRoot: value.repo, baseHead: value.head });
@@ -107,8 +132,8 @@ void test("固定检查按 worktree Hash 缓存且 ready 生成可应用补丁",
   const path = "game/tests/view.test.ts";
   const baseHash = await hashFile(task.worktreeRoot, path);
   await patch({ task, store: value.store }, { edits: [{ path, baseHash, oldText: "'old'", newText: "'new'" }] });
-  const first = await check({ task, store: value.store }, { id: "rules-test" });
-  const second = await check({ task, store: value.store }, { id: "rules-test" });
+  const first = await check({ task, store: value.store, checks: sqlDungeonChecks }, { id: "rules-test" });
+  const second = await check({ task, store: value.store, checks: sqlDungeonChecks }, { id: "rules-test" });
   assert.equal(first.details.status, "passed");
   assert.equal(first.details.cached, false);
   assert.equal(second.details.cached, true);
@@ -118,6 +143,21 @@ void test("固定检查按 worktree Hash 缓存且 ready 生成可应用补丁",
   assert.equal(done.details.state, "ready_to_apply");
   assert.ok(done.details.patchPath);
   assert.equal((await readFile(join(value.repo, path), "utf8")).replaceAll("\r\n", "\n"), "export const label = 'old';\n");
+});
+
+void test("check 只执行组合入口注入的固定目录", async (context) => {
+  const value = await fixture(context);
+  const task = await value.store.create({ mode: "diagnose", objective: "验证检查注入", repoRoot: value.repo, baseHead: value.head });
+  await value.store.transition(task, "diagnosing");
+  const catalog: CheckCatalog = {
+    spec: (id) => ({ id, file: process.execPath, args: ["--version"] }),
+    required: () => ["rules-test"],
+  };
+
+  const result = await check({ task, store: value.store, checks: catalog }, { id: "rules-test" });
+
+  assert.equal(result.details.status, "passed");
+  assert.match(await readFile(result.details.logPath, "utf8"), /^v\d+/u);
 });
 
 void test("模型不能伪造未执行的检查", async (context) => {
@@ -141,10 +181,10 @@ void test("finish 拒绝检查过程在 patch 清单外产生的源码变化", a
   await patch({ task, store: value.store }, {
     edits: [{ path, baseHash: await hashFile(task.worktreeRoot, path), oldText: "'old'", newText: "'new'" }],
   });
-  await check({ task, store: value.store }, { id: "rules-test" });
+  await check({ task, store: value.store, checks: sqlDungeonChecks }, { id: "rules-test" });
   await writeFile(join(task.worktreeRoot, "game", "tests", "outside.test.ts"), "export const outside = true;\n", "utf8");
   // 额外变化会使先前检查缓存失效；重新检查后才能单独验证补丁清单约束。
-  await check({ task, store: value.store }, { id: "rules-test" });
+  await check({ task, store: value.store, checks: sqlDungeonChecks }, { id: "rules-test" });
 
   await assert.rejects(finish({ task, store: value.store }, {
     status: "ready", summary: "修改完成。", risk: "低。", checks: ["rules-test"],
@@ -222,4 +262,54 @@ void test("finish 生成只含结构化事实的脱敏中文报告", async (cont
   assert.match(report, /\[CREDENTIAL REDACTED\]/u);
   assert.doesNotMatch(report, /abcdefghijklmnop|SELECT secret/iu);
   assert.match(report, /未运行固定检查/u);
+});
+
+void test("Dashboard 排查保存严格结构化方案且不允许代码改动", async (context) => {
+  const value = await fixture(context);
+  const task = await value.store.create({
+    mode: "fix",
+    source: "dashboard",
+    objective: "排查当前楼层",
+    repoRoot: value.repo,
+    baseHead: value.head,
+  });
+  await value.store.transition(task, "diagnosing");
+  const diagnosis = {
+    result: "fault" as const,
+    issue: "任务提示没有刷新",
+    cause: "展示订阅仍读取旧状态",
+    evidence: ["步骤 3：状态变化后标题不变"],
+    fix: "在展示层订阅回调中使用最新快照。",
+    paths: ["game/src/presentation/view.ts"],
+    risk: "low" as const,
+  };
+
+  const done = await finish({ task, store: value.store, stage: "probe" }, {
+    status: "diagnosed",
+    summary: "已定位展示故障。",
+    risk: "仅影响展示层。",
+    checks: [],
+    diagnosis,
+  });
+
+  assert.deepEqual(done.details.diagnosis, diagnosis);
+  assert.deepEqual(task.diagnosis, diagnosis);
+  assert.equal(task.state, "diagnosing");
+  assert.deepEqual(task.changedPaths, []);
+
+  await assert.rejects(finish({ task, store: value.store, stage: "probe" }, {
+    status: "diagnosed",
+    summary: "非法诊断。",
+    risk: "低。",
+    checks: [],
+    diagnosis: { ...diagnosis, issue: "<script>bad</script>" },
+  }), /纯文本/u);
+
+  await assert.rejects(finish({ task, store: value.store, stage: "probe" }, {
+    status: "diagnosed",
+    summary: "非法诊断。",
+    risk: "低。",
+    checks: [],
+    diagnosis: { ...diagnosis, evidence: ["SELECT secret FROM hidden"] },
+  }), /不得包含 SQL/u);
 });

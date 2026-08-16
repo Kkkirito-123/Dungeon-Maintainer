@@ -18,6 +18,7 @@ function task(): TaskRecord {
     schemaVersion: 1,
     id: "task-1",
     mode: "fix",
+    source: "cli",
     objective: "test",
     repoRoot: "C:\\repo",
     baseHead: "a".repeat(40),
@@ -37,6 +38,7 @@ function task(): TaskRecord {
     appliedHashes: {},
     usage: { turns: 0, toolCalls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     conclusion: null,
+    diagnosis: null,
   };
 }
 

@@ -1,13 +1,15 @@
 /**
  * 运行配置入口。
  *
- * 本模块只从当前进程环境读取维护器自己的模型参数，并计算统一数据目录；它不会
- * 搜索目标仓库、加载 `.env`，也不会把密钥写入任务文件。配置缺失会在真正调用
- * 模型前明确失败，纯状态查询、补丁应用与回滚不依赖模型凭据。
+ * 本模块只从维护器根目录 `.env` 和当前进程环境读取自身模型参数，并计算统一数据
+ * 目录；它不会搜索目标游戏仓库，也不会把密钥写入任务文件。进程环境优先于文件，
+ * 配置缺失会在真正调用模型前明确失败，纯状态查询、补丁应用与回滚不依赖模型凭据。
  */
 
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** 维护器的模型、持久化目录和资源上限。 */
 export interface RuntimeConfig {
@@ -25,9 +27,9 @@ export interface RuntimeConfig {
   timeoutMs: number;
   /** 任务、日志、补丁和临时 worktree 的统一父目录。 */
   dataDir: string;
-  /** 单任务允许的最大模型回合数。 */
+  /** 单个 Pi 会话允许的最大模型回合数。 */
   maxTurns: number;
-  /** 单任务允许的最大工具调用数。 */
+  /** 单个 Pi 会话允许的最大工具调用数。 */
   maxToolCalls: number;
   /** 单任务允许的累计 token 数。 */
   maxTokens: number;
@@ -36,6 +38,47 @@ export interface RuntimeConfig {
 function boundedInt(value: string | undefined, fallback: number, min: number, max: number): number {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed >= min && parsed <= max ? parsed : fallback;
+}
+
+/**
+ * 解析维护器自己的 `.env` 文本。
+ *
+ * @param text 维护器根目录中的配置文本；不会读取目标游戏目录。
+ * @returns 只包含 `MAINTAINER_*` 的配置项；不返回游戏 Agent 的密钥变量。
+ */
+export function parseMaintainerEnv(text: string): Record<string, string> {
+  const output: Record<string, string> = {};
+  for (const line of text.split(/\r?\n/u)) {
+    const match = line.trim().match(/^(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=\s*(.*)$/u);
+    if (!match?.[1]?.startsWith("MAINTAINER_")) continue;
+    let value = match[2] ?? "";
+    if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    output[match[1]] = value;
+  }
+  return output;
+}
+
+/**
+ * 定位维护器自己的 `.env`，兼容源码目录与编译后的 `dist/src` 目录。
+ * @param modulePath 当前配置模块的绝对文件路径；测试可传入虚拟路径。
+ * @returns 维护器项目根目录下的 `.env`，绝不根据当前工作目录或目标仓库推断。
+ */
+export function maintainerEnvPath(modulePath = fileURLToPath(import.meta.url)): string {
+  const sourceRoot = resolve(dirname(modulePath), "..", "..");
+  const projectRoot = basename(sourceRoot) === "dist" ? dirname(sourceRoot) : sourceRoot;
+  return resolve(projectRoot, ".env");
+}
+
+function runtimeEnv(): NodeJS.ProcessEnv {
+  let fileEnv: Record<string, string> = {};
+  try {
+    fileEnv = parseMaintainerEnv(readFileSync(maintainerEnvPath(), "utf8"));
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+  }
+  return { ...fileEnv, ...process.env };
 }
 
 /**
@@ -63,7 +106,7 @@ export function normalizeBaseUrl(value: string): string {
  * @returns 完整且带默认资源限制的配置。
  * @throws 当 API 根地址非法时抛出错误；密钥缺失不会在此处抛错。
  */
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig {
+export function loadConfig(env: NodeJS.ProcessEnv = runtimeEnv()): RuntimeConfig {
   const local = env.LOCALAPPDATA?.trim() || resolve(homedir(), ".local", "share");
   return {
     apiKey: env.MAINTAINER_API_KEY?.trim() || null,

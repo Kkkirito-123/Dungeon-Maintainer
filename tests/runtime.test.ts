@@ -15,6 +15,7 @@ import { loadConfig } from "../src/runtime/config.js";
 import type { RuntimeModel } from "../src/runtime/model.js";
 import { TaskStore } from "../src/runtime/task.js";
 import { createTaskWorktree, hashFile } from "../src/safety/worktree.js";
+import { sqlDungeonChecks } from "../src/adapters/sql-dungeon/adapter.js";
 
 const exec = promisify(execFile);
 
@@ -112,7 +113,10 @@ void test("批准后重新检查、修改、验证并生成待应用补丁", asy
     fauxAssistantMessage(fauxToolCall("check", { id: "rules-test" }), { stopReason: "toolUse" }),
     fauxAssistantMessage(fauxToolCall("finish", { status: "ready", summary: "生命规则已调整。", risk: "单文件改动。", checks: ["rules-test"] }), { stopReason: "toolUse" }),
   ]);
-  const result = await runAgent(config(value.data), store, task, { model: resumed });
+  const result = await runAgent(config(value.data), store, task, {
+    model: resumed,
+    checks: sqlDungeonChecks,
+  });
   assert.equal(result.outcome, "ready");
   assert.equal(task.state, "ready_to_apply");
   assert.ok(task.patchPath);

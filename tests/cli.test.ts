@@ -121,3 +121,31 @@ void test("CLI 核心修复在显式 apply 前不改变目标并支持安全回�
   assert.equal((await store.read(taskId)).state, "reverted");
   assert.equal(await git(value.repo, ["status", "--porcelain=v1"]), "");
 });
+
+void test("Dashboard 核心批准只更新任务并提示返回原页面", async (context) => {
+  const value = await fixture(context);
+  const lines: string[] = [];
+  const store = new TaskStore(value.data);
+  const head = await git(value.repo, ["rev-parse", "HEAD"]);
+  const task = await store.create({
+    mode: "fix",
+    source: "dashboard",
+    objective: "修复展示层状态",
+    repoRoot: value.repo,
+    baseHead: head,
+  });
+  await store.transition(task, "diagnosing");
+  const token = await store.requestApproval(task, ["game/src/domain/rule.ts"]);
+  const deps: CliDeps = {
+    config: { ...loadConfig({ MAINTAINER_API_KEY: "not-used" }), dataDir: value.data },
+    write: (line) => lines.push(line),
+  };
+
+  assert.equal(await runCommand(
+    ["approve", task.id, token],
+    deps,
+    new AbortController().signal,
+  ), 0);
+  assert.equal((await store.read(task.id)).state, "approved");
+  assert.match(lines.join("\n"), /返回 Dashboard，点击“继续修复”/u);
+});
