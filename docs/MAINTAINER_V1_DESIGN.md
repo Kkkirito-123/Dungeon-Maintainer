@@ -1,271 +1,182 @@
 # Dungeon Maintainer V1 设计
 
-## 1. 设计目标
+## 1. 目标
 
-Dungeon Maintainer V1 把通用 Coding Agent 缩减为 SQL Dungeon 专用维护循环。模型负责理解问题、
-选择工具和总结证据；确定性代码负责所有可产生副作用或泄露风险的行为。实机试玩由同一个 Pi
-Agent 指挥，游戏桥只执行经过约束的工具动作。
-
-```text
-用户问题 / 游戏内按钮
-  -> CLI / DashboardController / TaskStore
-  -> Pi Agent
-      -> inspect：有限代码证据
-      -> patch：隔离 worktree 精确替换
-      -> check：固定质量门禁
-      -> play：Pi Agent 选择游戏工具，浏览器桥执行真实试玩
-      -> finish：证据核验与补丁封装
-  -> 用户 approve / apply
-  -> 目标工作区
-```
-
-V1 不追求通用仓库支持、自主 Shell、自动发布、多 Agent 编排、长期记忆、HTTP 服务或独立 Web
-控制台。它只提供由本地 CLI 持有的同窗 Dashboard；适配器只支持带有严格
-`.maintainer/project.json` 标识的 SQL Dungeon 仓库。
-
-## 2. Pi Runtime 与自有代码边界
-
-Pi Core 只提供以下成熟基础能力：
-
-- `Agent` 和 `AgentTool` 工具循环；
-- 模型流式事件和 usage；
-- `beforeToolCall` / `afterToolCall` 生命周期；
-- `AbortSignal` 取消；
-- `transformContext` 和 token 估算。
-
-Pi 不决定路径是否可读、代码是否核心、补丁能否落地或检查是否真实通过。这些约束分别由
-`safety/policy.ts`、`safety/worktree.ts`、`tools/check.ts` 和 `tools/finish.ts` 强制执行。
-因此即使 prompt 被忽略、模型返回额外字段或供应商行为异常，工具协议和执行层仍会拒绝越权。
-
-Runtime 固定每个模型回合只能调用一个工具；普通维护任务注册 `inspect/patch/check/finish`，试玩
-任务再注入 `look/go/use/query`。Dashboard 排查阶段不注册 `patch/check`，修复阶段才恢复；权限
-差异由工具列表和执行层共同强制，不依赖 Prompt。恢复核心
-审批时创建新的 Agent 会话，只把任务目标和已批准路径重新交给模型，要求它重新 `inspect`；不把
-旧代码正文持久化后重放。
-
-## 3. 任务状态与审批
-
-正常路径：
+Dungeon Maintainer V1 是 SQL Dungeon 专用的本地 Coding Agent。用户在当前终端与原生 Pi CLI
+聊天，右侧 headed Chromium 运行 detached worktree 中的真实游戏。Agent 根据自然语言问题定位、
+复现、修改并触发页面更新；用户显式 `/apply` 前，正式游戏仓库保持不变。
 
 ```text
-created -> diagnosing -> editing -> verifying -> ready_to_apply -> applied
-                 |            |
-                 +-> needs_approval -> approved -+
-applied -> reverted
+用户问题 -> Pi CLI（单会话）
+  -> Dungeon Maintainer Extension
+       -> 代码定位与固定检查
+       -> 浏览器语义复现
+       -> detached worktree 精确修改
+       -> 刷新、恢复、重放
+  -> /verify -> /apply -> 正式游戏工作区（无提交）
 ```
 
-异常终态为 `blocked`、`aborted`、`failed` 和 `reverted`。`blocked` 可用于明确的环境或证据阻断；
-非法迁移由 `TaskStore` 拒绝。只读诊断以 `finish(diagnosed)` 的业务结果结束，不制造补丁。
+V1 非目标：多 Agent、Dashboard、Electron、通用 Shell、任意浏览器脚本、自建模型循环、长期记忆、
+自动发布和通用仓库适配。
 
-核心路径包括领域规则、课程内容、存储、契约、应用层、入口、配置、依赖、脚本、CI、试玩桥和
-在线 Agent。自动范围只包含游戏文档、测试和小型展示层。法律文件、凭据、`.git` 与生成目录永久
-禁止写入。
+## 2. 两仓库边界
 
-核心 `patch` 在执行前产生十分钟有效的随机 token。任务文件只保存以下摘要：
+- 维护器拥有 Pi Extension、任务事实、worktree、权限、检查、浏览器生命周期和 apply。
+- 游戏拥有玩法规则、Vite、DOM/Phaser、SQLite，以及只在开发态安装的协议 v2 桥。
+- 维护器不把运行时代码复制进游戏；游戏不导入维护器包。
+- 游戏根 `.maintainer/project.json` 只能包含 `schemaVersion: 1` 和 `adapter: sql-dungeon`。
+
+## 3. 启动与恢复
+
+`start` 校验 Git 根、项目标识、洁净工作区和依赖，记录 `baseHead`，创建 detached worktree 与
+Pi 会话目录，再以 worktree 为 cwd 启动 Pi。固定参数包含：
 
 ```text
-SHA-256({ taskId, baseHead, sortedPaths, token })
+--no-builtin-tools --no-extensions --no-skills
+--no-prompt-templates --no-context-files
+-e <maintainer-extension>
+--provider dungeon-maintainer --model <fixed-model>
+--session-id <task-id> --session-dir <task-dir>/pi
 ```
 
-用户重新输入 token 后，批准只覆盖同一任务、同一 Git 基线和精确路径列表；token 立即标记为已
-使用。新增核心路径会再次暂停，不能继承旧批准。
+taskId 与 Pi session-id 固定绑定，因为聊天、审批、补丁和 worktree 必须指向同一任务。Extension
+通过会话生命周期钩子取消 `/new`、内置 `/resume`、`/import`、`/fork`、`/clone` 和 `/tree`，
+阻断 Shell，并在模型被选择为其他项时立即恢复固定维护模型。
 
-## 4. 路径和补丁安全
+`resume` 验证 schema、正式仓库 `baseHead`、worktree Git 根/HEAD、Pi 会话目录和唯一首行记录。
+worktree 或会话丢失时阻断，不静默重建。
 
-所有模型路径必须是无 NUL、无绝对地址、无 `..` 的项目相对路径。执行层先解析仓库真实根路径，
-再解析目标或最近存在的父目录；若 `realpath` 落到仓库外，即使表面路径仍在仓库中，也按符号链接
-逃逸拒绝。
-
-`inspect read` 返回完整文件 SHA-256 作为 `baseHash`。`patch` 写入前重新计算 Hash，只有完全
-一致才执行；已存在文件要求 `oldText` 恰好出现一次，新文件要求 `baseHash="missing"` 且
-`oldText=""`。工具不支持删除、移动、模糊匹配、整文件任意覆盖或二进制修改。
-
-任务累计补丁预算为最多 3 个文件、120 行成本。拆成多个工具调用仍共享同一预算；超限会停止
-自动修改并要求用户缩小范围或人工处理。预算是限制模型影响面的硬边界，不因 prompt 改变。
-
-Dashboard 修复还增加浏览器前置检查点：`patch` 完成全部 Hash、权限、唯一匹配和预算校验后，
-必须先调用会话 `checkpoint()`，成功后才写入第一字节源码。检查点失败时 worktree 保持原样；
-写入后 Vite 刷新必须明确恢复并核对公开楼层、模式、生命和进度，否则隐藏复测直接阻断。
-
-## 5. Git 检查点、应用与回滚
-
-`fix` 创建任务时记录目标仓库 `baseHead`，并从该提交创建 detached worktree。目标工作区必须
-干净且 HEAD 未漂移。模型只读写任务 worktree，目标分支在整个诊断、修改和验证阶段保持不变。
-Git 不会复制被忽略的 `game/node_modules`；若目标仓库已经安装依赖，worktree 只在同名忽略目录
-创建链接以复用可再生依赖。路径策略永久禁止模型访问该目录，链接也不进入 Diff、Hash 或补丁。
-
-`finish(ready)` 从 worktree 生成 `patch.diff`。它先确认目标仍干净且 HEAD 等于 `baseHead`，再用
-Git clean filter 验证目标文件仍对应基线 blob，最后保存目标工作区的真实字节 Hash。这样既能识别
-被隐藏的内容漂移，也不会因 Windows CRLF 与 Git blob 的 LF 规范化而误报冲突。
-`reverse.diff` 保存同一份已验证补丁，回滚时由 `git apply --reverse` 解释方向，避免两份补丁独立
-生成后漂移。
-
-显式 `apply` 依次检查：
-
-1. 任务状态为 `ready_to_apply`；
-2. 目标工作区干净；
-3. 当前 HEAD 等于 `baseHead`；
-4. 每个目标文件当前 Hash 等于保存的基线 Hash；
-5. `git apply --check` 成功。
-
-任一条件失败都不写入目标文件。应用后保存每个文件的新 Hash；`revert` 只有在这些 Hash 仍完全
-一致时才执行反向检查和反向应用，防止覆盖用户在补丁之后的继续修改。应用和回滚都不提交 Git。
-
-## 6. 五工具契约
-
-### inspect
-
-提供 `status/tree/search/read/diff`。每次输出最多 400 行或 48 KiB，并附证据 ID 和内容 Hash；
-单文件读取按行分页，文件上限 2 MiB。搜索通过 `execFile` 固定调用 `rg --json`，逐条解析并再次
-执行路径白名单；异常时不回传可能未过滤完整的 stdout，只返回中性错误分类。
-
-### patch
-
-接收最多三个精确编辑项，每项包含 `path/baseHash/oldText/newText`。路径策略、核心批准、隐私
-正文、唯一匹配和任务预算在写入前统一检查；返回路径与新 Hash，不把补丁正文重复写入审计日志。
-
-### check
-
-模型只能选择适配器代码内登记的检查 ID，不能提供命令、参数、cwd 或环境变量。子进程环境移除
-常见凭据字段；完整脱敏日志写入任务目录，模型只接收状态和最后 80 行。
-
-### review / play
-
-每个场景创建一个 Pi Agent 会话，模型在每次语义反馈后选择 `look/go/use/query`，也可以在发现客观
-代码问题后选择 `inspect/patch/check/finish`。`go` 的一次调用最多执行 64 个真实步；BFS、目标
-不可达时的 frontier 回退和战斗/交互/楼层变化停止由桥内部完成。模型不会逐格调用，也不会收到
-管理员答案或隐藏裁判；单层失败不阻止后续楼层，左侧页面会实时显示回合、工具、结果和 Token。
-
-### dashboard
-
-`dashboard --repo <path> [--floor 1..8]` 只接受干净目标仓库，创建 `source=dashboard` 的 fix 任务和
-detached worktree，再从该 worktree 启动 Vite 与可视 Chromium。Node 只向页面注入
-`__DUNGEON_QUICK_CHECK__`、`__DUNGEON_QUICK_FIX__`、`__DUNGEON_APPLY_FIX__` 三个无参数
-函数；网页不能提交路径、Prompt、SQL、Shell、检查 ID 或批准 token。同一时刻只有一个作业，
-互斥标记在任何异步任务读取前设置，重复调用返回 `busy`。
-
-快速排查复用当前浏览器会话和点击时楼层，不调用 `openScenario`，只提供
-`look/go/use/query/inspect/finish`，并强制绕过两级 PASS 缓存。`finish` 必须返回经过纯文本、
-敏感内容和路径策略校验的 `fault/healthy/blocked` 结构化诊断。只有 `fault` 且存在许可路径时才
-能修复。修复继续复用同一任务和页面；核心文件暂停到终端批准，批准命令只更新任务，用户回到
-页面点击 `继续修复` 后恢复。模型声明 ready 只是候选，固定检查和隐藏复测都通过后才封装补丁。
-
-### finish
-
-只接受 `diagnosed/needs_approval/ready/blocked`。`ready` 必须至少声明一个检查 ID，且该检查在
-当前完整 worktree Hash 下确实通过；模型不能凭文字伪造门禁。Dashboard 的 diagnosis 最多六条
-证据和三个规范化路径，拒绝 HTML、控制字符、SQL、凭据和完整游戏状态。成功后生成中文报告、
-正向补丁和反向补丁，但不应用到目标仓库。
-
-## 7. 检查与 Harness 缓存
-
-检查缓存键不是时间或文件名，而是当前 Git HEAD、已跟踪 Diff 和未跟踪文件内容共同计算的
-SHA-256。`check` 使用 `checkId + worktreeHash`；任意代码字节变化都会使旧检查结果失效。
-
-Harness 有两级独立缓存，磁盘只保存 Hash、净化动作和有限裁判摘要：
-
-- 决策缓存键包含适配器版本、场景、模型身份和完整可见轨迹；时间戳、usage 与 tool-call ID 不参与
-  Hash。仅 `look/go/use/query` 的严格参数可以重放，TTL 为 10 分钟，上限 256 条；代码工具、
-  `finish`、SQL、Key、prompt 与 completion 永不缓存。
-- 结果缓存键包含适配器版本、场景和完整 worktree Hash；只保存隐藏裁判确认的 PASS，TTL 为
-  24 小时，上限 128 条。命中后不启动浏览器、不调用模型，并明确显示 `0 TOKENS`。
-- `--fresh` 同时绕过两级 Harness 缓存。缓存损坏、过期或写入失败只会回退正常模型路径，不能
-  放宽工具、审批或路径权限。
-
-未命中结果缓存时才创建新的临时 Chromium Context、Pi 会话和报告目录。任务只保存
-`key/hash/status/reportPath` 索引，不保存提示词、回复正文或游戏快照。
-
-## 8. 上下文与资源控制
-
-普通维护会话硬限制为 20 个模型回合和 40 次工具调用；完整八层 Harness 每层明确使用 64/64；
-Dashboard 快速排查使用 6/6/8000 个新增 Token，现场修复使用 20/40 和任务剩余 Token。整个任务
-硬限制为 64000 个累计 Token。八层套件按场景重置局部计数基线，因此某层达到局部限额仍能记录
-后继续下一层；核心审批、取消、供应商失败或总 Token 到顶会立即停止。Pi transcript 只存在当前进程；
-`session.jsonl` 记录事件类型、工具名、状态和 usage，不保存消息正文。
-
-当估算上下文达到模型窗口约 75% 时，发送给模型的视图被替换为“确定性事实摘要 + 最近完整工具
-调用链”。摘要只保留：
-
-- 原始任务目标、模式和 Git 基线；
-- 当前状态与精确批准路径；
-- 已修改文件；
-- 已通过检查；
-- 失败或阻断检查。
-
-它不保留进度日志、API Key、SQL、地图、浏览器快照或补丁正文。若无法找到不拆断 tool call 与
-tool result 的安全切点，则不压缩，避免制造无效上下文。
-
-## 9. Pi Agent 试玩与 BFS
-
-SQL Dungeon 开发态桥协议为 v2：
-
-```ts
-interface DungeonPlaytestBridge {
-  version: 2;
-  readonly checkpointRestored: boolean;
-  checkpoint(): boolean;
-  look(): PlaytestView;
-  go(target: "objective" | "frontier", maxSteps: number): Promise<PlaytestResult>;
-  use(actionId: string): Promise<PlaytestResult>;
-  query(): Promise<PlaytestResult>;
-  judge(floor: number): PlaytestJudge;
-}
-```
-
-`checkpoint` 是维护器刷新控制专用扩展，只把完整 Run/Profile 放入当前临时 Chromium Context 的
-一次性 `sessionStorage`。页面启动时读取后立即删除，并向 Node 暴露不含数据的恢复布尔值；恢复
-失败时不得回到楼层初始状态继续伪造成功。普通试玩仍只使用五个既有动作/裁判方法。
-
-桥只在 `import.meta.env.DEV`、本机地址和 `?playtest=agent` 同时满足时安装。生产构建通过静态
-条件消除动态桥模块。每次运行创建临时 Chromium Context 和临时内存 Run，不读写正式
-IndexedDB 或 Profile；试玩期间线上 Agent 请求关闭，游戏本地文案仍可用。
-
-路线规划由游戏桥基于已发现可行走区域执行 BFS，不使用额外机器学习、动态规划或强化学习。
-Pi Agent 只发出 `objective` 或 `frontier` 目标。一个批次最多 64 步；战斗、受伤、任务变化、出现
-交互、楼层变化或阻塞会立即返回并重新规划。`objective` 尚无路径时桥内部寻找最近 frontier，
-路径纠错不会进入维护模型。
-
-桥的固定执行优先级为：关闭阻塞覆盖层、提交桥内答案、处理结算、执行必要交互、前往目标、
-探索 frontier、等待游戏自身计时器。模型只在这些语义事件后重新决策，避免按格消耗 Token。
-第八层由隐藏裁判确认五阶段 Boss 和七页 `MIGRATE`。
-
-## 10. 隐藏裁判与脱敏
-
-玩家投影不包含地图、管理员答案、完整快照、背包或身份。`query()` 不接收 SQL 参数；预选答案
-只在游戏桥内部读取、写入真实编辑器并提交。`judge()` 的课程、Boss、升层和 MIGRATE 断言只由
-Node 侧运行器用于最终结果，不作为动作提示，也不进入维护模型。
-
-控制台写盘前移除 SQL 和凭据样式；截图前清空编辑器并隐藏管理员菜单、地图、答题复盘和终端。
-步骤报告只保留动作类型、耗时、计数，以及限长的 `mission/prompt/banner/actions` 公开尾迹。
-报告不保存 SQL、答案、完整地图、完整快照、背包、身份、prompt、completion 或 Key。
-
-## 11. 本地数据
-
-默认数据根为 Windows `%LOCALAPPDATA%\dungeon-maintainer`；非 Windows 环境回退到用户数据目录。
+## 4. 代码结构
 
 ```text
-dungeon-maintainer/
-├─ tasks/<task-id>/
-│  ├─ task.json
-│  ├─ session.jsonl
-│  ├─ events.ndjson
-│  ├─ report.md
-│  ├─ patch.diff
-│  ├─ reverse.diff
-│  ├─ checks/
-│  ├─ play/
-│  └─ dashboard/
+src/
+├─ main.ts
+├─ app.ts                    # 稳定导出门面
+├─ app/
+│  ├─ repository.ts         # SQL Dungeon 标识、Git 与运行依赖事实
+│  ├─ pi-process.ts         # 固定 Pi 参数、子进程与会话文件
+│  ├─ task-lifecycle.ts     # 任务路径绑定与终态 worktree 清理
+│  ├─ start.ts
+│  └─ resume.ts
+├─ config.ts
+├─ pi/
+│  ├─ extension.ts          # Provider、工具、命令和生命周期装配
+│  ├─ session-policy.ts     # Pi 绑定、固定模型、Shell/会话切换阻断
+│  ├─ game-runtime.ts       # 单 Vite、Chromium 和 GameDriver 生命周期
+│  ├─ prompt.ts
+│  ├─ tools/
+│  └─ commands/
+├─ task/
+├─ workspace/
+├─ game/
+├─ repair/
+└─ logging/
+```
+
+旧 Dashboard、自建 CLI 交互层、自建模型循环、上下文压缩、Harness、两级缓存和通用适配器已删除。
+`app.ts` 与 `pi/extension.ts` 保持稳定门面，具体副作用归入唯一职责文件；架构回归测试防止
+子进程、worktree、`realpath` 或 Vite/Chromium 生命周期重新堆回装配入口。
+
+## 5. 任务与状态
+
+schema v2 只保存任务路径、Hash、状态、有限检查/复现索引和结论。状态机：
+
+```text
+created -> active -> verifying -> ready_to_apply -> applied
+             ↕
+      awaiting_approval
+             ↓
+       blocked / discarded
+```
+
+`TaskStore` 使用临时文件和原子替换保存 `task.json`。旧 schema v1 明确拒绝恢复。Pi 会话正文仅在
+`pi/`，不会复制进事件日志。
+
+## 6. 路径、Hash 与审批
+
+所有路径必须是无 NUL、无绝对地址、无 `..` 的项目相对路径。执行层对仓库根、目标或最近存在
+父目录执行 `realpath`；仓库内符号链接/junction 指向仓库外时拒绝。
+
+- `auto`：游戏文档、测试和小型展示层。
+- `core`：领域、内容、契约、基础设施、应用、开发桥、Agent、脚本、CI 和根配置。
+- `denied`：`.git`、`.env*`、凭据、法律文件、生成目录、虚拟环境和仓库外路径。
+
+`patch` 只支持唯一旧文本替换或创建新文本文件。每项携带最新 `baseHash`，单任务累计最多 3 文件、
+120 行。核心审批绑定 `taskId + baseHead + 精确路径 + baseHash + 旧/新正文 Hash`，只能消费一次。
+拒绝审批时不会建立浏览器检查点，也不会写入任何源码字节。
+
+## 7. 定位与复现
+
+模型工具固定为 `inspect/patch/check/finish/look/go/use/query`。运行时问题必须至少产生一个
+go/use/query 动作，再用 `finish(status=reproduced)` 保存标题、期望、实际、证据和语义动作。
+构建、类型或测试问题可以失败的固定检查作为复现证据。
+
+`SemanticTrace` 只保存动作类型、有限参数、结果摘要和单调序号，容量 500 条。清空窗口不会重用
+序号；只有显式复现窗口写入 `reproductions/`。鼠标轨迹、帧、SQL、地图、存档和隐藏裁判不落盘。
+
+## 8. 游戏桥
+
+协议 v2 固定提供 `checkpoint/look/go/use/query/judge/events`。桥只在
+`DEV + localhost + ?playtest=agent` 时安装，并通过 DEV 动态导入保证生产构建裁除。
+
+游戏开发桥内部按职责分为 `protocol.ts`（协议/临时存储）、`actions.ts`（固定 DOM 动作）、
+`projection.ts`（玩家可见投影）、`navigation.ts`（目标、frontier、BFS 与停止原因）、
+`query.ts`（不向模型暴露正文的真实查询执行）、`trace.ts` 和仅负责装配的 `bridge.ts`。
+`bridge.ts` 保留旧导出作为兼容门面，但不再拥有投影、寻路或答案执行规则。
+
+试玩模式使用页面内存 DataStore 和临时 Chromium Context，不打开正式 IndexedDB，不读取正式
+localStorage Run/Profile 或用户 Chrome Profile，并关闭游戏外部 Agent endpoint。完整地图只在
+浏览器内部 BFS；答案只在浏览器内部经过真实 SqlEngine 和 GameSession 判定；`judge` 不暴露给模型。
+
+## 9. 修改、刷新与重放
+
+固定顺序：
+
+1. 所有静态校验和核心确认完成。
+2. `beforePatch` 确保复现起点检查点存在。
+3. 写入 detached worktree，Vite 更新。
+4. 浏览器 reload 并消费一次性 sessionStorage 检查点。
+5. 确认 `checkpointRestored === true`。
+6. 立即在恢复起点重建检查点，供后续 `/verify` 使用。
+7. 按原顺序重放 go/use/query。
+
+不能在症状状态覆盖原起点。重放失败保留 worktree 和证据，但不会进入 `ready_to_apply`。
+
+## 10. 检查与验证
+
+检查命令、参数和 cwd 全部由源码固定，子进程使用 `shell:false` 并移除常见凭据环境变量。检查记录
+绑定完整 worktree Hash；该 Hash 覆盖 HEAD、已跟踪 diff 和所有未跟踪文件字节。
+
+`/verify` 是 `ready_to_apply` 的唯一入口：要求已登记变更和复现/失败检查证据，运行路径对应的
+固定检查，存在复现时恢复并重放，最后生成 `patch.diff`、`reverse.diff`、正式仓库基线文件 Hash
+和最终 worktree Hash。
+
+## 11. Apply 与 Discard
+
+`/apply` 重新检查状态、补丁、VerificationRecord、worktree Hash、正式仓库洁净度、`baseHead`、
+逐文件基线 Hash 和 `git apply --check`，再显示精确路径确认。成功只修改正式工作区，不创建提交。
+若应用后任务保存失败，先反向 `--check` 再反向应用，避免仓库和任务事实分裂。
+
+`/discard` 保存最终 Diff、标记 discarded、关闭浏览器/Vite 并退出 Pi。父进程回到维护器 cwd 后
+才删除 `worktrees/` 下的精确任务目录；任务证据保留。
+
+## 12. 本地数据与隐私
+
+```text
+%LOCALAPPDATA%/dungeon-maintainer/
+├─ tasks/<task-id>/{task.json,events.jsonl,pi/,reproductions/,checks/,patch.diff,reverse.diff}
 └─ worktrees/<task-id>/
 ```
 
-配置继续以 `MAINTAINER_*` 进程环境为唯一来源，尤其不会把 API Key 复制到该目录。任务目录是本地
-可审计证据，不应提交到 SQL Dungeon 或本仓库。
+事件只允许标量字段并统一脱敏、限长。禁止持久化 API Key、模型正文、SQL、答案、完整地图、
+`runSeed`、完整快照、正式存档、背包、身份和浏览器帧。
 
-## 12. 验收边界
+## 13. 注释、命名与验收
 
-新仓库的基础门禁为 `pnpm lint`、`pnpm typecheck`、`pnpm test` 和 `pnpm build`。测试必须覆盖
-严格工具字段、路径越权、符号链接、审批过期、Hash 冲突、HEAD 漂移、脏工作区、安全回滚、缓存、
-上下文压缩、模型限额、Dashboard 并发、诊断结构、检查点前置和确定性 Runner。
+生产文件使用中文文件头，导出契约使用中文 JSDoc；注释解释会话绑定、权限、Hash、审批、
+realpath、检查点、重放、日志和 apply 恢复等非直观设计。命名使用 `TaskStore`、`GameDriver`、
+`PreciseEdit` 等明确领域词，禁止 `Manager/Helper/Utils`。
 
-浏览器变更还需在 SQL Dungeon 执行规则测试、Python 在线三角色测试、游戏测试、架构检查和生产
-构建。真实八层试玩是端到端证据，不替代单元测试；模拟模型测试也不替代真实 Git 检查点。
+维护器门禁：`pnpm lint`、`pnpm typecheck`、`pnpm test`、`pnpm build`。游戏门禁：完整测试、
+架构检查、生产构建，并确认 `game/dist` 不含 `__DUNGEON_PLAYTEST__`。端到端验收还需证明 Pi 与
+右侧游戏同启、语义复现、worktree 隔离、刷新恢复重放、核心确认、`/verify` 门禁和显式 `/apply`。
