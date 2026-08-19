@@ -1,0 +1,220 @@
+/**
+ * SQL Dungeon 固定质量检查。
+ *
+ * Agent 只能选择维护器源码登记的 CheckId，不能传命令、参数、cwd 或环境变量。
+ * 子进程使用 shell:false，环境移除常见凭据字段；完整脱敏日志写入任务 checks 目录，
+ * 模型仅看到状态和末尾有限行。结果绑定完整 worktree Hash，代码变化后不会误用。
+ */
+
+import { spawn } from "node:child_process";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { appendEvent } from "../logging/events.js";
+import { redactText } from "../logging/redact.js";
+import type { TaskStore } from "../task/store.js";
+import type { CheckRecord, TaskRecord } from "../task/types.js";
+import { hashWorktree } from "./git.js";
+
+/** 模型可以选择的固定检查 ID。 */
+export type CheckId =
+  | "rules-test"
+  | "rules-validate"
+  | "agent-test"
+  | "game-test"
+  | "game-architecture"
+  | "game-build";
+
+/** 不经过 Shell 拼接的固定检查定义。 */
+export interface CheckSpec {
+  id: CheckId;
+  file: string;
+  args: readonly string[];
+}
+
+const CHECKS: Readonly<Record<CheckId, CheckSpec>> = {
+  "rules-test": {
+    id: "rules-test",
+    file: "python",
+    args: ["scripts/test_validate_rules.py"],
+  },
+  "rules-validate": {
+    id: "rules-validate",
+    file: "python",
+    args: ["scripts/validate-rules.py"],
+  },
+  "agent-test": {
+    id: "agent-test",
+    file: "python",
+    args: ["-m", "unittest", "discover", "-s", "agent/tests"],
+  },
+  "game-test": {
+    id: "game-test",
+    file: "pnpm",
+    args: ["--dir", "game", "test"],
+  },
+  "game-architecture": {
+    id: "game-architecture",
+    file: "pnpm",
+    args: ["--dir", "game", "architecture:check"],
+  },
+  "game-build": {
+    id: "game-build",
+    file: "pnpm",
+    args: ["--dir", "game", "build"],
+  },
+};
+
+/**
+ * 根据变更路径返回 finish ready 前必须通过的检查。
+ *
+ * @param paths 任务记录的精确变更路径。
+ * @returns 去重后的固定检查 ID。
+ */
+export function requiredChecks(paths: readonly string[]): CheckId[] {
+  if (paths.some((path) => path.startsWith("game/src/"))) {
+    return ["game-test", "game-architecture", "game-build"];
+  }
+  if (paths.some((path) => path.startsWith("game/tests/"))) {
+    return ["game-test"];
+  }
+  return [];
+}
+
+function safeEnvironment(): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(process.env).filter(
+    ([name]) => !/(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)/iu.test(name),
+  ));
+}
+
+async function runFixedCommand(
+  spec: CheckSpec,
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<{ code: number | null; output: string; durationMs: number }> {
+  const started = performance.now();
+  return await new Promise((resolve, reject) => {
+    const child = spawn(spec.file, spec.args, {
+      cwd,
+      env: safeEnvironment(),
+      shell: false,
+      windowsHide: true,
+    });
+    const chunks: Buffer[] = [];
+    const collect = (chunk: Buffer): void => {
+      chunks.push(chunk);
+    };
+    child.stdout.on("data", collect);
+    child.stderr.on("data", collect);
+    const abort = (): void => {
+      child.kill();
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    child.once("error", reject);
+    child.once("close", (code) => {
+      signal?.removeEventListener("abort", abort);
+      resolve({
+        code,
+        output: Buffer.concat(chunks).toString("utf8"),
+        durationMs: Math.round(performance.now() - started),
+      });
+    });
+  });
+}
+
+/** 固定检查执行结果及模型可见尾迹。 */
+export interface CheckExecutionResult {
+  record: CheckRecord;
+  cached: boolean;
+  tail: string;
+}
+
+/**
+ * 执行或复用一个固定检查。
+ *
+ * @param store 当前任务存储。
+ * @param task 当前任务。
+ * @param id 维护器源码登记的检查 ID。
+ * @param signal 取消时终止子进程。
+ */
+export async function runCheck(
+  store: TaskStore,
+  task: TaskRecord,
+  id: CheckId,
+  signal?: AbortSignal,
+): Promise<CheckExecutionResult> {
+  signal?.throwIfAborted();
+  const worktreeHash = await hashWorktree(task.worktreeRoot);
+  const cached = task.checks.find(
+    (record) => record.id === id && record.worktreeHash === worktreeHash,
+  );
+  if (cached) {
+    const log = await readFile(cached.logPath, "utf8");
+    await appendEvent(store, task.id, "tool.check", {
+      id,
+      status: cached.status,
+      cached: true,
+    });
+    return {
+      record: cached,
+      cached: true,
+      tail: log.split(/\r?\n/u).slice(-80).join("\n"),
+    };
+  }
+  if (task.state === "ready_to_apply") await store.transition(task, "active");
+  if (task.state === "active") await store.transition(task, "verifying");
+  const checksDir = join(store.taskDir(task.id), "checks");
+  await mkdir(checksDir, { recursive: true });
+  let status: CheckRecord["status"] = "blocked";
+  let command: {
+    code: number | null;
+    output: string;
+    durationMs: number;
+  };
+  try {
+    command = await runFixedCommand(CHECKS[id], task.worktreeRoot, signal);
+    status = command.code === 0 ? "passed" : "failed";
+  } catch (error) {
+    command = {
+      code: null,
+      output: "检查进程无法启动："
+        + (error instanceof Error ? error.name : "UnknownError"),
+      durationMs: 0,
+    };
+  }
+  signal?.throwIfAborted();
+  const logPath = join(
+    checksDir,
+    id + "-" + worktreeHash.slice(0, 12) + ".log",
+  );
+  const safeLog = redactText(command.output);
+  await writeFile(logPath, safeLog, "utf8");
+  const record: CheckRecord = {
+    id,
+    worktreeHash,
+    status,
+    durationMs: command.durationMs,
+    logPath,
+    savedAt: new Date().toISOString(),
+  };
+  task.checks = task.checks.filter(
+    (entry) => !(entry.id === id && entry.worktreeHash === worktreeHash),
+  );
+  task.checks.push(record);
+  await store.save(task);
+  await appendEvent(store, task.id, "tool.check", {
+    id,
+    status,
+    cached: false,
+    durationMs: command.durationMs,
+  });
+  return {
+    record,
+    cached: false,
+    tail: safeLog.split(/\r?\n/u).slice(-80).join("\n"),
+  };
+}
+
+/** 返回全部固定检查 ID，供工具 schema 和测试使用。 */
+export function checkIds(): CheckId[] {
+  return Object.keys(CHECKS) as CheckId[];
+}
