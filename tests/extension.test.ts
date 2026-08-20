@@ -123,7 +123,10 @@ describe("Pi Extension 固定工具、命令和会话阻断", () => {
       assert.equal(provider.models?.[0]?.id, "fixed-model");
       assert.ok(!JSON.stringify(provider).includes("provider-secret"));
 
-      const promptResult = await requireHook(pi, "before_agent_start")() as {
+      const promptResult = await requireHook(pi, "before_agent_start")(
+        {},
+        { getContextUsage: () => undefined },
+      ) as {
         systemPrompt: string;
       };
       assert.deepEqual(pi.activeTools, pi.tools);

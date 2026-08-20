@@ -2,8 +2,8 @@
 
 ## 1. 目标
 
-Dungeon Maintainer V1 是 SQL Dungeon 专用的本地 Coding Agent。用户在当前终端与原生 Pi CLI
-聊天，右侧 headed Chromium 运行 detached worktree 中的真实游戏。Agent 根据自然语言问题定位、
+Dungeon Maintainer V1 是 SQL Dungeon 专用的本地 Coding Agent。用户在一个 Chromium Shell 中与
+Pi RPC 驱动的聊天 CLI 协作，右侧 iframe 运行 detached worktree 中的真实游戏。Agent 根据自然语言问题定位、
 复现、修改并触发页面更新；用户显式 `/apply` 前，正式游戏仓库保持不变。
 
 ```text
@@ -18,6 +18,16 @@ Dungeon Maintainer V1 是 SQL Dungeon 专用的本地 Coding Agent。用户在�
 
 V1 非目标：多 Agent、Dashboard、Electron、通用 Shell、任意浏览器脚本、自建模型循环、长期记忆、
 自动发布和通用仓库适配。
+
+Shell 界面代码必须集中在维护器 src/shell 文件夹：
+
+    src/shell/protocol.ts  状态栏、SSE 事件和确认框数据契约
+    src/shell/server.ts    127.0.0.1 HTTP/SSE、令牌校验和事件环形缓存
+    src/shell/page.ts      聊天、游戏 iframe、拖拽分栏和底部状态栏
+
+父进程通过 Pi RPC/JSONL 与 Agent 通信，游戏由 Playwright 在同一个 Chromium Page 的 iframe
+中驱动。Shell 只传输低敏摘要，不传输 API Key、完整 Prompt、thinking、SQL、管理员答案、
+隐藏裁判或浏览器帧。
 
 ## 2. 两仓库边界
 

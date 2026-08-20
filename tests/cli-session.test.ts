@@ -48,7 +48,9 @@ describe("外部 CLI 与固定 Pi 启动参数", () => {
     const args = buildPiArguments(task, config, "C:/maintainer/extension.js");
     const joined = args.join(" ");
 
+    assert.deepEqual(args.slice(0, 2), ["--mode", "rpc"]);
     for (const flag of [
+      "--approve",
       "--no-builtin-tools",
       "--no-extensions",
       "--no-skills",

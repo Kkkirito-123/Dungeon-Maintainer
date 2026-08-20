@@ -12,6 +12,10 @@ describe("V1 启动与 Extension 职责分区", () => {
       new URL("../../src/app/pi-process.ts", import.meta.url),
       "utf8",
     );
+    const rpcProcess = await readFile(
+      new URL("../../src/pi/rpc-process.ts", import.meta.url),
+      "utf8",
+    );
     const start = await readFile(
       new URL("../../src/app/start.ts", import.meta.url),
       "utf8",
@@ -20,7 +24,8 @@ describe("V1 启动与 Extension 职责分区", () => {
     assert.match(appFacade, /from "\.\/app\/pi-process\.js"/u);
     assert.match(appFacade, /from "\.\/app\/start\.js"/u);
     assert.doesNotMatch(appFacade, /node:child_process/u);
-    assert.match(piProcess, /spawn\(/u);
+    assert.match(piProcess, /PiRpcProcess/u);
+    assert.match(rpcProcess, /spawn\(/u);
     assert.match(start, /createTaskWorktree/u);
   });
 

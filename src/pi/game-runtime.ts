@@ -22,6 +22,27 @@ interface ActiveGameRuntime {
   driver: GameDriver;
 }
 
+async function notifyShellRuntime(
+  shellUrl: string | undefined,
+  state: "starting" | "ready" | "error" | "stopped",
+  gameUrl: string,
+): Promise<void> {
+  if (!shellUrl) return;
+  const shell = new URL(shellUrl);
+  const endpoint = new URL("/api/runtime", shell);
+  endpoint.search = shell.search;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-dungeon-token": shell.searchParams.get("token") ?? "",
+    },
+    body: JSON.stringify({ state, gameUrl }),
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!response.ok) throw new Error("统一 Shell 未接受游戏运行时状态");
+}
+
 /**
  * 管理单任务、单浏览器游戏运行时。
  *
@@ -70,12 +91,16 @@ export class DungeonGameRuntime {
       let browser: GameBrowser | null = null;
       try {
         server = await startGameServer(this.task.worktreeRoot);
+        const gameUrl = server.url + "/?playtest=agent&floor=1";
+        const shellUrl = process.env.DUNGEON_MAINTAINER_SHELL_URL?.trim();
+        await notifyShellRuntime(shellUrl, "starting", gameUrl);
         browser = new GameBrowser(server.url, (kind) => {
           void appendEvent(this.store, this.task.id, "browser.error", { kind }).catch(
             () => undefined,
           );
-        });
+        }, shellUrl);
         await browser.open();
+        await notifyShellRuntime(shellUrl, "ready", gameUrl);
         const driver = new GameDriver(browser);
         this.active = { server, browser, driver };
         await appendEvent(this.store, this.task.id, "game.started", {
@@ -83,6 +108,8 @@ export class DungeonGameRuntime {
         });
         return driver;
       } catch (error) {
+        const shellUrl = process.env.DUNGEON_MAINTAINER_SHELL_URL?.trim();
+        await notifyShellRuntime(shellUrl, "error", "").catch(() => undefined);
         await browser?.close().catch(() => undefined);
         await server?.close().catch(() => undefined);
         throw error;
@@ -106,6 +133,11 @@ export class DungeonGameRuntime {
     if (!active) return;
     await active.browser.close();
     await active.server.close();
+    await notifyShellRuntime(
+      process.env.DUNGEON_MAINTAINER_SHELL_URL?.trim(),
+      "stopped",
+      "",
+    ).catch(() => undefined);
     await appendEvent(this.store, this.task.id, "game.stopped");
   }
 }

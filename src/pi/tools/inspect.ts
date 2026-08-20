@@ -4,7 +4,7 @@
  * 本文件负责把状态、浅目录、文本搜索、分页读取和 worktree Diff 转换为有限模型证据；
  * 不负责修改文件、执行任意命令或判断修复是否完成。所有路径都先经过 workspace
  * policy 的 realpath 边界检查，搜索仅以固定参数调用 ripgrep。输出最多 400 行或
- * 48 KiB，并在进入 Pi 上下文前脱敏；`.env`、生成目录、二进制和仓库外符号链接
+ * 8 KiB，并在进入 Pi 上下文前脱敏；`.env`、生成目录、二进制和仓库外符号链接
  * 始终不可读。主要失败模式是路径越权、文件过大、`rg` 缺失或搜索进程异常。
  */
 
@@ -27,7 +27,7 @@ import {
 
 const exec = promisify(execFile);
 const MAX_LINES = 400;
-const MAX_BYTES = 48 * 1024;
+const MAX_BYTES = 8 * 1024;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
 /** `inspect` 的严格参数契约。 */
@@ -277,7 +277,7 @@ export async function inspectTask(
     text: metadata
       + "\n"
       + clipped.text
-      + (clipped.truncated ? "\n[内容已按 400 行或 48 KiB 截断]" : ""),
+      + (clipped.truncated ? "\n[内容已按 400 行或 8 KiB 截断]" : ""),
     details,
   };
 }

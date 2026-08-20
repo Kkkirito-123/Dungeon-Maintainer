@@ -3,11 +3,11 @@
  *
  * 浏览器使用全新临时 Context，不读取用户 Chrome Profile。所有页面调用都固定为
  * look/go/use/query/judge/checkpoint，不接受模型 JavaScript、CSS 选择器或 SQL。
- * headed Chromium 默认移动到常见 1920 像素屏幕的右半侧；窗口管理器不接受定位参数
- * 时仍会正常打开，用户可手动调整，不影响任务安全。
+ * headed Chromium 只打开维护器 Shell 页面；游戏本身作为 Shell 内的 iframe 加载，
+ * 因此用户只看到一个可拖拽分栏的窗口。没有 Shell 地址时仅用于单元测试兼容直开游戏。
  */
 
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Frame, type Page } from "playwright";
 import type {
   PlayJudge,
   PlayResult,
@@ -30,14 +30,17 @@ export class GameBrowser {
   private browser: Browser | null = null;
   private context: BrowserContext | null = null;
   private page: Page | null = null;
+  private gameUrl = "";
 
   /**
    * @param baseUrl 当前 worktree 的本机 Vite 地址。
    * @param onError 页面错误通知，只允许记录分类而非控制台正文。
+   * @param shellUrl 统一 Chromium Shell 地址；正式 start/resume 必须提供。
    */
   constructor(
     private readonly baseUrl: string,
     private readonly onError: BrowserErrorListener,
+    private readonly shellUrl: string | null = process.env.DUNGEON_MAINTAINER_SHELL_URL?.trim() || null,
   ) {}
 
   /**
@@ -50,8 +53,7 @@ export class GameBrowser {
       this.browser = await chromium.launch({
         headless: false,
         args: [
-          "--window-position=960,0",
-          "--window-size=960,1000",
+          "--window-size=1500,1000",
         ],
       });
     } catch (error) {
@@ -72,8 +74,9 @@ export class GameBrowser {
     this.page.on("pageerror", () => {
       this.onError("page-error");
     });
+    this.gameUrl = this.baseUrl + "/?playtest=agent&floor=" + String(floor);
     await this.page.goto(
-      this.baseUrl + "/?playtest=agent&floor=" + String(floor),
+      this.shellUrl ?? this.gameUrl,
       { waitUntil: "domcontentloaded" },
     );
     await this.waitForReady();
@@ -99,12 +102,12 @@ export class GameBrowser {
    * @throws 桥未安装或 sessionStorage 写入失败时拒绝，调用方不得继续 patch。
    */
   async checkpoint(): Promise<void> {
-    const saved = await this.needPage().evaluate(() => {
+    const saved = await this.needGameFrame().then((frame) => frame.evaluate(() => {
       const bridge = (window as unknown as {
         __DUNGEON_PLAYTEST__?: { checkpoint?: () => boolean };
       }).__DUNGEON_PLAYTEST__;
       return bridge?.checkpoint?.() ?? false;
-    });
+    }));
     if (!saved) throw new GameBrowserError("游戏状态无法建立刷新检查点");
   }
 
@@ -114,14 +117,14 @@ export class GameBrowser {
    * @returns 恢复后的玩家投影。
    */
   async reloadFromCheckpoint(): Promise<PlayView> {
-    const page = this.needPage();
-    await page.reload({ waitUntil: "domcontentloaded" });
+    const frame = await this.needGameFrame();
+    await frame.goto(this.gameUrl, { waitUntil: "domcontentloaded" });
     await this.waitForReady();
-    const restored = await page.evaluate(() => (
+    const restored = await this.needGameFrame().then((currentFrame) => currentFrame.evaluate(() => (
       (window as unknown as {
         __DUNGEON_PLAYTEST__?: { checkpointRestored?: boolean };
       }).__DUNGEON_PLAYTEST__?.checkpointRestored === true
-    ));
+    )));
     if (!restored) {
       throw new GameBrowserError("刷新后未消费一次性游戏检查点");
     }
@@ -168,13 +171,13 @@ export class GameBrowser {
   }
 
   private async waitForReady(): Promise<void> {
-    const page = this.needPage();
-    await page.waitForFunction(() => (
+    const frame = await this.needGameFrame();
+    await frame.waitForFunction(() => (
       (window as unknown as {
         __DUNGEON_PLAYTEST__?: { version?: number };
       }).__DUNGEON_PLAYTEST__?.version === 2
     ));
-    await page.waitForFunction(() => (
+    await frame.waitForFunction(() => (
       document.querySelector("#app")?.getAttribute("data-runtime-state")
       === "active"
     ));
@@ -185,12 +188,28 @@ export class GameBrowser {
     return this.page;
   }
 
+  private async needGameFrame(): Promise<Frame> {
+    const page = this.needPage();
+    if (!this.shellUrl) return page.mainFrame();
+    const expectedOrigin = new URL(this.baseUrl).origin;
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      const frame = page.frames().find((candidate) => (
+        candidate !== page.mainFrame()
+        && candidate.url().startsWith(expectedOrigin)
+      ));
+      if (frame) return frame;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new GameBrowserError("统一 Shell 中的游戏 iframe 未加载");
+  }
+
   private async call<T>(
     method: "look" | "go" | "use" | "query" | "judge" | "events",
     args: unknown[],
   ): Promise<T> {
     try {
-      return await this.needPage().evaluate(
+      return await this.needGameFrame().then((frame) => frame.evaluate(
         async ({ name, values }) => {
           const bridge = (window as unknown as {
             __DUNGEON_PLAYTEST__?: Record<
@@ -203,7 +222,7 @@ export class GameBrowser {
           return await operation(...values);
         },
         { name: method, values: args },
-      ) as T;
+      ) as Promise<T>);
     } catch (error) {
       throw new GameBrowserError("浏览器工具 " + method + " 执行失败", {
         cause: error,

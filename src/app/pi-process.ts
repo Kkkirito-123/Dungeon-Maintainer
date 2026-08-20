@@ -9,11 +9,13 @@
  * 的 id/cwd 和文件名必须与任务一致；发现漂移时安全阻断，保留原任务供用户诊断。
  */
 
-import { spawn } from "node:child_process";
 import { open, readdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { requireApiKey, type MaintainerConfig } from "../config.js";
+import { PiRpcProcess, type PiRpcCommand } from "../pi/rpc-process.js";
+import { startShellServer } from "../shell/server.js";
+import { TaskStore } from "../task/store.js";
 import type { TaskRecord } from "../task/types.js";
 import { comparablePath } from "./path.js";
 import { pathExists } from "../workspace/git.js";
@@ -53,6 +55,11 @@ export function buildPiArguments(
   loadedExtensionPath = extensionPath(),
 ): string[] {
   return [
+    "--mode",
+    "rpc",
+    // 维护器只加载自己显式传入的 Extension，且 cwd 固定为隔离 worktree；自动批准
+    // 这个受控目录可以跳过 Pi 首次启动的交互式信任提示，避免可见终端停在启动阶段。
+    "--approve",
     "--no-builtin-tools",
     "--no-extensions",
     "--no-skills",
@@ -84,6 +91,28 @@ export async function runPiProcess(
   config: MaintainerConfig,
 ): Promise<number> {
   const apiKey = requireApiKey(config);
+  const store = new TaskStore(config.dataDir);
+  let rpc: PiRpcProcess | null = null;
+  let stopping = false;
+  const shell = await startShellServer({
+    task,
+    model: config.model,
+    contextWindow: config.contextWindow,
+    store,
+    sendPiCommand: async (command: PiRpcCommand) => {
+      if (!rpc) throw new Error("Pi RPC 尚未启动");
+      if (command.type === "extension_ui_response") {
+        rpc.respond(command);
+        return { ok: true };
+      }
+      return await rpc.send(command);
+    },
+    onClose: async () => {
+      if (stopping) return;
+      stopping = true;
+      await rpc?.stop();
+    },
+  });
   const environment: NodeJS.ProcessEnv = {
     ...process.env,
     MAINTAINER_API_KEY: apiKey,
@@ -93,22 +122,52 @@ export async function runPiProcess(
     MAINTAINER_MAX_TOKENS: String(config.maxOutputTokens),
     DUNGEON_MAINTAINER_TASK_ID: task.id,
     DUNGEON_MAINTAINER_DATA_DIR: config.dataDir,
+    DUNGEON_MAINTAINER_WORKTREE: task.worktreeRoot,
+    DUNGEON_MAINTAINER_SHELL_URL: shell.url,
   };
-  const child = spawn(
-    process.execPath,
-    [resolvePiCliPath(), ...buildPiArguments(task, config)],
-    {
-      cwd: task.worktreeRoot,
-      env: environment,
-      stdio: "inherit",
-      shell: false,
-      windowsHide: false,
+  rpc = new PiRpcProcess(
+    resolvePiCliPath(),
+    buildPiArguments(task, config),
+    environment,
+    (event) => {
+      shell.handlePiEvent(event);
+      if (event && typeof event === "object" && !Array.isArray(event)) {
+        const record = event as Record<string, unknown>;
+        if (record.type === "message_update" && record.usage) {
+          shell.updateSessionStats({ tokens: record.usage });
+        }
+        if (record.type === "agent_end" || record.type === "agent_settled") {
+          void rpc?.send({ id: "stats-" + String(Date.now()), type: "get_session_stats" })
+            .then((stats) => shell.updateSessionStats(stats))
+            .catch(() => undefined);
+        }
+        if (record.type === "pi_stderr" || record.type === "pi_protocol_error") {
+          shell.publish({
+            type: "notice",
+            level: "error",
+            text: record.type === "pi_protocol_error"
+              ? "Pi RPC 输出协议异常"
+              : "Pi RPC 进程报告错误输出",
+          });
+        }
+      }
+      void store.read(task.id)
+        .then((updated) => shell.updateTask(updated))
+        .catch(() => undefined);
     },
   );
-  return await new Promise<number>((resolvePromise, rejectPromise) => {
-    child.once("error", rejectPromise);
-    child.once("close", (code) => resolvePromise(code ?? 1));
-  });
+  try {
+    await rpc.start();
+    console.log("统一 Chromium Shell：" + shell.url);
+    console.log("左侧为 Pi 聊天，右侧为 worktree 游戏；正式仓库仍需显式 /apply");
+    const exitCode = await rpc.waitForExit();
+    shell.publish({ type: "closed", code: exitCode });
+    return exitCode;
+  } finally {
+    await rpc.stop();
+    await shell.close();
+    rpc = null;
+  }
 }
 
 async function readPiSessionHeader(path: string): Promise<{
@@ -165,4 +224,20 @@ export async function verifyPiSession(task: TaskRecord): Promise<string> {
     throw new Error("Pi 会话首行 cwd 与任务 worktree 不一致");
   }
   return path;
+}
+
+/**
+ * 判断任务目录是否仍处于“从未写入 Pi 会话”的首次启动窗口。
+ *
+ * @param task 已通过路径绑定校验的任务。
+ * @returns 会话目录存在且没有任何匹配当前任务 ID 的会话文件时返回 `true`。
+ * @remarks 该结果只允许 resume 对没有任何补丁、检查或复现证据的全新任务使用；
+ * 一旦目录中出现过会话文件，调用方必须继续走严格的唯一文件校验。
+ */
+export async function hasNoPiSessionFile(task: TaskRecord): Promise<boolean> {
+  if (!await pathExists(task.piSessionDir)) return false;
+  const suffix = "_" + task.id + ".jsonl";
+  const matches = (await readdir(task.piSessionDir, { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && entry.name.endsWith(suffix));
+  return matches.length === 0;
 }

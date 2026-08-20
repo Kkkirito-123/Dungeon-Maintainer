@@ -39,7 +39,10 @@ export interface GameToolContext {
 }
 
 function text(value: unknown): string {
-  return JSON.stringify(value, null, 2);
+  const serialized = JSON.stringify(value, null, 2);
+  return serialized.length <= 8 * 1024
+    ? serialized
+    : serialized.slice(0, 8 * 1024) + "\n[游戏结果已按 8 KiB 截断]";
 }
 
 /**

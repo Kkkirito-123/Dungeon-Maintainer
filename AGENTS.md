@@ -5,20 +5,21 @@ TypeScript 标识符使用清晰英文领域词。
 
 ## 产品目标与非目标
 
-本仓库只实现 SQL Dungeon 专用的本地 Coding Agent：原生 Pi CLI 负责聊天，维护器 Extension
+本仓库只实现 SQL Dungeon 专用的本地 Coding Agent：Pi RPC 驱动统一 Chromium Shell 的聊天，
+维护器 Extension
 负责受限代码工具、游戏语义工具、detached worktree、固定检查、浏览器复现和显式 apply。
 
 ```text
-Pi CLI -> src/pi/extension.ts
+Chromium Shell -> Pi RPC -> src/pi/extension.ts
   -> session-policy + game-runtime
   -> inspect / patch / check / finish
   -> look / go / use / query
   -> task + workspace + repair + game + logging
 ```
 
-V1 固定单 Agent、单任务、单 worktree、单 Vite 和单 Chromium Context。不要加入 Dashboard、
-Electron、自建模型循环、上下文压缩、Harness、通用 Shell、多 Agent、长期记忆、自动 commit、push、
-PR、部署或 HTTP 服务。维护器和游戏始终是两个独立仓库。
+V1 固定单 Agent、单任务、单 worktree、单 Vite 和单 Chromium Context。不要加入公网 Dashboard、
+Electron、自建模型循环、Harness、通用 Shell、多 Agent、长期记忆、自动 commit、push、PR 或部署。
+允许且仅允许由 src/shell 提供绑定 127.0.0.1 的任务级 HTTP/SSE 界面。维护器和游戏始终是两个独立仓库。
 
 ## 模块所有权
 
@@ -32,6 +33,7 @@ src/pi/session-policy.ts Pi 会话绑定、固定模型、Shell 与会话切换�
 src/pi/game-runtime.ts   单 Vite、临时 Chromium 和 GameDriver 生命周期
 src/pi/tools/            八个固定模型工具
 src/pi/commands/         五个固定用户命令
+src/shell/               Chromium Shell 页面、HTTP/SSE 协议和状态栏
 src/task/                schema v2 任务事实与状态机
 src/workspace/           Git、realpath、补丁、检查、apply 与 worktree
 src/game/                Vite、临时 Chromium、协议客户端与语义驱动
@@ -118,6 +120,19 @@ pnpm build
 测试必须覆盖 CLI/Pi 参数、会话绑定、状态迁移、绝对路径与 `..`、符号链接、审批拒绝与消费、
 Hash 冲突、worktree 隔离、刷新重放顺序、日志脱敏、apply 漂移和 discard 清理。Git 安全测试使用
 真实临时仓库，不能只用 mock。
+
+## 统一 Shell 目录约束
+
+V1 的聊天和游戏展示使用一个本地 Chromium Shell。所有界面、HTTP/SSE 事件和状态栏代码必须
+集中在 src/shell 文件夹：
+
+    src/shell/protocol.ts  状态、事件和确认框契约
+    src/shell/server.ts    127.0.0.1 服务、令牌校验和事件缓存
+    src/shell/page.ts      聊天、iframe、拖拽分栏和底部状态栏
+
+Pi 子进程继续使用 RPC/JSONL；游戏由 Playwright 在同一个 Chromium Page 的 iframe 中驱动。
+不得把界面状态复制到 task.json，也不得通过 Shell 传输 API Key、完整 Prompt、thinking、SQL、
+管理员答案、隐藏裁判或浏览器帧。允许本地 HTTP/SSE 仅用于当前任务的 Shell，不得扩展成公网服务。
 
 涉及游戏桥时，还要在目标游戏仓库运行聚焦测试、完整游戏测试、架构检查和生产构建，并确认
 `game/dist` 不含 `__DUNGEON_PLAYTEST__`。只报告实际执行的检查，不把静态或 mock 证据称为端到端。

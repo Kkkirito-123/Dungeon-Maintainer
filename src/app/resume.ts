@@ -12,7 +12,11 @@ import type { MaintainerConfig } from "../config.js";
 import { requireApiKey } from "../config.js";
 import { TaskStore } from "../task/store.js";
 import { inspectDungeonRepository, verifyRuntimeDependencies } from "./repository.js";
-import { runPiProcess, verifyPiSession } from "./pi-process.js";
+import {
+  hasNoPiSessionFile,
+  runPiProcess,
+  verifyPiSession,
+} from "./pi-process.js";
 import { assertTaskLocalPaths, cleanupFinishedWorktree } from "./task-lifecycle.js";
 import { verifyTaskWorktree } from "../workspace/worktree.js";
 import { comparablePath } from "./path.js";
@@ -45,7 +49,22 @@ export async function resumeMaintainer(
   }
   await verifyRuntimeDependencies(state.root);
   await verifyTaskWorktree(task);
-  await verifyPiSession(task);
+  const untouched = (task.state === "created" || task.state === "active")
+    && task.changedPaths.length === 0
+    && task.patchLines === 0
+    && task.checks.length === 0
+    && task.reproductions.length === 0
+    && task.verification === null
+    && task.approval === null
+    && task.patchPath === null
+    && task.reversePatchPath === null;
+  if (untouched && await hasNoPiSessionFile(task)) {
+    // Pi 只有在首次输入后才会落盘 JSONL；首次启动尚未输入时允许同一 taskId
+    // 创建这一个全新的会话，避免把“尚未产生会话文件”误报成损坏或重复会话。
+    console.warn("原任务尚未写入 Pi 会话文件，将继续创建同一任务的首次会话");
+  } else {
+    await verifyPiSession(task);
+  }
   console.log("恢复任务：" + task.id);
   console.log("继续使用原 Pi 会话与 worktree；正式仓库仍需显式 /apply");
   const exitCode = await runPiProcess(task, config);

@@ -105,6 +105,38 @@ export function installDungeonMaintainerExtension(
   registerMaintainerCommands(pi, sharedContext);
   registerSessionPolicyHooks(pi, store, task, config);
 
+  let turnToolCalls = 0;
+  let lastToolSignature = "";
+  let repeatedToolCalls = 0;
+
+  // 工具预算在 Extension 层阻断，避免模型因为一次错误判断不断重复 inspect 或游戏动作；
+  // 这不是提示词建议，而是运行时硬限制，因此不会因模型输出变长而失效。
+  pi.on("agent_start", () => {
+    turnToolCalls = 0;
+    lastToolSignature = "";
+    repeatedToolCalls = 0;
+  });
+  pi.on("tool_call", (event) => {
+    turnToolCalls += 1;
+    const signature = event.toolName + ":" + JSON.stringify(event.input);
+    if (signature === lastToolSignature) repeatedToolCalls += 1;
+    else repeatedToolCalls = 1;
+    lastToolSignature = signature;
+    const toolLimit = event.toolName === "inspect"
+      ? 12
+      : ["look", "go", "use", "query"].includes(event.toolName) ? 8
+        : event.toolName === "patch" ? 4
+          : ["check", "finish"].includes(event.toolName) ? 8 : 32;
+    if (turnToolCalls > 32 || repeatedToolCalls > 2 || turnToolCalls > toolLimit) {
+      return {
+        block: true,
+        terminate: true,
+        reason: "本阶段工具预算已用尽或检测到重复调用；请先总结已有证据再继续。",
+      };
+    }
+    return undefined;
+  });
+
   pi.on("session_start", async (_event, context) => {
     await assertTaskSessionBinding(context, task);
     if (task.state === "applied" || task.state === "discarded") {
@@ -124,6 +156,8 @@ export function installDungeonMaintainerExtension(
     if (!expectedModel || !await pi.setModel(expectedModel)) {
       throw new Error("Dungeon Maintainer 模型未注册或 API Key 不可用");
     }
+    // 当前专用 Agent 不展示思维链；关闭 thinking 可直接减少无效输出和上下文占用。
+    pi.setThinkingLevel("off");
     await gameRuntime.ensure();
     await appendEvent(store, task.id, "pi.session_start", {
       state: task.state,
@@ -134,9 +168,18 @@ export function installDungeonMaintainerExtension(
     );
   });
 
-  pi.on("before_agent_start", () => {
+  pi.on("before_agent_start", (_event, context) => {
     // 每个模型回合都重新固定工具列表，防止 UI 设置或快捷键把内置能力重新激活。
     pi.setActiveTools([...ACTIVE_TOOLS]);
+    const usage = context.getContextUsage();
+    if (usage?.percent !== null && usage?.percent !== undefined && usage.percent >= 90) {
+      // 90% 后主动压缩并只保留任务事实，避免模型继续重复读取造成上下文溢出。
+      context.compact({
+        customInstructions: "只保留任务目标、当前复现用例、证据 ID、补丁路径、验证状态和未解决阻塞；删除重复文件正文。",
+      });
+    } else if (usage?.percent !== null && usage?.percent !== undefined && usage.percent >= 80) {
+      context.ui.notify("上下文已超过 80%，请停止低价值搜索并使用已有证据摘要。", "warning");
+    }
     return { systemPrompt: buildDungeonMaintainerPrompt(task) };
   });
 

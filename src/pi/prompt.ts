@@ -41,6 +41,11 @@ export function buildDungeonMaintainerPrompt(task: TaskRecord): string {
     "只读诊断使用 finish(status=diagnosed)；客观无法继续时使用 blocked，并明确缺少什么证据或环境。",
     "不要声称 ready_to_apply 或已应用：只有 /verify 能进入 ready_to_apply，只有用户的 /apply 能写回正式仓库。",
     "",
+    "Token 与上下文纪律：每个回合只给简短结论、证据摘要和下一步；不要输出思维链。",
+    "定位最多使用 12 次 inspect，复现最多 8 次 look/go/use/query，修改最多 4 次 patch，验证最多 8 次 check/finish。",
+    "相同工具参数连续重复时必须改变策略；工具预算用尽后停止搜索并总结，不要死循环。",
+    "上下文接近上限时优先引用已有证据摘要，不要重新读取相同文件；必要时等待 Pi 自动压缩。",
+    "",
     "代码要求：修改范围必须直接服务当前问题；命名使用明确领域词，禁止含糊的 Manager/Helper/Utils。",
     "新增或重写生产文件要有中文文件头、导出契约中文 JSDoc，并在安全边界和非直观顺序处解释为什么。",
   ].join("\n");
