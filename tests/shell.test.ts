@@ -254,10 +254,9 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
           body: JSON.stringify({ text: "定位问题" }),
         });
         assert.equal(inputResponse.status, 200);
-        const firstCommand = commands[0];
-        assert.ok(firstCommand);
-        assert.equal(firstCommand.type, "prompt");
-        assert.equal(firstCommand.message, "定位问题");
+        const promptCommand = commands.find((command) => command.type === "prompt");
+        assert.ok(promptCommand);
+        assert.equal(promptCommand.message, "定位问题");
 
         const busyInputResponse = await fetch(shell.url.replace("/?", "/api/input?"), {
           method: "POST",
@@ -465,6 +464,82 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
         const persisted = await store.read(task.id);
         assert.equal(persisted.modelProfileId, "default");
         assert.equal(persisted.thinkingLevel, "high");
+      } finally {
+        await shell.close();
+      }
+    } finally {
+      await repository.dispose();
+    }
+  });
+
+  it("自然语言输入超出安全线时先同步压缩，压缩后仍超限则不发送 prompt", async () => {
+    const repository = await createTemporaryGitRepository({ "README.md": "token control\n" });
+    try {
+      const dataDir = join(repository.temporaryRoot, "data");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "shell-token-control",
+        objective: INITIAL_TASK_OBJECTIVE,
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(store.taskDir("shell-token-control"), "pi"),
+      });
+      const commands: Array<Record<string, unknown>> = [];
+      let contextTokens = 50_000;
+      let compactedTokens = 12_000;
+      const sessionStats = () => ({
+        contextUsage: {
+          tokens: contextTokens,
+          contextWindow: 64_000,
+          percent: contextTokens / 640,
+        },
+      });
+      const shell = await startShellServer({
+        task,
+        model: "model-a",
+        contextWindow: 64_000,
+        maxOutputTokens: 4_096,
+        store,
+        sendPiCommand: async (command) => {
+          commands.push(command);
+          if (command.type === "get_session_stats") return sessionStats();
+          if (command.type === "compact") {
+            contextTokens = compactedTokens;
+            return { estimatedTokensAfter: compactedTokens };
+          }
+          return undefined;
+        },
+        onClose: async () => undefined,
+      });
+      try {
+        shell.updateSessionStats(sessionStats());
+        const accepted = await fetch(shell.url.replace("/?", "/api/input?"), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text: "继续定位" }),
+        });
+        assert.equal(accepted.status, 200);
+        assert.deepEqual(
+          commands.map((command) => command.type),
+          ["get_session_stats", "compact", "get_session_stats", "prompt"],
+        );
+
+        shell.handlePiEvent({ type: "agent_settled" });
+        contextTokens = 50_000;
+        compactedTokens = 50_000;
+        shell.updateSessionStats(sessionStats());
+        const blocked = await fetch(shell.url.replace("/?", "/api/input?"), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text: "继续定位" }),
+        });
+        assert.equal(blocked.status, 409);
+        assert.match(
+          (await blocked.json() as { error: string }).error,
+          /压缩后仍预计使用/u,
+        );
+        assert.equal(commands.filter((command) => command.type === "prompt").length, 1);
       } finally {
         await shell.close();
       }

@@ -110,6 +110,9 @@ src/
 
 旧 Dashboard、自建 CLI 交互层、自建模型循环、Harness、两级缓存和通用适配器已删除；上下文控制
 改由 Pi 原生 compact 加维护器的最新证据裁剪完成。
+自然语言输入进入 Pi 前由 Shell 执行同步 Token 门禁：安全输入上限取
+`min(contextWindow × 75%, contextWindow - maxOutputTokens)`，并加入本轮输入的保守估算。
+超过安全线时先等待 Pi compact 完成；压缩后仍超过安全线才拒绝本轮，且拒绝的输入不会发送给模型。
 `app.ts` 与 `pi/extension.ts` 保持稳定门面，具体副作用归入唯一职责文件；架构回归测试防止
 子进程、worktree、`realpath` 或 Vite/Chromium 生命周期重新堆回装配入口。
 

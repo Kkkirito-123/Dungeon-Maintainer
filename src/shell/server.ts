@@ -14,6 +14,10 @@ import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
 import type { PiRpcCommand } from "../pi/rpc-process.js";
+import {
+  decideTokenControl,
+  promptTokenLimit,
+} from "../pi/token-control.js";
 import type { TaskStore } from "../task/store.js";
 import type { TaskRecord } from "../task/types.js";
 import {
@@ -88,7 +92,18 @@ function modelOption(value: unknown): ShellModelOption | null {
     id,
     name: stringValue(value.name) ?? id,
     reasoning: value.reasoning === true,
+    contextWindow: typeof value.contextWindow === "number" ? value.contextWindow : null,
+    maxOutputTokens: typeof value.maxTokens === "number" ? value.maxTokens : null,
   };
+}
+
+function compactionEstimate(value: unknown): number | null {
+  if (!isRecord(value)) return null;
+  return typeof value.estimatedTokensAfter === "number"
+    && Number.isFinite(value.estimatedTokensAfter)
+    && value.estimatedTokensAfter >= 0
+    ? Math.floor(value.estimatedTokensAfter)
+    : null;
 }
 
 function taskProfileId(provider: string, modelId: string): string {
@@ -220,12 +235,14 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
   let task = options.task;
   const shellTaskId = options.task.id;
   let status: ShellStatus = createInitialStatus(options);
+  let activeMaxOutputTokens = options.maxOutputTokens ?? 4_096;
   let gameUrl: string | null = null;
   let sequence = 0;
   const events: Array<{ id: number; event: ShellEvent }> = [];
   const clients = new Set<ShellClient>();
   const token = randomUUID();
   let promptInFlight = false;
+  let tokenControlInFlight = false;
   let activeRequestKind: "input" | "command" | null = null;
   let pendingTerminalError: string | null = null;
   let activityStartedAt: number | null = null;
@@ -412,17 +429,19 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
       };
     }
     if (contextUsage) {
+      const contextLimit = typeof contextUsage.contextWindow === "number"
+        ? contextUsage.contextWindow
+        : status.contextLimit;
       status = {
         ...status,
         contextUsed: typeof contextUsage.tokens === "number"
           ? contextUsage.tokens
           : null,
-        contextLimit: typeof contextUsage.contextWindow === "number"
-          ? contextUsage.contextWindow
-          : status.contextLimit,
+        contextLimit,
         contextPercent: typeof contextUsage.percent === "number"
           ? contextUsage.percent
           : null,
+        promptTokenLimit: promptTokenLimit(contextLimit, activeMaxOutputTokens),
       };
     }
     publishState();
@@ -437,6 +456,8 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
     ]);
     const state = isRecord(stateValue) ? stateValue : null;
     const currentModel = state ? modelOption(state.model) : null;
+    activeMaxOutputTokens = currentModel?.maxOutputTokens ?? activeMaxOutputTokens;
+    const contextLimit = currentModel?.contextWindow ?? status.contextLimit;
     const modelsRecord = isRecord(modelsValue) ? modelsValue : null;
     const availableModels = Array.isArray(modelsRecord?.models)
       ? modelsRecord.models.map(modelOption).filter(
@@ -460,6 +481,8 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
       pendingMessageCount: state && typeof state.pendingMessageCount === "number"
         ? state.pendingMessageCount
         : 0,
+      contextLimit,
+      promptTokenLimit: promptTokenLimit(contextLimit, activeMaxOutputTokens),
     };
     const nextProfileId = taskProfileId(status.modelProvider, status.model);
     const previousProfileId = task.modelProfileId;
@@ -484,6 +507,77 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
     }
     updateSessionStats(statsValue);
     publishState();
+  };
+
+  const refreshTokenUsage = async (): Promise<void> => {
+    const stats = await options.sendPiCommand({ type: "get_session_stats" });
+    updateSessionStats(stats);
+  };
+
+  const compactForTokenControl = async (): Promise<number | null> => {
+    status = { ...status, phase: "compacting" };
+    publishState();
+    publishActivity("working", "上下文超过安全线，正在压缩后再提交本轮消息…", true);
+    const result = await options.sendPiCommand({
+      type: "compact",
+      customInstructions: "保留当前任务目标、最新游戏证据、源码定位、已批准修改范围、Diff、验证状态和未解决阻塞；删除重复旧工具正文。",
+    });
+    const estimatedTokens = compactionEstimate(result);
+    await refreshTokenUsage().catch(() => undefined);
+    if (estimatedTokens !== null) {
+      status = {
+        ...status,
+        contextUsed: estimatedTokens,
+        contextPercent: status.contextLimit > 0
+          ? estimatedTokens / status.contextLimit * 100
+          : null,
+      };
+      publishState();
+    }
+    return estimatedTokens ?? status.contextUsed;
+  };
+
+  const ensureNaturalInputBudget = async (text: string): Promise<string | null> => {
+    // 新会话尚未有可用上下文估算时不发额外 RPC；Pi 原生 overflow 门禁负责兜底。
+    // 已有用量的会话才在发送前刷新，避免把未知状态误判为超限或改变普通请求顺序。
+    if (status.contextUsed !== null) await refreshTokenUsage();
+    const decision = decideTokenControl(
+      status.contextUsed,
+      status.contextLimit,
+      activeMaxOutputTokens,
+      text,
+    );
+    if (decision.action === "allow") return null;
+    try {
+      const compactedTokens = await compactForTokenControl();
+      const afterCompaction = decideTokenControl(
+        compactedTokens,
+        status.contextLimit,
+        activeMaxOutputTokens,
+        text,
+      );
+      if (afterCompaction.action === "compact") {
+        const error = "上下文压缩后仍预计使用 "
+          + String(afterCompaction.projectedTokens)
+          + " Token，超过安全输入上限 "
+          + String(afterCompaction.promptTokenLimit)
+          + "；请切换更大上下文模型或创建新任务。";
+        status = { ...status, phase: "idle" };
+        publishActivity("error", error);
+        publishState();
+        return error;
+      }
+      status = { ...status, phase: "idle" };
+      publishActivity("done", "上下文压缩完成，正在提交本轮消息…");
+      publishState();
+      return null;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "上下文压缩失败";
+      status = { ...status, phase: "idle" };
+      publishActivity("error", "自动压缩失败：" + sanitizeText(message));
+      publishState();
+      return "上下文已超过安全线，但自动压缩失败：" + sanitizeText(message);
+    }
   };
 
   const updateRuntime = (update: { state: "starting" | "ready" | "error" | "stopped"; gameUrl?: string | null }): void => {
@@ -820,6 +914,24 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
         writeJson(response, { error: "Pi 正在处理上一条消息，请等待当前动作完成" }, 409);
         return;
       }
+      if (tokenControlInFlight) {
+        writeJson(response, { error: "正在整理上下文，请等待 Token 门禁完成" }, 409);
+        return;
+      }
+      tokenControlInFlight = true;
+      let tokenError: string | null;
+      try {
+        tokenError = await ensureNaturalInputBudget(text).catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : "无法读取 Pi Token 用量";
+          return "Token 门禁检查失败：" + sanitizeText(message);
+        });
+      } finally {
+        tokenControlInFlight = false;
+      }
+      if (tokenError) {
+        writeJson(response, { error: tokenError }, 409);
+        return;
+      }
       beginRequest("input");
       publish({ type: "chat.user", text: sanitizeText(text) });
       publishActivity("waiting", "消息已收到，正在等待 Pi 开始诊断…", true);
@@ -935,7 +1047,6 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
           type: "compact",
           customInstructions: "保留当前任务目标、最新游戏证据、源码定位、已批准修改范围、Diff 和验证状态；删除重复旧工具正文。",
         });
-        status = { ...status, contextUsed: null, contextPercent: null };
         await syncPiState();
         publishActivity("done", "上下文压缩完成");
         writeJson(response, { ok: true, status });

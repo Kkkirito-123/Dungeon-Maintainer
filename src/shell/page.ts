@@ -254,7 +254,7 @@ export function renderShellPage(): string {
         contextControl.className = 'status-control';
         const contextPercent = typeof status.contextPercent === 'number' ? status.contextPercent.toFixed(1) + '%' : '—';
         const contextValue = document.createElement('strong');
-        contextValue.textContent = safeNumber(status.contextUsed) + '/' + safeNumber(status.contextLimit) + ' · ' + contextPercent + (status.autoCompactionEnabled ? ' · 自动' : ' · 手动');
+        contextValue.textContent = safeNumber(status.contextUsed) + '/' + safeNumber(status.contextLimit) + ' · ' + contextPercent + ' · 安全线 ' + safeNumber(status.promptTokenLimit) + (status.autoCompactionEnabled ? ' · 自动' : ' · 手动');
         contextControl.append(
           '上下文: ',
           contextValue,
