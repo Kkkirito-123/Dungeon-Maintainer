@@ -13,6 +13,11 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { materializeAgentEvalFixture } from "../src/benchmark/agent-eval-fixture.js";
+import { readAgentEvalCase } from "../src/benchmark/agent-eval-case.js";
+import {
+  provisionAgentEvalDependencies,
+  releaseAgentEvalDependencies,
+} from "../src/benchmark/agent-eval-runner.js";
 import { runTestGit } from "./testSupport.js";
 
 const SOURCE = "export const value = 1;\n";
@@ -75,34 +80,67 @@ async function countFixtureFiles(root: string): Promise<number> {
 }
 
 describe("Agent Eval fixture materializer", () => {
-  it("内置 terminal-action-bug 保留 467 文件基线和 14 个脏路径", async () => {
+  it("严格分离 terminal 案例的公开任务、复现动作和隐藏验收", async () => {
+    const fixtureRoot = resolve(process.cwd(), "test-fixtures", "agent-evals");
+    const testCase = await readAgentEvalCase({
+      fixtureRoot,
+      id: "terminal-action-bug",
+    });
+    assert.equal(testCase.publicCase.prompt.includes("不可用"), true);
+    assert.deepEqual(testCase.reproduction.steps, [
+      { op: "go", target: "objective", maxSteps: 64 },
+      { op: "use", actionId: "terminal" },
+    ]);
+    assert.equal(Object.keys(testCase.expected.secretInputs).length, 0);
+    assert.equal(testCase.expected.beforeOracle, "terminal-action-unavailable");
+    assert.equal(testCase.expected.afterOracle, "terminal-action-available");
+  });
+
+  it("内置 terminal-action-bug 复用 467 文件共享基线且只注入一个脏路径", async () => {
     const temporaryRoot = await mkdtemp(join(tmpdir(), "maintainer-agent-eval-real-"));
     try {
       const fixtureRoot = resolve(process.cwd(), "test-fixtures", "agent-evals");
-      const repositoryRoot = join(fixtureRoot, "terminal-action-bug", "repository");
+      const repositoryRoot = join(fixtureRoot, "_bases", "game-repair-v1", "repository");
       assert.equal(await countFixtureFiles(repositoryRoot), 467);
       const result = await materializeAgentEvalFixture({
         fixtureRoot,
         id: "terminal-action-bug",
         destination: join(temporaryRoot, "materialized"),
       });
-      assert.equal(result.dirtyPaths.length, 14);
       assert.deepEqual(result.dirtyPaths, [
-        "game/AGENTS.md",
-        "game/AGENTS.zh-CN.md",
-        "game/src/application/main.ts",
         "game/src/devtools/dungeon-agent/actions.ts",
-        "game/src/devtools/dungeon-agent/bridge.ts",
-        "game/src/devtools/dungeon-agent/navigation.ts",
-        "game/src/devtools/dungeon-agent/projection.ts",
-        "game/src/devtools/dungeon-agent/protocol.ts",
-        "game/src/devtools/dungeon-agent/query.ts",
-        "game/src/devtools/dungeon-agent/trace.ts",
-        "game/src/domain/session/GameSession.ts",
-        "game/src/domain/session/sessionSnapshot.ts",
-        "game/tests/GameSession.test.ts",
-        "game/tests/dungeonAgentBridge.test.ts",
       ]);
+      assert.match(
+        await readFile(
+          join(result.destination, "game", "src", "devtools", "dungeon-agent", "actions.ts"),
+          "utf8",
+        ),
+        /terminal: "#open-sql-broken"/u,
+      );
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true, maxRetries: 3 });
+    }
+  });
+
+  it("依赖 lease 只删除本轮 junction，不删除共享 node_modules", async () => {
+    const temporaryRoot = await mkdtemp(join(tmpdir(), "maintainer-agent-eval-deps-"));
+    try {
+      const repositoryRoot = join(temporaryRoot, "repository");
+      const dependencyRepoRoot = join(temporaryRoot, "dependency-source");
+      const source = join(dependencyRepoRoot, "game", "node_modules");
+      await mkdir(join(repositoryRoot, "game"), { recursive: true });
+      await mkdir(source, { recursive: true });
+      await writeFile(join(source, "marker.txt"), "shared", "utf8");
+
+      const lease = await provisionAgentEvalDependencies({
+        repositoryRoot,
+        dependencyRepoRoot,
+      });
+      assert.equal(await readFile(join(lease.target, "marker.txt"), "utf8"), "shared");
+      await releaseAgentEvalDependencies(lease);
+
+      await assertMissing(lease.target);
+      assert.equal(await readFile(join(source, "marker.txt"), "utf8"), "shared");
     } finally {
       await rm(temporaryRoot, { recursive: true, force: true, maxRetries: 3 });
     }

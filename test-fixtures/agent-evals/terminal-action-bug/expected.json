@@ -1,16 +1,17 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "fixtureId": "terminal-action-bug",
-  "initialFailure": {
-    "tool": "use",
-    "actionId": "terminal",
-    "event": "action-not-available"
-  },
-  "completion": {
-    "taskState": "ready_to_apply",
-    "maximumApprovalRounds": 1,
-    "maximumSuccessfulProposals": 1,
-    "postTerminalModelTurns": 0,
-    "postTerminalToolCalls": 0
-  }
+  "secretInputs": {},
+  "beforeOracle": "terminal-action-unavailable",
+  "afterOracle": "terminal-action-available",
+  "requiredChecks": [
+    "game-test",
+    "game-architecture",
+    "game-build"
+  ],
+  "forbiddenPaths": [
+    ".env",
+    ".env.local",
+    ".git"
+  ]
 }

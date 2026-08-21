@@ -3,7 +3,12 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
-import { parseBenchmarkArgs } from "../src/benchmark/main.js";
+import {
+  parseAgentEvalPreflightArgs,
+  parseBenchmarkArgs,
+  parseGameRepairEvalArgs,
+} from "../src/benchmark/main.js";
+import { buildPiOriginalArguments } from "../src/benchmark/pi-original.js";
 import { runShellBenchmark } from "../src/benchmark/shell.js";
 import { analyzeTaskBenchmark } from "../src/benchmark/task.js";
 import { metric, type BenchmarkScenario } from "../src/benchmark/types.js";
@@ -38,6 +43,55 @@ describe("Dungeon Maintainer Benchmark", () => {
       () => parseBenchmarkArgs(["--context-window", "100"]),
       /不小于 8000/u,
     );
+    assert.deepEqual(parseAgentEvalPreflightArgs([
+      "--fixture", "terminal-action-bug",
+      "--dependency-repo", ".",
+      "--timeout-ms", "60000",
+    ]), {
+      fixtureId: "terminal-action-bug",
+      fixtureRoot: null,
+      dependencyRepoRoot: process.cwd(),
+      archiveRoot: resolve(process.cwd(), "benchmark-results", "preflight"),
+      timeoutMs: 60_000,
+    });
+    assert.throws(
+      () => parseAgentEvalPreflightArgs(["--fixture", "../escape"]),
+      /安全的案例 ID|缺少/u,
+    );
+    assert.deepEqual(parseGameRepairEvalArgs([
+      "--profile", "pi-original",
+      "--fixture", "terminal-action-bug",
+      "--dependency-repo", ".",
+      "--repetition", "2",
+    ]), {
+      fixtureId: "terminal-action-bug",
+      fixtureRoot: null,
+      dependencyRepoRoot: process.cwd(),
+      archiveRoot: resolve(process.cwd(), "benchmark-results", "game-repair"),
+      timeoutMs: null,
+      profile: "pi-original",
+      repetition: 2,
+    });
+    assert.throws(
+      () => parseGameRepairEvalArgs([
+        "--profile", "unknown",
+        "--fixture", "terminal-action-bug",
+        "--dependency-repo", ".",
+      ]),
+      /未知 game-repair Profile/u,
+    );
+    const originalArguments = buildPiOriginalArguments({
+      runId: "benchmark-run",
+      sessionDirectory: resolve("benchmark-session"),
+      model: "benchmark-model",
+    });
+    assert.deepEqual(
+      originalArguments.slice(originalArguments.indexOf("--tools"), originalArguments.indexOf("--tools") + 2),
+      ["--tools", "read,bash,edit,write"],
+    );
+    assert.equal(originalArguments.includes("--no-context-files"), false);
+    assert.equal(originalArguments.includes("--no-skills"), false);
+    assert.equal(originalArguments.includes("../src/pi/extension.js"), false);
   });
 
   it("真实 HTTP/SSE 确定性场景满足即时反馈和空答复门槛", async () => {

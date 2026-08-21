@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 2,
+  "id": "transition-lost-after-reload",
+  "base": "game-repair-v1",
+  "sourcePatch": "source.patch",
+  "patchSha256": "bd886b116e9b7f59df70cdeac999e831797db26172fa9ccd58bb9b92684bb847",
+  "dirtyPaths": ["game/src/presentation/dom/AppShell.ts"]
+}

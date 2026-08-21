@@ -1,0 +1,11 @@
+diff --git a/game/src/domain/session/GameSession.ts b/game/src/domain/session/GameSession.ts
+--- a/game/src/domain/session/GameSession.ts
++++ b/game/src/domain/session/GameSession.ts
+@@ -3052,6 +3052,7 @@ export class GameSession {
+     experienceMessage: string,
+   ): void {
+     this.completedLessons.add(lesson.id);
+     this.completedRoomIds.add(this.currentRoomId);
++    this.monsters = this.monsters.map((monster) => ({ ...monster, hp: monster.maxHp }));
+     if (!this.profile.masteredLessons.includes(lesson.id)) {
+       this.profile.masteredLessons.push(lesson.id);

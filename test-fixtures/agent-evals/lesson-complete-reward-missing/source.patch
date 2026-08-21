@@ -1,0 +1,12 @@
+diff --git a/game/src/domain/session/GameSession.ts b/game/src/domain/session/GameSession.ts
+--- a/game/src/domain/session/GameSession.ts
++++ b/game/src/domain/session/GameSession.ts
+@@ -3051,7 +3051,7 @@ export class GameSession {
+     _events: CombatEvent[],
+     experienceMessage: string,
+   ): void {
+-    this.completedLessons.add(lesson.id);
++    this.completedLessons.delete(lesson.id);
+     this.completedRoomIds.add(this.currentRoomId);
+     if (!this.profile.masteredLessons.includes(lesson.id)) {
+       this.profile.masteredLessons.push(lesson.id);

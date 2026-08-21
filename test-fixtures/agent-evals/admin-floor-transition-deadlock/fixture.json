@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 2,
+  "id": "admin-floor-transition-deadlock",
+  "base": "game-repair-v1",
+  "sourcePatch": "source.patch",
+  "patchSha256": "5fa61002d69c2b2b2eee3f194a36c8bd12a2393b4fd68cec4ee1bc9e7a2fe589",
+  "dirtyPaths": ["game/src/domain/session/GameSession.ts"]
+}

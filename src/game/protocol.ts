@@ -99,6 +99,11 @@ export interface PlayJudge {
   migrationSteps: number;
   migrationComplete: boolean;
   advanced: boolean;
+  stageIndex?: number;
+  claimableReward?: string | null;
+  bossHp?: number | null;
+  victories?: number;
+  guidanceDistance?: number | null;
 }
 
 /** 游戏桥增量提供的低敏内部语义事件。 */
@@ -112,6 +117,7 @@ export interface PlaytestEvent {
 export interface DungeonPlaytestBridge {
   version: 2;
   readonly checkpointRestored: boolean;
+  prepare(presetId: string): boolean;
   checkpoint(): boolean;
   look(): PlayView;
   go(

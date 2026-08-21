@@ -102,6 +102,22 @@ export class GameBrowser {
   }
 
   /**
+   * 在首个复现检查点前应用一个内置管理员状态预设。
+   *
+   * 该入口只供零模型 Benchmark 准备确定性起点，不属于 Pi 的游戏工具面；
+   * 预设 ID 由受校验的 fixture 提供，页面拒绝未知预设。
+   */
+  async prepare(presetId: string): Promise<void> {
+    const prepared = await this.needGameFrame().then((frame) => frame.evaluate((id) => {
+      const bridge = (window as unknown as {
+        __DUNGEON_PLAYTEST__?: { prepare?: (value: string) => boolean };
+      }).__DUNGEON_PLAYTEST__;
+      return bridge?.prepare?.(id) ?? false;
+    }, presetId));
+    if (!prepared) throw new GameBrowserError("游戏无法应用 Benchmark 起点预设");
+  }
+
+  /**
    * 保存一次性页面检查点。
    *
    * @throws 桥未安装或 sessionStorage 写入失败时拒绝，调用方不得继续 patch。

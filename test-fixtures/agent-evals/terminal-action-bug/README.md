@@ -8,10 +8,12 @@
 
 ## 组成
 
-- `repository/`：来源提交 `3c311443b96243080c2668ed359f1a2a23a09a14` 的完整 tracked 快照。
-- `source.patch`：来源工作树中 14 个未提交修改，物化后必须保持为 dirty 状态。
-- `fixture.json`：物化所需的版本、Hash 和精确 dirty 路径。
-- `expected.json`：Harness 可读取的低敏验收事实；不应注入模型上下文。
+- `../_bases/game-repair-v1/repository/`：467 文件共享正常基线，只保存一份。
+- `source.patch`：把终端按钮映射改坏的一行 Bug Patch。
+- `fixture.json`：共享基线 ID、补丁 Hash 和唯一预期 dirty 路径。
+- `case.json`：允许发送给 Agent 的公开任务和超时。
+- `reproduction.json`：零模型复现所需的固定语义动作。
+- `expected.json`：Harness 可读取的隐藏验收事实；不应注入模型上下文。
 
 ## 边界
 
