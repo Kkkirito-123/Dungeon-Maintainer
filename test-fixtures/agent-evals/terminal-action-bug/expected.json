@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "fixtureId": "terminal-action-bug",
+  "initialFailure": {
+    "tool": "use",
+    "actionId": "terminal",
+    "event": "action-not-available"
+  },
+  "completion": {
+    "taskState": "ready_to_apply",
+    "maximumApprovalRounds": 1,
+    "maximumSuccessfulProposals": 1,
+    "postTerminalModelTurns": 0,
+    "postTerminalToolCalls": 0
+  }
+}

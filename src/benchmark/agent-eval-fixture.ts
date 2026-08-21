@@ -1,0 +1,393 @@
+/**
+ * 内置 Agent Eval fixture 的安全物化。
+ *
+ * 本模块只负责从版本库内的 `test-fixtures/agent-evals/<id>` 读取固定
+ * manifest、基线文件和补丁，并在调用方指定的全新目录中建立可重复的 Git
+ * 评测仓库。它不运行 Benchmark、不选择任务、不修改 fixture 源数据，也不向
+ * Agent 暴露任意 Git 或 Shell 能力。
+ *
+ * 输入是受限的 fixture ID、可选的 fixture 根目录和一个必须尚不存在的目标目录；
+ * 输出只包含新仓库路径、实际基线提交与已校验的脏路径。唯一副作用是创建该
+ * 目标目录并在其中执行参数固定的 Git 命令。Git 不经过 shell，提交作者、时间、
+ * `core.autocrlf` 和 hooks 路径均被固定，不使用用户身份或证书。
+ *
+ * fixture 目录、manifest、补丁和基线文件都被当作不可信输入：路径穿越、
+ * 符号链接/特殊文件、已有目标、Hash/文件数/脏路径不一致都会失败。若在创建
+ * 目标后失败，模块只递归回收本次创建的精确目录；回收也失败时同时报告原错误
+ * 和回收错误，不会静默留下可被误用的半成品。
+ */
+
+import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import {
+  copyFile,
+  lstat,
+  mkdir,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+} from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { promisify } from "node:util";
+
+const executeFile = promisify(execFile);
+const FIXED_GIT_NAME = "Dungeon Maintainer Agent Eval";
+const FIXED_GIT_EMAIL = "agent-eval@dungeon-maintainer.invalid";
+const FIXED_GIT_DATE = "2000-01-01T00:00:00+00:00";
+
+interface AgentEvalFixtureManifest {
+  schemaVersion: 1;
+  id: string;
+  baseCommit: string;
+  baselineFileCount: number;
+  repositoryDir: "repository";
+  sourcePatch: "source.patch";
+  patchSha256: string;
+  dirtyPaths: string[];
+}
+
+/** Agent Eval fixture 物化的固定输入。 */
+export interface AgentEvalFixtureMaterializeOptions {
+  /** fixture ID，必须是不含路径分隔符的单一目录名。 */
+  readonly id: string;
+  /** 全新评测仓库的目标目录；其父目录必须已存在。 */
+  readonly destination: string;
+  /** fixture 根目录；省略时为当前工作目录下的 `test-fixtures/agent-evals`。 */
+  readonly fixtureRoot?: string;
+}
+
+/** 已建立且完成 manifest 一致性校验的 Agent Eval 仓库事实。 */
+export interface MaterializedAgentEvalFixture {
+  /** 新建仓库的规范绝对路径。 */
+  readonly destination: string;
+  /** 本地重建的实际基线提交，不要求与来源 manifest 的 `baseCommit` 相同。 */
+  readonly baseCommit: string;
+  /** 应用补丁后的排序去重项目相对路径。 */
+  readonly dirtyPaths: readonly string[];
+}
+
+function isMissing(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException).code === "ENOENT";
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if (isMissing(error)) return false;
+    throw error;
+  }
+}
+
+function normalizeFixtureId(id: string): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(id) || id === "." || id === "..") {
+    throw new Error("Agent Eval fixture ID 不是安全的单一目录名");
+  }
+  return id;
+}
+
+function normalizeFixturePath(value: unknown): string {
+  if (
+    typeof value !== "string"
+    || value.length === 0
+    || isAbsolute(value)
+    || value.includes("\\")
+    || /[:*?"<>|]/u.test(value)
+  ) {
+    throw new Error("fixture.json 包含非法 dirtyPaths 路径");
+  }
+  const segments = value.split("/");
+  if (
+    segments.some((segment) => segment === "" || segment === "." || segment === "..")
+    || segments[0]?.toLowerCase() === ".git"
+  ) {
+    throw new Error("fixture.json 包含路径穿越或 Git 内部路径");
+  }
+  return segments.join("/");
+}
+
+function parseManifest(value: unknown, requestedId: string): AgentEvalFixtureManifest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("fixture.json 必须是对象");
+  }
+  const manifest = value as Record<string, unknown>;
+  const expectedKeys = [
+    "baseCommit",
+    "baselineFileCount",
+    "dirtyPaths",
+    "id",
+    "patchSha256",
+    "repositoryDir",
+    "schemaVersion",
+    "sourcePatch",
+  ];
+  if (Object.keys(manifest).sort().join("\n") !== expectedKeys.join("\n")) {
+    throw new Error("fixture.json 字段与 schema v1 不一致");
+  }
+  if (
+    manifest.schemaVersion !== 1
+    || manifest.id !== requestedId
+    || typeof manifest.baseCommit !== "string"
+    || !/^[0-9a-f]{40}$/u.test(manifest.baseCommit)
+    || typeof manifest.baselineFileCount !== "number"
+    || !Number.isSafeInteger(manifest.baselineFileCount)
+    || manifest.baselineFileCount < 0
+    || manifest.repositoryDir !== "repository"
+    || manifest.sourcePatch !== "source.patch"
+    || typeof manifest.patchSha256 !== "string"
+    || !/^[0-9a-f]{64}$/u.test(manifest.patchSha256)
+    || !Array.isArray(manifest.dirtyPaths)
+  ) {
+    throw new Error("fixture.json 内容与 schema v1 不一致");
+  }
+  const dirtyPaths = manifest.dirtyPaths.map(normalizeFixturePath);
+  if (new Set(dirtyPaths).size !== dirtyPaths.length) {
+    throw new Error("fixture.json 的 dirtyPaths 不允许重复");
+  }
+  return {
+    schemaVersion: 1,
+    id: requestedId,
+    baseCommit: manifest.baseCommit,
+    baselineFileCount: manifest.baselineFileCount,
+    repositoryDir: "repository",
+    sourcePatch: "source.patch",
+    patchSha256: manifest.patchSha256,
+    dirtyPaths: [...dirtyPaths].sort(),
+  };
+}
+
+async function readManifest(path: string, requestedId: string): Promise<AgentEvalFixtureManifest> {
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(path, "utf8")) as unknown;
+  } catch (error) {
+    throw new Error("fixture.json 不是有效 UTF-8 JSON", { cause: error });
+  }
+  return parseManifest(value, requestedId);
+}
+
+function assertDirectChild(parent: string, child: string, label: string): void {
+  const childPath = relative(parent, child);
+  if (
+    childPath.length === 0
+    || childPath.startsWith("..")
+    || isAbsolute(childPath)
+    || childPath.includes("/")
+    || childPath.includes("\\")
+  ) {
+    throw new Error(label + " 逃逸 fixture 根目录");
+  }
+}
+
+async function requirePlainFile(path: string, label: string): Promise<void> {
+  const information = await lstat(path);
+  if (information.isSymbolicLink() || !information.isFile()) {
+    throw new Error(label + " 必须是普通文件");
+  }
+}
+
+async function inspectRepositoryTree(root: string): Promise<number> {
+  let fileCount = 0;
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    if (entry.name.toLowerCase() === ".git") {
+      throw new Error("fixture repository 不得包含 Git 内部目录");
+    }
+    const entryPath = join(root, entry.name);
+    const information = await lstat(entryPath);
+    if (information.isSymbolicLink()) {
+      throw new Error("fixture repository 不得包含符号链接或 junction");
+    }
+    if (information.isDirectory()) {
+      fileCount += await inspectRepositoryTree(entryPath);
+    } else if (information.isFile()) {
+      fileCount += 1;
+    } else {
+      throw new Error("fixture repository 不得包含特殊文件");
+    }
+  }
+  return fileCount;
+}
+
+async function copyRepositoryTree(source: string, destination: string): Promise<void> {
+  for (const entry of await readdir(source, { withFileTypes: true })) {
+    if (entry.name.toLowerCase() === ".git") {
+      throw new Error("fixture repository 在复制期间出现 Git 内部目录");
+    }
+    const sourcePath = join(source, entry.name);
+    const destinationPath = join(destination, entry.name);
+    const information = await lstat(sourcePath);
+    if (information.isSymbolicLink()) {
+      throw new Error("fixture repository 在复制期间出现符号链接或 junction");
+    }
+    if (information.isDirectory()) {
+      await mkdir(destinationPath);
+      await copyRepositoryTree(sourcePath, destinationPath);
+    } else if (information.isFile()) {
+      await copyFile(sourcePath, destinationPath);
+    } else {
+      // inspectRepositoryTree 已经拒绝过链接和特殊文件；复制时再检查是为了
+      // 防止 fixture 在校验与复制之间被替换。
+      throw new Error("fixture repository 在复制期间出现链接或特殊文件");
+    }
+  }
+}
+
+async function runGit(
+  cwd: string,
+  args: readonly string[],
+  environment: Readonly<Record<string, string>> = {},
+): Promise<string> {
+  const result = await executeFile("git", [...args], {
+    cwd,
+    encoding: "utf8",
+    env: { ...process.env, ...environment },
+    maxBuffer: 16 * 1024 * 1024,
+    windowsHide: true,
+  });
+  return result.stdout;
+}
+
+async function initializeBaseline(destination: string): Promise<string> {
+  await runGit(destination, ["init", "--quiet"]);
+  await runGit(destination, ["config", "core.autocrlf", "false"]);
+  await runGit(destination, ["config", "user.name", FIXED_GIT_NAME]);
+  await runGit(destination, ["config", "user.email", FIXED_GIT_EMAIL]);
+  await runGit(destination, ["config", "commit.gpgSign", "false"]);
+  await runGit(destination, ["config", "core.hooksPath", ".git/no-hooks"]);
+  await runGit(destination, ["add", "--all", "--force", "--"]);
+  await runGit(destination, [
+    "commit",
+    "--quiet",
+    "--no-gpg-sign",
+    "--no-verify",
+    "--message",
+    "agent-eval baseline",
+  ], {
+    GIT_AUTHOR_NAME: FIXED_GIT_NAME,
+    GIT_AUTHOR_EMAIL: FIXED_GIT_EMAIL,
+    GIT_AUTHOR_DATE: FIXED_GIT_DATE,
+    GIT_COMMITTER_NAME: FIXED_GIT_NAME,
+    GIT_COMMITTER_EMAIL: FIXED_GIT_EMAIL,
+    GIT_COMMITTER_DATE: FIXED_GIT_DATE,
+    TZ: "UTC",
+  });
+  return (await runGit(destination, ["rev-parse", "HEAD"])).trim();
+}
+
+async function readDirtyPaths(destination: string): Promise<string[]> {
+  const [tracked, untracked] = await Promise.all([
+    runGit(destination, ["diff", "--name-only", "-z", "--no-renames", "--"]),
+    runGit(destination, ["ls-files", "-z", "--others"]),
+  ]);
+  return [...new Set(
+    (tracked + untracked)
+      .split("\0")
+      .filter(Boolean)
+      .map(normalizeFixturePath),
+  )].sort();
+}
+
+/**
+ * 将单个内置 Agent Eval fixture 物化为可直接运行评测的本地 Git 仓库。
+ *
+ * @param options fixture ID、目标目录与可选的测试根目录。目标父目录必须已存在，
+ * 目标本身必须不存在。
+ * @returns 规范目标路径、新建的实际基线提交和补丁后的已校验脏路径。
+ * @throws ID/路径穿越、符号链接或特殊文件、已有目标、manifest 不一致、
+ * Git 失败或补丁后脏路径不一致时拒绝；创建后失败会回收本次目标。
+ * @remarks 调用方只授权创建 `destination`；函数不改动 fixture、其他目录或用户
+ * Git 配置。manifest 的 `baseCommit` 仅作为来源元数据校验，不强制本地重建提交同 Hash。
+ */
+export async function materializeAgentEvalFixture(
+  options: AgentEvalFixtureMaterializeOptions,
+): Promise<MaterializedAgentEvalFixture> {
+  const id = normalizeFixtureId(options.id);
+  const fixtureRoot = resolve(
+    options.fixtureRoot ?? join(process.cwd(), "test-fixtures", "agent-evals"),
+  );
+  const destination = resolve(options.destination);
+  if (dirname(destination) === destination) {
+    throw new Error("拒绝将文件系统根目录作为 Agent Eval 目标");
+  }
+  if (await pathExists(destination)) {
+    throw new Error("Agent Eval 目标目录已存在");
+  }
+
+  const rootInformation = await lstat(fixtureRoot);
+  if (rootInformation.isSymbolicLink() || !rootInformation.isDirectory()) {
+    throw new Error("Agent Eval fixture 根必须是真实目录");
+  }
+  const realFixtureRoot = await realpath(fixtureRoot);
+  const requestedFixtureDirectory = resolve(realFixtureRoot, id);
+  const fixtureInformation = await lstat(requestedFixtureDirectory);
+  if (fixtureInformation.isSymbolicLink() || !fixtureInformation.isDirectory()) {
+    throw new Error("Agent Eval fixture 必须是真实目录");
+  }
+  const fixtureDirectory = await realpath(requestedFixtureDirectory);
+  assertDirectChild(realFixtureRoot, fixtureDirectory, "Agent Eval fixture");
+
+  const manifestPath = join(fixtureDirectory, "fixture.json");
+  const repositoryPath = join(fixtureDirectory, "repository");
+  const patchPath = join(fixtureDirectory, "source.patch");
+  await requirePlainFile(manifestPath, "fixture.json");
+  await requirePlainFile(patchPath, "source.patch");
+  const repositoryInformation = await lstat(repositoryPath);
+  if (repositoryInformation.isSymbolicLink() || !repositoryInformation.isDirectory()) {
+    throw new Error("fixture repository 必须是真实目录");
+  }
+
+  const manifest = await readManifest(manifestPath, id);
+  const baselineFileCount = await inspectRepositoryTree(repositoryPath);
+  if (baselineFileCount !== manifest.baselineFileCount) {
+    throw new Error("fixture repository 文件数与 manifest 不一致");
+  }
+  const patchBytes = await readFile(patchPath);
+  const patchSha256 = createHash("sha256").update(patchBytes).digest("hex");
+  if (patchSha256 !== manifest.patchSha256) {
+    throw new Error("source.patch SHA-256 与 manifest 不一致");
+  }
+
+  let created = false;
+  try {
+    await mkdir(destination);
+    created = true;
+    await copyRepositoryTree(repositoryPath, destination);
+    const baseCommit = await initializeBaseline(destination);
+    const trackedFileCount = (await runGit(destination, ["ls-files", "-z"]))
+      .split("\0")
+      .filter(Boolean)
+      .length;
+    if (trackedFileCount !== manifest.baselineFileCount) {
+      throw new Error("本地基线提交文件数与 manifest 不一致");
+    }
+    // 固定 core.autocrlf=false 只保证物化仓库后续不再自动转换换行；已打包的 fixture 可能在
+    // Windows 检出时已保存为 CRLF，而 source.patch 依然使用 Git 标准 LF。只忽略上下文换行空白，
+    // 不忽略字符内容，可使同一 fixture 在不同检出环境中稳定应用。
+    await runGit(destination, [
+      "apply",
+      "--ignore-space-change",
+      "--whitespace=nowarn",
+      "--",
+      patchPath,
+    ]);
+    const dirtyPaths = await readDirtyPaths(destination);
+    if (dirtyPaths.join("\n") !== manifest.dirtyPaths.join("\n")) {
+      throw new Error("应用 source.patch 后的 dirtyPaths 与 manifest 不一致");
+    }
+    return { destination, baseCommit, dirtyPaths };
+  } catch (error) {
+    if (created) {
+      try {
+        await rm(destination, { recursive: true, force: true, maxRetries: 3 });
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "Agent Eval fixture 物化失败，且无法回收半成品目录",
+        );
+      }
+    }
+    throw error;
+  }
+}

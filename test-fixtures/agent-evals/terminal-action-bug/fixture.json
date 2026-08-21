@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "terminal-action-bug",
+  "baseCommit": "3c311443b96243080c2668ed359f1a2a23a09a14",
+  "baselineFileCount": 467,
+  "repositoryDir": "repository",
+  "sourcePatch": "source.patch",
+  "patchSha256": "ad46ae2ab58d128017bb9965f5954d21c9d8661985ef7daa5bc681f86005cbdd",
+  "dirtyPaths": [
+    "game/AGENTS.md",
+    "game/AGENTS.zh-CN.md",
+    "game/src/application/main.ts",
+    "game/src/devtools/dungeon-agent/actions.ts",
+    "game/src/devtools/dungeon-agent/bridge.ts",
+    "game/src/devtools/dungeon-agent/navigation.ts",
+    "game/src/devtools/dungeon-agent/projection.ts",
+    "game/src/devtools/dungeon-agent/protocol.ts",
+    "game/src/devtools/dungeon-agent/query.ts",
+    "game/src/devtools/dungeon-agent/trace.ts",
+    "game/src/domain/session/GameSession.ts",
+    "game/src/domain/session/sessionSnapshot.ts",
+    "game/tests/GameSession.test.ts",
+    "game/tests/dungeonAgentBridge.test.ts"
+  ]
+}
