@@ -53,6 +53,7 @@ export async function runGit(
 export interface RepoState {
   root: string;
   head: string;
+  branch: string;
   clean: boolean;
   status: string;
 }
@@ -65,11 +66,18 @@ export interface RepoState {
  */
 export async function readRepo(path: string): Promise<RepoState> {
   const root = resolve(await runGit(path, ["rev-parse", "--show-toplevel"]));
-  const [head, status] = await Promise.all([
+  const [head, branch, status] = await Promise.all([
     runGit(root, ["rev-parse", "HEAD"]),
+    runGit(root, ["branch", "--show-current"]),
     runGit(root, ["status", "--porcelain=v1", "--untracked-files=all"]),
   ]);
-  return { root, head, clean: status.length === 0, status };
+  return {
+    root,
+    head,
+    branch: branch || "(detached)",
+    clean: status.length === 0,
+    status,
+  };
 }
 
 /** 判断精确路径是否存在。 */
@@ -115,8 +123,9 @@ export async function hashFile(
  * node_modules 不参与验证。代码任意变化都会使检查和 VerificationRecord 失效。
  */
 export async function hashWorktree(root: string): Promise<string> {
-  const [head, diff, others] = await Promise.all([
+  const [head, staged, diff, others] = await Promise.all([
     runGitRaw(root, ["rev-parse", "HEAD"]),
+    runGitRaw(root, ["diff", "--cached", "--binary", "--no-ext-diff", "--"]),
     runGitRaw(root, ["diff", "--binary", "--no-ext-diff", "--"]),
     runGitRaw(root, ["ls-files", "-z", "--others", "--exclude-standard"]),
   ]);
@@ -126,6 +135,7 @@ export async function hashWorktree(root: string): Promise<string> {
   }
   return createHash("sha256")
     .update(head)
+    .update(staged)
     .update(diff)
     .update(untracked)
     .digest("hex");
@@ -144,4 +154,25 @@ export async function worktreeDiff(root: string): Promise<string> {
     "--no-ext-diff",
     "--",
   ]);
+}
+
+/**
+ * 列出 detached worktree 相对其 index 的全部源码变化。
+ *
+ * @param root 任务 worktree 根目录。
+ * @returns 排序去重后的项目相对路径，包含未跟踪文件。
+ * @remarks 启动时来源工作树快照已暂存到 index，因此这里得到的只是 Agent 后续增量，
+ * 不会把用户启动前已有的本地修改误算成 Agent 修改。
+ */
+export async function worktreeChangedPaths(root: string): Promise<string[]> {
+  const [tracked, untracked] = await Promise.all([
+    runGitRaw(root, ["diff", "--name-only", "-z", "--"]),
+    runGitRaw(root, ["ls-files", "-z", "--others", "--exclude-standard"]),
+  ]);
+  return [...new Set(
+    (tracked + untracked)
+      .split("\0")
+      .filter(Boolean)
+      .map(normalizeProjectPath),
+  )].sort();
 }

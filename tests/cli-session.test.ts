@@ -14,6 +14,7 @@ import {
   parseMaintainerEnv,
 } from "../src/config.js";
 import { parseMaintainerCli } from "../src/main.js";
+import { FULL_CODING_TOOLS } from "../src/pi/tool-policy.js";
 import { createTaskRecordFixture, createTemporaryGitRepository } from "./testSupport.js";
 
 describe("外部 CLI 与固定 Pi 启动参数", () => {
@@ -37,7 +38,7 @@ describe("外部 CLI 与固定 Pi 启动参数", () => {
     );
   });
 
-  it("Pi 参数禁用内置能力并固定 Extension、模型和任务会话", () => {
+  it("Pi 参数加载完整 Coding 工具并固定 Extension、模型和任务会话", () => {
     const task = createTaskRecordFixture({ id: "task-123" });
     const config = loadConfig({
       LOCALAPPDATA: "C:/maintainer-data",
@@ -51,12 +52,15 @@ describe("外部 CLI 与固定 Pi 启动参数", () => {
     assert.deepEqual(args.slice(0, 2), ["--mode", "rpc"]);
     for (const flag of [
       "--approve",
-      "--no-builtin-tools",
       "--no-extensions",
       "--no-skills",
       "--no-prompt-templates",
       "--no-context-files",
     ]) assert.ok(args.includes(flag));
+    const toolsIndex = args.indexOf("--tools");
+    assert.ok(toolsIndex >= 0);
+    assert.equal(args[toolsIndex + 1], FULL_CODING_TOOLS.join(","));
+    assert.ok(!args.includes("--no-builtin-tools"));
     assert.deepEqual(args.slice(-4), [
       "--session-id",
       "task-123",
@@ -94,7 +98,7 @@ describe("外部 CLI 与固定 Pi 启动参数", () => {
     assert.throws(() => normalizeBaseUrl("file:///tmp/key"), /HTTP\(S\)/u);
   });
 
-  it("目标仓库必须干净且项目标识只能声明固定版本和适配器", async () => {
+  it("目标仓库允许本地修改，但项目标识只能声明固定版本和适配器", async () => {
     const repository = await createTemporaryGitRepository({
       ".maintainer/project.json": JSON.stringify({
         schemaVersion: 1,
@@ -105,6 +109,9 @@ describe("外部 CLI 与固定 Pi 启动参数", () => {
     try {
       const state = await inspectDungeonRepository(repository.repoRoot);
       assert.equal(state.root, repository.repoRoot);
+      await writeFile(join(repository.repoRoot, "game", "package.json"), "{\"dirty\":true}\n", "utf8");
+      const dirtyState = await inspectDungeonRepository(repository.repoRoot);
+      assert.equal(dirtyState.clean, false);
       await writeFile(join(repository.repoRoot, ".maintainer", "project.json"), JSON.stringify({
         schemaVersion: 1,
         adapter: "sql-dungeon",

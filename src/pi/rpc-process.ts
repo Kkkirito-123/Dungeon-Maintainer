@@ -26,6 +26,7 @@ export type PiRpcEventListener = (event: unknown) => void;
 export class PiRpcProcess {
   private child: ChildProcessWithoutNullStreams | null = null;
   private lines: Interface | null = null;
+  private errorLines: Interface | null = null;
   private readonly pending = new Map<string, {
     resolve(value: unknown): void;
     reject(error: Error): void;
@@ -58,9 +59,8 @@ export class PiRpcProcess {
     this.child = child;
     this.lines = createInterface({ input: child.stdout });
     this.lines.on("line", (line) => this.handleLine(line));
-    child.stderr.on("data", () => {
-      this.onEvent({ type: "pi_stderr" });
-    });
+    this.errorLines = createInterface({ input: child.stderr });
+    this.errorLines.on("line", (line) => this.handleErrorLine(line));
     this.exitPromise = new Promise<number>((resolve) => {
       child.once("close", (code) => {
         const error = new Error("Pi RPC 进程已退出");
@@ -105,15 +105,42 @@ export class PiRpcProcess {
     return await this.exitPromise;
   }
 
-  /** 发送停止信号并关闭子进程。 */
+  /** 先关闭 stdin 触发 Pi 的 session_shutdown；超时后才强制终止子进程。 */
   async stop(): Promise<void> {
     const child = this.child;
     if (!child) return;
-    child.kill();
+    if (child.exitCode === null && child.signalCode === null && child.stdin.writable) {
+      child.stdin.end();
+      const graceful = await Promise.race([
+        this.waitForExit().then(() => true, () => true),
+        new Promise<boolean>((resolve) => {
+          const timer = setTimeout(() => resolve(false), 10_000);
+          timer.unref();
+        }),
+      ]);
+      if (!graceful) child.kill();
+    }
     await this.waitForExit().catch(() => undefined);
     this.lines?.close();
+    this.errorLines?.close();
     this.lines = null;
+    this.errorLines = null;
     this.child = null;
+  }
+
+  private handleErrorLine(line: string): void {
+    const normalized = line.trim();
+    if (!normalized) return;
+    if (
+      normalized.startsWith("Warning: No project session found with id '")
+      && normalized.endsWith("creating a new session with that id.")
+    ) {
+      // Pi 在首次使用维护器固定的 taskId 时必然发出这条提示；这是创建预期会话，
+      // 不是运行错误，也不应该在聊天区消耗用户注意力。
+      this.onEvent({ type: "pi_first_session" });
+      return;
+    }
+    this.onEvent({ type: normalized.startsWith("Warning:") ? "pi_warning" : "pi_stderr" });
   }
 
   private handleLine(line: string): void {

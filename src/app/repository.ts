@@ -1,12 +1,13 @@
 /**
  * SQL Dungeon 仓库事实与运行环境校验。
  *
- * 本模块负责读取固定 `.maintainer/project.json` 标识、确认正式仓库干净、检查游戏
+ * 本模块负责读取固定 `.maintainer/project.json` 标识、读取当前工作树状态、检查游戏
  * Vite/Chromium/ripgrep 依赖，并返回可供 start/resume 使用的 Git 事实。它不创建任务、
  * 不创建 worktree、不启动 Pi，也不修改目标仓库；这些副作用分别属于 start 和 Pi 进程层。
  *
  * 标识文件只允许 schemaVersion 与 adapter 两个字段，防止仓库配置注入命令或权限。
- * 检查失败时直接阻断启动；resume 不会根据缺失依赖或错误标识静默重建任何内容。
+ * 脏工作树由 workspace 层复制为隔离快照而不是在这里拒绝；resume 不会根据缺失依赖
+ * 或错误标识静默重建任何内容。
  */
 
 import { execFile } from "node:child_process";
@@ -46,20 +47,17 @@ async function readProjectMarker(repoRoot: string): Promise<DungeonProjectMarker
 }
 
 /**
- * 校验用户选择的是干净且带固定标识的 SQL Dungeon Git 仓库。
+ * 校验用户选择的是带固定标识的 SQL Dungeon Git 工作树。
  *
  * @param repoPath 仓库内任意路径。
  * @returns 规范仓库根、HEAD 和洁净状态。
- * @throws 非 Git 仓库、标识非法或工作区不干净时拒绝。
+ * @throws 非 Git 仓库或标识非法时拒绝；未提交修改会作为后续隔离快照输入。
  */
 export async function inspectDungeonRepository(
   repoPath: string,
 ): Promise<RepoState> {
   const state = await readRepo(resolve(repoPath));
   await readProjectMarker(state.root);
-  if (!state.clean) {
-    throw new Error("正式游戏仓库必须保持干净；所有 Agent 修改只进入 detached worktree");
-  }
   return state;
 }
 

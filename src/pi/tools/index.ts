@@ -1,8 +1,10 @@
 /**
  * Dungeon Maintainer 固定 Pi 工具面的唯一装配入口。
  *
- * 本文件只注册计划规定的 `inspect/patch/check/finish/look/go/use/query`，不做业务
- * 执行，也不允许项目配置或外部 Extension 动态追加 Shell、任意读写和浏览器脚本。
+ * 本文件只注册计划规定的 `inspect/patch/check/finish/look/go/use/input_sql/query/tree` 领域工具，
+ * 不做业务执行。Pi 原生 read/edit/write 等工具由启动层固定加载；Extension 保持
+ * 工具面稳定以复用 Prompt 缓存，并按“只读诊断 -> 用户批准总方案 -> 本轮完整执行”
+ * 在执行层切换写入门禁。
  * 调用方必须传入同一个 TaskRecord、TaskStore 与单浏览器访问器，确保任务恢复后没有
  * 第二套内存状态。任一工具注册失败会阻止 Extension 完成加载。
  */
@@ -11,19 +13,29 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { GameDriver } from "../../game/driver.js";
 import type { TaskStore } from "../../task/store.js";
 import type { TaskRecord } from "../../task/types.js";
+import type { VerificationResult } from "../../repair/verification.js";
 import { registerCheckTool } from "./check.js";
 import { registerFinishTool } from "./finish.js";
 import { registerGameTools } from "./game.js";
 import { registerInspectTool } from "./inspect.js";
 import { registerPatchTool } from "./patch.js";
+import { registerTreeTool } from "./tree.js";
 
-/** 八个固定工具共享的运行依赖。 */
+/** 十个固定领域工具共享的运行依赖。 */
 export interface MaintainerToolContext {
   task: TaskRecord;
   store: TaskStore;
   currentDriver(): GameDriver | null;
   requireDriver(): GameDriver;
   ensureGame(): Promise<GameDriver>;
+  /** 用户确认具体完整方案后，开放本轮 Pi 原生写入和精确 patch。 */
+  approveExecution(): void;
+  /** 方案完成、拒绝或本轮结束时恢复只读诊断工具。 */
+  completeExecution(): void;
+  /** 当前 Agent 运行是否已经获得总方案执行授权。 */
+  isExecutionApproved(): boolean;
+  /** 对当前 worktree 自动执行固定检查、重放和隐藏断言。 */
+  verifyTask(signal?: AbortSignal): Promise<VerificationResult>;
 }
 
 /**
@@ -41,4 +53,5 @@ export function registerMaintainerTools(
   registerCheckTool(pi, context);
   registerFinishTool(pi, context);
   registerGameTools(pi, context);
+  registerTreeTool(pi, context);
 }

@@ -2,7 +2,7 @@
  * 单浏览器语义动作、检查点和重放编排。
  *
  * GameDriver 是 Pi 游戏工具与底层 Playwright 客户端之间的唯一入口。第一次 look 或
- * /play 会先在页面 sessionStorage 建立复现起点并清空环形 Trace；后续 go/use/query
+ * /play 会先在页面 sessionStorage 建立复现起点并清空环形 Trace；后续 go/use/inputSql/query
  * 只记录有限语义。源码修改后先 reload 消费检查点，再立刻重建同一起点检查点，最后
  * 按原顺序重放动作，因此后续 /verify 仍能从相同起点再次验证。
  */
@@ -15,12 +15,18 @@ import type {
 } from "./protocol.js";
 import type { GameBrowser } from "./browser.js";
 
+const TRANSITION_POLL_INTERVAL_MS = 50;
+const TRANSITION_POLL_ATTEMPTS = 40;
+const MAX_GO_SEGMENTS = 8;
+const CONTINUABLE_GO_EVENTS = new Set(["action", "task"]);
+
 /** 一次重放的公开验证结果。 */
 export interface ReplayResult {
   passed: boolean;
   actionCount: number;
   finalView: PlayView;
   failure: string | null;
+  queryAccepted: boolean | null;
 }
 
 /** 当前 Pi 任务的游戏驱动。 */
@@ -28,6 +34,8 @@ export class GameDriver {
   readonly trace = new SemanticTrace(500);
   private checkpointReady = false;
   private lastView: PlayView | null = null;
+  /** SQL 只在当前进程内按 Trace 序号保留，永不写入复现文件或事件日志。 */
+  private readonly replayInputSql = new Map<number, string>();
 
   /** @param browser 已打开协议 v2 页面。 */
   constructor(private readonly browser: GameBrowser) {}
@@ -41,6 +49,7 @@ export class GameDriver {
     const view = await this.browser.look();
     await this.browser.checkpoint();
     this.trace.clear();
+    this.replayInputSql.clear();
     this.checkpointReady = true;
     this.lastView = view;
     return view;
@@ -67,6 +76,18 @@ export class GameDriver {
     await this.ensureCheckpoint();
   }
 
+  /**
+   * 读取当前玩家投影，但不建立检查点也不写入复现 Trace。
+   *
+   * 该入口只供每轮 Agent 开始前注入一份小型实时状态，避免为了回答当前位置而额外
+   * 消耗一次模型工具往返；真正的复现仍必须通过 `look/go/use/inputSql/query` 留下语义证据。
+   */
+  async peek(): Promise<PlayView> {
+    const view = await this.browser.look();
+    this.lastView = view;
+    return view;
+  }
+
   /** 读取玩家投影并记录 look。 */
   async look(): Promise<PlayView> {
     await this.ensureCheckpoint();
@@ -87,7 +108,31 @@ export class GameDriver {
     maxSteps: number,
   ): Promise<PlayResult> {
     await this.ensureCheckpoint();
-    const result = await this.browser.go(target, maxSteps);
+    let remainingSteps = maxSteps;
+    let result = await this.browser.go(target, remainingSteps);
+    let totalSteps = result.steps;
+    for (let segment = 1; segment < MAX_GO_SEGMENTS; segment += 1) {
+      if (
+        !result.ok
+        || result.view.mode !== "explore"
+        || !CONTINUABLE_GO_EVENTS.has(result.event)
+        || totalSteps >= maxSteps
+      ) break;
+      remainingSteps = maxSteps - totalSteps;
+      const previous = result;
+      const next = await this.browser.go(target, remainingSteps);
+      if (
+        !next.ok
+        && next.steps === 0
+        && (next.event === "no-discovered-path" || next.event === "target-not-visible")
+      ) {
+        result = previous;
+        break;
+      }
+      result = next;
+      totalSteps += next.steps;
+    }
+    result = { ...result, steps: totalSteps };
     this.lastView = result.view;
     this.trace.push({
       action: "go",
@@ -112,7 +157,30 @@ export class GameDriver {
     return result;
   }
 
-  /** 提交桥内部答案，不接收 SQL 参数。 */
+  /**
+   * 向当前已打开的固定 textarea 写入 SQL。
+   *
+   * SQL 正文只留在当前 GameDriver 进程，供同一进程内刷新重放；Trace 仅保存长度，
+   * 因此任务重启后没有输入正文时，重放会明确返回 replay-input-unavailable。
+   */
+  async inputSql(sql: string): Promise<PlayResult> {
+    if (typeof sql !== "string" || sql.length > 16 * 1024 || sql.includes("\u0000")) {
+      throw new Error("SQL 输入无效或超过 16 KiB");
+    }
+    await this.ensureCheckpoint();
+    const result = await this.browser.inputSql(sql);
+    this.lastView = result.view;
+    const entry = this.trace.push({
+      action: "input-sql",
+      arguments: { inputLength: sql.length },
+      ok: result.ok,
+      summary: result.event + " · length=" + String(sql.length),
+    });
+    this.replayInputSql.set(entry.sequence, sql);
+    return result;
+  }
+
+  /** 提交当前 textarea 现值；SQL 参数必须先通过 inputSql 写入。 */
   async query(): Promise<PlayResult> {
     await this.ensureCheckpoint();
     const result = await this.browser.query();
@@ -138,6 +206,26 @@ export class GameDriver {
     if (!this.checkpointReady) {
       throw new Error("当前没有可用于源码刷新的复现检查点");
     }
+    const currentView = this.lastView;
+    if (!currentView) throw new Error("当前复现检查点缺少玩家投影");
+    for (const action of actions) {
+      if (action.action !== "input-sql") continue;
+      const inputLength = action.arguments.inputLength;
+      const sql = this.replayInputSql.get(action.sequence);
+      if (
+        typeof inputLength !== "number"
+        || typeof sql !== "string"
+        || sql.length !== inputLength
+      ) {
+        return {
+          passed: false,
+          actionCount: 0,
+          finalView: currentView,
+          failure: "replay-input-unavailable",
+          queryAccepted: null,
+        };
+      }
+    }
     const restored = await this.browser.reloadFromCheckpoint();
     // reload 已消费一次性 sessionStorage。重放前立即重建相同起点，后续 /verify 才能
     // 再次从同一状态开始，而不是从本次重放后的症状状态开始。
@@ -147,11 +235,32 @@ export class GameDriver {
     this.lastView = restored;
     let failure: string | null = null;
     let actionCount = 0;
+    let queryAccepted: boolean | null = null;
     for (const action of actions) {
       if (action.action === "look") continue;
       try {
+        // 正常控制循环在每个语义动作前都会重读玩家投影。重放也必须
+        // 保留这个固定同步点，否则 DOM 展示与 Session 状态的短暂时序会让
+        // 后续 query/use 在旧投影上紧接执行。
+        this.lastView = await this.browser.look();
         let result: PlayResult;
-        if (action.action === "go") {
+        if (action.action === "input-sql") {
+          const inputLength = action.arguments.inputLength;
+          const sql = this.replayInputSql.get(action.sequence);
+          if (
+            typeof inputLength !== "number"
+            || typeof sql !== "string"
+            || sql.length !== inputLength
+          ) {
+            failure = "replay-input-unavailable";
+            break;
+          }
+          if (!await this.waitForQueryMode()) {
+            failure = "replay-query-not-ready";
+            break;
+          }
+          result = await this.inputSql(sql);
+        } else if (action.action === "go") {
           const target = action.arguments.target;
           const maxSteps = action.arguments.maxSteps;
           if (
@@ -160,18 +269,33 @@ export class GameDriver {
           ) {
             throw new Error("复现 go 参数损坏");
           }
+          if (!await this.waitForExploreMode()) {
+            failure = "replay-movement-not-ready";
+            break;
+          }
           result = await this.go(target, maxSteps);
         } else if (action.action === "use") {
           const actionId = action.arguments.actionId;
           if (typeof actionId !== "string") {
             throw new Error("复现 use 参数损坏");
           }
+          if (!await this.waitForUseAction(actionId)) {
+            failure = "replay-use-not-ready";
+            break;
+          }
           result = await this.use(actionId);
         } else {
+          if (!await this.waitForQueryMode()) {
+            failure = "replay-query-not-ready";
+            break;
+          }
           result = await this.query();
+          queryAccepted = result.ok;
         }
         actionCount += 1;
-        if (!result.ok) {
+        // 原复现中已失败的探测动作可以继续重放，最终是否修复由
+        // 结构化断言判定。但原本成功的链路动作若变为失败，属于回归必须立即阻断。
+        if (!result.ok && action.ok) {
           failure = result.event;
           break;
         }
@@ -180,18 +304,74 @@ export class GameDriver {
         break;
       }
     }
+    if (failure === null) await this.settleAutomaticTransition();
     const finalView = this.lastView;
     return {
       passed: failure === null,
       actionCount,
       finalView,
       failure,
+      queryAccepted,
     };
   }
 
   /** 读取隐藏裁判摘要，仅供验证层调用。 */
   async judge(floor: number): Promise<PlayJudge> {
     return await this.browser.judge(floor);
+  }
+
+  private async settleAutomaticTransition(): Promise<void> {
+    const transition = this.lastView;
+    if (!transition || transition.mode !== "transition") return;
+    for (let attempt = 0; attempt < TRANSITION_POLL_ATTEMPTS; attempt += 1) {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, TRANSITION_POLL_INTERVAL_MS);
+      });
+      const view = await this.browser.look();
+      this.lastView = view;
+      if (view.mode !== "transition" || view.floor !== transition.floor) return;
+    }
+  }
+
+  private async waitForExploreMode(): Promise<boolean> {
+    if (this.lastView?.mode === "explore") return true;
+    for (let attempt = 0; attempt < TRANSITION_POLL_ATTEMPTS; attempt += 1) {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, TRANSITION_POLL_INTERVAL_MS);
+      });
+      const view = await this.browser.look();
+      this.lastView = view;
+      if (view.mode === "explore") return true;
+    }
+    return false;
+  }
+
+  private async waitForQueryMode(): Promise<boolean> {
+    if (this.lastView?.mode === "combat" || this.lastView?.mode === "challenge") {
+      return true;
+    }
+    for (let attempt = 0; attempt < TRANSITION_POLL_ATTEMPTS; attempt += 1) {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, TRANSITION_POLL_INTERVAL_MS);
+      });
+      const view = await this.browser.look();
+      this.lastView = view;
+      if (view.mode === "combat" || view.mode === "challenge") return true;
+    }
+    return false;
+  }
+
+  private async waitForUseAction(actionId: string): Promise<boolean> {
+    if (this.lastView?.actions.some((action) => action.id === actionId)) return true;
+    for (let attempt = 0; attempt < TRANSITION_POLL_ATTEMPTS; attempt += 1) {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, TRANSITION_POLL_INTERVAL_MS);
+      });
+      const view = await this.browser.look();
+      this.lastView = view;
+      if (view.actions.some((action) => action.id === actionId)) return true;
+    }
+    return false;
   }
 
   private async ensureCheckpoint(): Promise<void> {

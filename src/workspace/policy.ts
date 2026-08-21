@@ -69,7 +69,31 @@ export function normalizeProjectPath(value: string): string {
   if (parts.some((part) => part === "..")) {
     throw new Error("路径不得离开项目根目录");
   }
-  return parts.join("/");
+  const result = parts.join("/");
+  if (!result) {
+    throw new Error("路径必须指向项目内的具体文件");
+  }
+  return result;
+}
+
+async function assertNoLinkedWriteSegment(
+  realRoot: string,
+  candidate: string,
+  normalized: string,
+): Promise<void> {
+  const segments = relative(realRoot, candidate).split(sep).filter(Boolean);
+  let current = realRoot;
+  for (const segment of segments) {
+    current = resolve(current, segment);
+    try {
+      if ((await lstat(current)).isSymbolicLink()) {
+        throw new Error("写入路径不能经过符号链接或 junction：" + normalized);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+  }
 }
 
 /**
@@ -157,6 +181,11 @@ export async function resolveProjectPath(
   }
   const realRoot = await realpath(root);
   const candidate = resolve(realRoot, normalized);
+  if (operation === "write") {
+    // 即使链接仍指向 worktree 内部，也不能把可变链接当成冻结的批准文件；否则
+    // 审批后替换链接即可把同一相对路径重定向到另一目标。
+    await assertNoLinkedWriteSegment(realRoot, candidate, normalized);
+  }
   const existing = await nearestExisting(candidate);
   const realExisting = await realpath(existing);
   const escaped = relative(realRoot, realExisting);

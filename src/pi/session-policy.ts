@@ -16,12 +16,9 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import type { MaintainerConfig } from "../config.js";
 import { appendEvent } from "../logging/events.js";
 import type { TaskStore } from "../task/store.js";
 import type { TaskRecord } from "../task/types.js";
-
-const PROVIDER_ID = "dungeon-maintainer";
 
 function comparablePath(path: string): string {
   const normalized = resolve(path);
@@ -73,12 +70,11 @@ export async function assertTaskSessionBinding(
 }
 
 /**
- * 安装 V1 固定模型和危险交互阻断钩子。
+ * 安装危险交互阻断钩子。
  *
  * @param pi 当前 Pi Extension API。
  * @param store 任务事件存储，只写低敏安全摘要。
  * @param task 当前任务。
- * @param config 固定 Provider 与模型配置。
  * @remarks Pi 内置命令先于同名 Extension 命令处理，所以必须使用生命周期钩子取消；
  * 仅注册 `/new` 等同名命令无法阻止会话已经被替换。
  */
@@ -86,19 +82,7 @@ export function registerSessionPolicyHooks(
   pi: ExtensionAPI,
   store: TaskStore,
   task: TaskRecord,
-  config: MaintainerConfig,
 ): void {
-  pi.on("model_select", async (event, context) => {
-    if (event.model.provider === PROVIDER_ID && event.model.id === config.model) {
-      return;
-    }
-    const expected = context.modelRegistry.find(PROVIDER_ID, config.model);
-    if (!expected || !await pi.setModel(expected)) {
-      throw new Error("无法恢复固定 Dungeon Maintainer 模型");
-    }
-    context.ui.notify("当前任务已恢复固定维护模型", "warning");
-  });
-
   pi.on("user_bash", async (_event, context) => {
     await appendEvent(store, task.id, "security.user_bash_blocked");
     context.ui.notify("! 与 !! Shell 已禁用；请使用受限维护工具", "warning");

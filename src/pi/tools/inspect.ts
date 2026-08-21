@@ -3,8 +3,8 @@
  *
  * 本文件负责把状态、浅目录、文本搜索、分页读取和 worktree Diff 转换为有限模型证据；
  * 不负责修改文件、执行任意命令或判断修复是否完成。所有路径都先经过 workspace
- * policy 的 realpath 边界检查，搜索仅以固定参数调用 ripgrep。输出最多 400 行或
- * 8 KiB，并在进入 Pi 上下文前脱敏；`.env`、生成目录、二进制和仓库外符号链接
+ * policy 的 realpath 边界检查，搜索仅以固定参数调用 ripgrep。读取默认返回 80 行，
+ * 单次输出仍不超过 240 行或 4 KiB，并在进入 Pi 上下文前脱敏；`.env`、生成目录、二进制和仓库外符号链接
  * 始终不可读。主要失败模式是路径越权、文件过大、`rg` 缺失或搜索进程异常。
  */
 
@@ -16,7 +16,7 @@ import { promisify } from "node:util";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { appendEvent } from "../../logging/events.js";
-import { redactText } from "../../logging/redact.js";
+import { redactCredentials } from "../../logging/redact.js";
 import type { TaskStore } from "../../task/store.js";
 import type { TaskRecord } from "../../task/types.js";
 import { hashBytes, hashFile, readRepo, worktreeDiff } from "../../workspace/git.js";
@@ -26,9 +26,11 @@ import {
 } from "../../workspace/policy.js";
 
 const exec = promisify(execFile);
-const MAX_LINES = 400;
-const MAX_BYTES = 8 * 1024;
+const MAX_LINES = 240;
+const MAX_BYTES = 4 * 1024;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
+const DEFAULT_READ_LINES = 80;
+const MAX_READ_LINES = 160;
 
 /** `inspect` 的严格参数契约。 */
 export const InspectParameters = Type.Object({
@@ -42,6 +44,7 @@ export const InspectParameters = Type.Object({
   path: Type.Optional(Type.String({ maxLength: 300 })),
   query: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
   startLine: Type.Optional(Type.Integer({ minimum: 1, maximum: 1_000_000 })),
+  lineCount: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_READ_LINES })),
 }, { additionalProperties: false });
 
 /** `inspect` 参数的 TypeScript 投影。 */
@@ -144,7 +147,27 @@ async function searchText(
       maxBuffer: 2 * 1024 * 1024,
       windowsHide: true,
     });
-    const output: string[] = [];
+    const matches: Array<{
+      path: string;
+      line: number;
+      text: string;
+      order: number;
+    }> = [];
+    const priority = (path: string): number => {
+      const lower = path.toLowerCase();
+      let score = 0;
+      if (lower.includes("/src/")) score += 100;
+      if (lower.includes("/devtools/dungeon-agent/")) score += 500;
+      if (lower.endsWith("/actions.ts")) score += 400;
+      if (lower.includes("/bridge.")) score += 300;
+      if (lower.includes("/projection.")) score += 150;
+      if (lower.includes("/tests/") || lower.includes("/docs/") || lower.includes("readme")) {
+        score -= 250;
+      }
+      if (lower.includes("agents")) score -= 500;
+      return score;
+    };
+    let order = 0;
     for (const row of result.stdout.split(/\r?\n/u).filter(Boolean)) {
       const event: unknown = JSON.parse(row);
       if (
@@ -170,16 +193,21 @@ async function searchText(
         || classifyPath(path, "read") === "denied"
       ) continue;
       const line = typeof data.line_number === "number" ? data.line_number : 0;
-      output.push(
-        path
-        + ":"
-        + String(line)
-        + ":"
-        + data.lines.text.replace(/\r?\n$/u, ""),
-      );
-      if (output.length >= 80) break;
+      matches.push({
+        path,
+        line,
+        text: data.lines.text.replace(/\r?\n$/u, ""),
+        order,
+      });
+      order += 1;
     }
-    return output.join("\n");
+    matches.sort((left, right) => (
+      priority(right.path) - priority(left.path)
+      || left.order - right.order
+    ));
+    return matches.slice(0, 80).map((match) => (
+      match.path + ":" + String(match.line) + ":" + match.text
+    )).join("\n");
   } catch (error) {
     const code: unknown = (error as { code?: unknown }).code;
     if (code === "ENOENT") throw new Error("inspect search 需要本机安装 rg");
@@ -193,6 +221,7 @@ async function readPage(
   root: string,
   projectPath: string,
   startLine = 1,
+  lineCount = DEFAULT_READ_LINES,
 ): Promise<string> {
   const target = await resolveProjectPath(root, projectPath, "read");
   const information = await stat(target.absolute);
@@ -202,7 +231,7 @@ async function readPage(
   const value = await readFile(target.absolute, "utf8");
   if (value.includes("\0")) throw new Error("inspect 不读取二进制文件");
   return value.split(/\r?\n/u)
-    .slice(startLine - 1, startLine - 1 + MAX_LINES)
+    .slice(startLine - 1, startLine - 1 + lineCount)
     .map((line, index) => (
       String(startLine + index).padStart(5, " ") + " " + line
     ))
@@ -241,13 +270,13 @@ export async function inspectTask(
     raw = await searchText(root, input.query, input.path);
   } else if (input.action === "read") {
     if (!input.path) throw new Error("read 必须提供 path");
-    raw = await readPage(root, input.path, input.startLine);
+    raw = await readPage(root, input.path, input.startLine, input.lineCount);
     baseHash = await hashFile(root, input.path);
   } else {
     raw = await worktreeDiff(root);
   }
   signal?.throwIfAborted();
-  const clipped = clip(redactText(raw));
+  const clipped = clip(redactCredentials(raw));
   const contentHash = hashBytes(Buffer.from(clipped.text, "utf8"));
   const evidenceId = createHash("sha256")
     .update(context.task.id + ":" + input.action + ":" + contentHash)
@@ -277,7 +306,7 @@ export async function inspectTask(
     text: metadata
       + "\n"
       + clipped.text
-      + (clipped.truncated ? "\n[内容已按 400 行或 8 KiB 截断]" : ""),
+      + (clipped.truncated ? "\n[内容已按 240 行或 4 KiB 截断]" : ""),
     details,
   };
 }
@@ -299,7 +328,7 @@ export function registerInspectTool(
     promptSnippet: "用 inspect 获取代码与 Git 证据",
     promptGuidelines: [
       "修改前必须用 inspect read 获取目标文件的 baseHash。",
-      "优先 search 缩小范围，再分页 read；不要重复读取无关大文件。",
+      "优先 search 缩小范围，再用 startLine 和 lineCount 精确分页 read；默认 80 行，不要重复读取无关大文件。",
     ],
     executionMode: "sequential",
     parameters: InspectParameters,

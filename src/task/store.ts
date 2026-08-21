@@ -1,5 +1,5 @@
 /**
- * schema v2 任务状态和本地持久化。
+ * schema v3 任务状态和本地持久化。
  *
  * TaskStore 是任务事实的唯一写入口：task.json 使用临时文件加原子替换，
  * events.jsonl 只追加低敏元数据。它不执行 Git、浏览器或 Pi，也不读取目标仓库。
@@ -10,7 +10,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { redactText } from "../logging/redact.js";
 import type {
@@ -19,6 +19,22 @@ import type {
   TaskRecord,
   TaskState,
 } from "./types.js";
+
+function defaultTaskDisplayName(sourceBranch: unknown): string {
+  const branch = typeof sourceBranch === "string" && sourceBranch.trim()
+    ? sourceBranch.trim()
+    : "unknown";
+  return redactText("修复 · " + branch).slice(0, 80);
+}
+
+function normalizeTaskDisplayName(value: unknown): string {
+  const name = redactText(typeof value === "string" ? value : "")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, 80);
+  if (!name) throw new Error("任务名称不能为空");
+  return name;
+}
 
 const TRANSITIONS: Readonly<Record<TaskState, readonly TaskState[]>> = {
   created: ["active", "blocked", "discarded"],
@@ -65,7 +81,7 @@ export class TaskStore {
   }
 
   /**
-   * 创建并持久化 schema v2 任务。
+   * 创建并持久化 schema v3 任务。
    *
    * @param input 已经创建好 detached worktree 的任务基础信息。
    * @returns 状态为 created 的完整任务。
@@ -74,17 +90,35 @@ export class TaskStore {
     input: Pick<
       TaskRecord,
       "id" | "objective" | "repoRoot" | "baseHead" | "worktreeRoot" | "piSessionDir"
-    >,
+    > & Partial<Pick<
+      TaskRecord,
+      "displayName" | "sourceBranch" | "sourceDirtyFiles" | "sourceSnapshotHash"
+    >>,
   ): Promise<TaskRecord> {
     const now = new Date().toISOString();
     const task: TaskRecord = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       id: input.id,
+      displayName: input.displayName
+        ? normalizeTaskDisplayName(input.displayName)
+        : defaultTaskDisplayName(input.sourceBranch),
       objective: redactText(input.objective).slice(0, 2_000),
       repoRoot: resolve(input.repoRoot),
       baseHead: input.baseHead,
+      sourceBranch: input.sourceBranch ?? "(unknown)",
+      sourceDirtyFiles: input.sourceDirtyFiles ?? 0,
+      sourceSnapshotHash: input.sourceSnapshotHash ?? null,
       worktreeRoot: resolve(input.worktreeRoot),
       piSessionDir: resolve(input.piSessionDir),
+      modelProfileId: "default",
+      thinkingLevel: "off",
+      writeScope: {
+        state: "unapproved",
+        allowedPaths: [],
+        digest: null,
+        approvedAt: null,
+        closedAt: null,
+      },
       state: "created",
       createdAt: now,
       updatedAt: now,
@@ -114,7 +148,7 @@ export class TaskStore {
    * 读取并验证任务。
    *
    * @param taskId 要恢复的任务 ID。
-   * @returns schema v2 任务记录。
+   * @returns schema v3 任务记录；v2 会在原路径原子迁移。
    * @throws v1 任务、损坏 JSON、ID 不匹配或状态非法时拒绝。
    */
   async read(taskId: string): Promise<TaskRecord> {
@@ -128,14 +162,109 @@ export class TaskStore {
       throw new Error("旧 schema v1 任务不能恢复；请使用 start 创建 V1 Pi 任务");
     }
     if (
-      record.schemaVersion !== 2
+      (record.schemaVersion !== 2 && record.schemaVersion !== 3)
       || record.id !== taskId
       || typeof record.state !== "string"
       || !Object.hasOwn(TRANSITIONS, record.state)
     ) {
       throw new Error("任务记录版本、ID 或状态非法");
     }
-    return value as TaskRecord;
+    const task = value as unknown as TaskRecord;
+    let needsSave = false;
+    if (
+      typeof record.displayName !== "string"
+      || !record.displayName.trim()
+      || record.displayName === "未命名修复"
+    ) {
+      task.displayName = defaultTaskDisplayName(record.sourceBranch);
+      needsSave = true;
+    } else {
+      task.displayName = normalizeTaskDisplayName(record.displayName);
+    }
+    // 早期 schema v2 任务没有来源快照字段；保持其原有“正式仓库必须干净”语义，
+    // 不能凭空把恢复时的工作区状态认作启动基线。
+    if (typeof record.sourceBranch !== "string") task.sourceBranch = "(legacy)";
+    if (typeof record.sourceDirtyFiles !== "number") task.sourceDirtyFiles = 0;
+    if (typeof record.sourceSnapshotHash !== "string") task.sourceSnapshotHash = null;
+    if (record.schemaVersion === 2) {
+      task.schemaVersion = 3;
+      task.modelProfileId = "default";
+      task.thinkingLevel = "off";
+      task.writeScope = {
+        state: "unapproved",
+        allowedPaths: [],
+        digest: null,
+        approvedAt: null,
+        closedAt: null,
+      };
+      needsSave = true;
+      await this.save(task);
+      await this.append(task.id, {
+        at: task.updatedAt,
+        type: "task.migrated",
+        detail: { from: 2, to: 3 },
+      });
+    } else if (needsSave) {
+      await this.save(task);
+    }
+    return task;
+  }
+
+  /** 修改任务展示名称；名称只影响 UI 和任务目录，不改变任何执行绑定。 */
+  async rename(task: TaskRecord, displayName: string): Promise<void> {
+    const nextName = normalizeTaskDisplayName(displayName);
+    if (task.displayName === nextName) return;
+    task.displayName = nextName;
+    await this.save(task);
+    await this.append(task.id, {
+      at: task.updatedAt,
+      type: "task.renamed",
+      detail: { name: nextName },
+    });
+  }
+
+  /**
+   * 枚举任务目录中的安全任务 ID。
+   *
+   * @returns 稳定排序后的目录名；具体 task.json 仍必须逐个通过 read 校验。
+   */
+  async listIds(): Promise<string[]> {
+    const root = join(this.dataDir, "tasks");
+    let entries;
+    try {
+      entries = await readdir(root, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+    return entries
+      .filter((entry) => entry.isDirectory() && /^[a-zA-Z0-9._-]+$/u.test(entry.name))
+      .map((entry) => entry.name)
+      .sort();
+  }
+
+  /** 保存用户确认后的精确写入白名单。 */
+  async approveWriteScope(
+    task: TaskRecord,
+    allowedPaths: readonly string[],
+    digest: string,
+  ): Promise<void> {
+    task.writeScope = {
+      state: "approved",
+      allowedPaths: [...allowedPaths],
+      digest,
+      approvedAt: new Date().toISOString(),
+      closedAt: null,
+    };
+    await this.save(task);
+  }
+
+  /** 关闭当前写入白名单；保留路径供 Shell 展示和审计。 */
+  async closeWriteScope(task: TaskRecord): Promise<void> {
+    if (task.writeScope.state === "unapproved") return;
+    task.writeScope.state = "closed";
+    task.writeScope.closedAt = new Date().toISOString();
+    await this.save(task);
   }
 
   /**

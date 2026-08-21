@@ -2,12 +2,13 @@
  * Playwright Chromium 与协议 v2 页面客户端。
  *
  * 浏览器使用全新临时 Context，不读取用户 Chrome Profile。所有页面调用都固定为
- * look/go/use/query/judge/checkpoint，不接受模型 JavaScript、CSS 选择器或 SQL。
+ * look/go/use/inputSql/query/judge/checkpoint，不接受模型 JavaScript、CSS 选择器或坐标；
+ * inputSql 只接受文本并写入当前固定 textarea。
  * headed Chromium 只打开维护器 Shell 页面；游戏本身作为 Shell 内的 iframe 加载，
  * 因此用户只看到一个可拖拽分栏的窗口。没有 Shell 地址时仅用于单元测试兼容直开游戏。
  */
 
-import { chromium, type Browser, type BrowserContext, type Frame, type Page } from "playwright";
+import { chromium, type BrowserContext, type Frame, type Page } from "playwright";
 import type {
   PlayJudge,
   PlayResult,
@@ -27,10 +28,11 @@ export type BrowserErrorListener = (kind: string) => void;
  * open 与 close 都是幂等边界之外的显式操作；调用方必须在 session_shutdown 中 close。
  */
 export class GameBrowser {
-  private browser: Browser | null = null;
   private context: BrowserContext | null = null;
   private page: Page | null = null;
   private gameUrl = "";
+  /** 已处理的恢复文档 timeOrigin；同一恢复页面不能在后续验证中重复冒充自动刷新。 */
+  private lastRestoredTimeOrigin: number | null = null;
 
   /**
    * @param baseUrl 当前 worktree 的本机 Vite 地址。
@@ -44,15 +46,21 @@ export class GameBrowser {
   ) {}
 
   /**
-   * 启动 headed Chromium 并打开开发桥页面。
+   * 启动 Chromium 并打开开发桥页面。
    *
    * @param floor 初始管理员预览楼层。
+   * @param headless 基准测试时使用无界面 Chromium；正式维护会话始终为 `false`。
    */
-  async open(floor = 1): Promise<void> {
+  async open(floor = 1, headless = false): Promise<void> {
+    this.gameUrl = this.baseUrl + "/?playtest=agent&floor=" + String(floor);
+    const initialUrl = this.shellUrl ?? this.gameUrl;
     try {
-      this.browser = await chromium.launch({
-        headless: false,
+      this.context = await chromium.launchPersistentContext("", {
+        headless,
+        reducedMotion: "reduce",
+        viewport: null,
         args: [
+          `--app=${initialUrl}`,
           "--window-size=1500,1000",
         ],
       });
@@ -62,11 +70,10 @@ export class GameBrowser {
         { cause: error },
       );
     }
-    this.context = await this.browser.newContext({
-      reducedMotion: "reduce",
-      viewport: { width: 920, height: 900 },
-    });
-    this.page = await this.context.newPage();
+    // 空 userDataDir 会让 Playwright 创建并回收临时 Profile；--app 去掉浏览器工具栏，
+    // viewport:null 则让网页视口始终跟随真实窗口。固定虚拟视口会在高 DPI 屏幕上把
+    // 左侧输入框和底部状态栏裁到窗口之外，也会破坏用户拖动窗口后的响应式布局。
+    this.page = this.context.pages()[0] ?? await this.context.newPage();
     this.page.setDefaultTimeout(15_000);
     this.page.on("console", (message) => {
       if (message.type() === "error") this.onError("console-error");
@@ -74,9 +81,8 @@ export class GameBrowser {
     this.page.on("pageerror", () => {
       this.onError("page-error");
     });
-    this.gameUrl = this.baseUrl + "/?playtest=agent&floor=" + String(floor);
     await this.page.goto(
-      this.shellUrl ?? this.gameUrl,
+      initialUrl,
       { waitUntil: "domcontentloaded" },
     );
     await this.waitForReady();
@@ -85,10 +91,9 @@ export class GameBrowser {
   /** 关闭临时 Context 和浏览器进程。 */
   async close(): Promise<void> {
     await this.context?.close().catch(() => undefined);
-    await this.browser?.close().catch(() => undefined);
     this.page = null;
     this.context = null;
-    this.browser = null;
+    this.lastRestoredTimeOrigin = null;
   }
 
   /** 将 headed 游戏窗口带到前台。 */
@@ -117,17 +122,27 @@ export class GameBrowser {
    * @returns 恢复后的玩家投影。
    */
   async reloadFromCheckpoint(): Promise<PlayView> {
-    const frame = await this.needGameFrame();
-    await frame.goto(this.gameUrl, { waitUntil: "domcontentloaded" });
-    await this.waitForReady();
-    const restored = await this.needGameFrame().then((currentFrame) => currentFrame.evaluate(() => (
-      (window as unknown as {
-        __DUNGEON_PLAYTEST__?: { checkpointRestored?: boolean };
-      }).__DUNGEON_PLAYTEST__?.checkpointRestored === true
-    )));
-    if (!restored) {
+    const currentFrame = await this.needGameFrame();
+    await this.waitForReady(currentFrame);
+    // Vite 可能在源码写入后先于驱动器自动刷新 iframe，并已消费
+    // 一次性 checkpoint。此时再 goto 会二次消费一个不存在的令牌。
+    const currentRestoration = await this.restorationState(currentFrame);
+    if (
+      currentRestoration.restored
+      && currentRestoration.timeOrigin !== this.lastRestoredTimeOrigin
+    ) {
+      this.lastRestoredTimeOrigin = currentRestoration.timeOrigin;
+      return await this.look();
+    }
+
+    await currentFrame.goto(this.gameUrl, { waitUntil: "domcontentloaded" });
+    const restoredFrame = await this.needGameFrame();
+    await this.waitForReady(restoredFrame);
+    const restored = await this.restorationState(restoredFrame);
+    if (!restored.restored) {
       throw new GameBrowserError("刷新后未消费一次性游戏检查点");
     }
+    this.lastRestoredTimeOrigin = restored.timeOrigin;
     return await this.look();
   }
 
@@ -152,7 +167,12 @@ export class GameBrowser {
     return await this.call<PlayResult>("use", [actionId]);
   }
 
-  /** 提交桥内部管理员答案，调用方不能传 SQL。 */
+  /** 向当前已打开的固定玩家 textarea 写入 SQL，不执行查询或接受选择器。 */
+  async inputSql(sql: string): Promise<PlayResult> {
+    return await this.call<PlayResult>("inputSql", [sql]);
+  }
+
+  /** 点击当前玩家终端执行 textarea 现值，调用方不能传 SQL 参数。 */
   async query(): Promise<PlayResult> {
     return await this.call<PlayResult>("query", []);
   }
@@ -170,17 +190,28 @@ export class GameBrowser {
     );
   }
 
-  private async waitForReady(): Promise<void> {
-    const frame = await this.needGameFrame();
-    await frame.waitForFunction(() => (
+  private async waitForReady(frame?: Frame): Promise<void> {
+    const currentFrame = frame ?? await this.needGameFrame();
+    await currentFrame.waitForFunction(() => (
       (window as unknown as {
         __DUNGEON_PLAYTEST__?: { version?: number };
       }).__DUNGEON_PLAYTEST__?.version === 2
     ));
-    await frame.waitForFunction(() => (
+    await currentFrame.waitForFunction(() => (
       document.querySelector("#app")?.getAttribute("data-runtime-state")
       === "active"
     ));
+  }
+
+  private async restorationState(
+    frame: Frame,
+  ): Promise<{ restored: boolean; timeOrigin: number }> {
+    return await frame.evaluate(() => ({
+      restored: (window as unknown as {
+        __DUNGEON_PLAYTEST__?: { checkpointRestored?: boolean };
+      }).__DUNGEON_PLAYTEST__?.checkpointRestored === true,
+      timeOrigin: performance.timeOrigin,
+    }));
   }
 
   private needPage(): Page {
@@ -205,12 +236,20 @@ export class GameBrowser {
   }
 
   private async call<T>(
-    method: "look" | "go" | "use" | "query" | "judge" | "events",
+    method: "look" | "go" | "use" | "inputSql" | "query" | "judge" | "events",
     args: unknown[],
   ): Promise<T> {
     try {
       return await this.needGameFrame().then((frame) => frame.evaluate(
         async ({ name, values }) => {
+          if (name === "go" || name === "use") {
+            // 左侧输入框会让游戏 iframe 收到 blur，探索场景因此暂停外部移动和交互。
+            // 在固定语义动作前重新聚焦游戏根节点，恢复真实页面输入状态；这里不接受
+            // 模型选择器，也不伪造键盘或鼠标轨迹。
+            document.querySelector<HTMLElement>("#game-root")?.focus({
+              preventScroll: true,
+            });
+          }
           const bridge = (window as unknown as {
             __DUNGEON_PLAYTEST__?: Record<
               string,

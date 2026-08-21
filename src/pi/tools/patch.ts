@@ -1,11 +1,13 @@
 /**
  * Pi `patch` 精确修改工具。
  *
- * 本文件只把 Pi 的严格 TypeBox 参数、一次性确认框和浏览器刷新顺序连接到 workspace
+ * 本文件只把 Pi 的严格 TypeBox 参数、方案授权和浏览器刷新顺序连接到 workspace
  * patch；真正的路径、realpath、baseHash、唯一匹配、隐私和预算校验均由安全层执行。
  * 运行时问题必须先保存复现，静态问题必须已有失败检查。写入前保留复现起点，写入后
  * 用新代码恢复检查点并重放同一语义动作。拒绝审批不会写入字节；刷新失败会保留
- * worktree 变化和事件证据，但正式仓库仍不受影响。
+ * worktree 变化和事件证据，但正式仓库仍不受影响。模型只能在总方案已经获批后看到
+ * 本工具，因此核心路径不会再弹出第二个确认框；workspace 层仍保留精确摘要与一次性
+ * 消费记录，供非模型调用和安全测试使用。
  */
 
 import type {
@@ -22,6 +24,7 @@ import {
   applyPrecisePatch,
   type PrecisePatchResult,
 } from "../../workspace/patch.js";
+import { assertWritePathAllowed } from "../../workspace/write-scope.js";
 
 const PatchEditParameters = Type.Object({
   path: Type.String({ minLength: 1, maxLength: 300 }),
@@ -50,6 +53,7 @@ export interface PatchToolContext {
   store: TaskStore;
   currentDriver(): GameDriver | null;
   ensureGame(): Promise<GameDriver>;
+  isExecutionApproved(): boolean;
 }
 
 async function confirmCorePatch(
@@ -93,6 +97,9 @@ export function registerPatchTool(
     executionMode: "sequential",
     parameters: PatchParameters,
     async execute(_toolCallId, input, signal, _onUpdate, extensionContext) {
+      if (!context.isExecutionApproved()) {
+        throw new Error("完整修复方案尚未获用户确认，不能修改代码。");
+      }
       const reproduction = await readActiveReproduction(
         context.store,
         context.task,
@@ -111,15 +118,27 @@ export function registerPatchTool(
       // 回调会在 workspace 层内部执行；用显式状态盒保留结果，避免把异步回调赋值
       // 误判成当前作用域中永远不会发生的控制流，同时不把刷新职责泄漏到安全层。
       const replayState: { current: ReplayResult | null } = { current: null };
+      const scopedInput = {
+        edits: input.edits.map((edit) => ({
+          ...edit,
+          path: assertWritePathAllowed(context.task, edit.path),
+        })),
+      };
       const result = await applyPrecisePatch({
         task: context.task,
         store: context.store,
-        confirmCore: async (paths, changedLines) => await confirmCorePatch(
-          extensionContext,
-          context.task,
-          paths,
-          changedLines,
-        ),
+        confirmCore: async (paths, changedLines) => {
+          // 总方案确认已经授权当前 Agent 运行完成其中的代码修改。patch 在诊断阶段
+          // 不可见，因此这里无需为同一方案重复打断用户；未获总授权的非标准调用
+          // 仍回退到原有精确核心路径确认。
+          if (context.isExecutionApproved()) return true;
+          return await confirmCorePatch(
+            extensionContext,
+            context.task,
+            paths,
+            changedLines,
+          );
+        },
         beforePatch: async () => {
           // 已有复现时必须保留最初检查点，绝不能在症状发生后重新覆盖起点。
           await driver?.ensureReproductionCheckpoint();
@@ -139,7 +158,7 @@ export function registerPatchTool(
             replayState.current = await driver.reloadAndReplay([]);
           }
         },
-      }, input, signal);
+      }, scopedInput, signal);
       const replay = replayState.current;
       const details: PatchToolDetails = {
         ...result,
