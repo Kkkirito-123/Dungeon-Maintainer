@@ -10,6 +10,7 @@
  */
 
 import type { TaskRecord, TaskState } from "../task/types.js";
+import { promptTokenLimit } from "../pi/token-control.js";
 
 /** Shell 可选择的 Pi 模型安全摘要。 */
 export interface ShellModelOption {
@@ -17,6 +18,8 @@ export interface ShellModelOption {
   id: string;
   name: string;
   reasoning: boolean;
+  contextWindow: number | null;
+  maxOutputTokens: number | null;
 }
 
 /** Shell 请求 AppController 切换到来源工作树或可恢复任务。 */
@@ -54,6 +57,7 @@ export interface ShellStatus {
   contextUsed: number | null;
   contextLimit: number;
   contextPercent: number | null;
+  promptTokenLimit: number;
   turnInputTokens: number;
   turnOutputTokens: number;
   cacheReadTokens: number;
@@ -108,6 +112,7 @@ export type ShellUiResponse =
 export interface ShellStatusConfig {
   model: string;
   contextWindow: number;
+  maxOutputTokens?: number;
   task: TaskRecord;
 }
 
@@ -149,6 +154,7 @@ export function createInitialStatus(config: ShellStatusConfig): ShellStatus {
     contextUsed: null,
     contextLimit: config.contextWindow,
     contextPercent: null,
+    promptTokenLimit: promptTokenLimit(config.contextWindow, config.maxOutputTokens ?? 4_096),
     turnInputTokens: 0,
     turnOutputTokens: 0,
     cacheReadTokens: 0,

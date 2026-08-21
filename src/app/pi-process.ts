@@ -165,6 +165,7 @@ export class AppController {
       task: this.activeTask,
       model: activeProfile.modelId,
       contextWindow: activeProfile.contextWindow,
+      maxOutputTokens: activeProfile.maxOutputTokens,
       store: this.store,
       sendPiCommand: async (command: PiRpcCommand) => await this.send(command),
       onSwitchTask: async (request) => await this.switchTask(request),

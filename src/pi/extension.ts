@@ -1012,13 +1012,7 @@ export function installDungeonMaintainerExtension(
     // 每个模型回合都重新固定工具列表，防止 UI 设置或快捷键把内置能力重新激活。
     setExecutionApproved(executionApproved);
     const usage = context.getContextUsage();
-    if (usage?.percent !== null && usage?.percent !== undefined && usage.percent >= 70) {
-      // 64k 上下文还需为输出预留 16k 左右；70% 先行压缩，避免等到 90% 时已经
-      // 没有安全输出空间。Pi 0.84.2 的零 usage 缺陷另由升级/回补上游修复处理。
-      context.compact({
-        customInstructions: "只保留任务目标、当前复现用例、证据 ID、补丁路径、验证状态和未解决阻塞；删除重复文件正文。",
-      });
-    } else if (usage?.percent !== null && usage?.percent !== undefined && usage.percent >= 60) {
+    if (usage?.percent !== null && usage?.percent !== undefined && usage.percent >= 60) {
       context.ui.notify("上下文已超过 60%，请停止低价值搜索并使用已有证据摘要。", "warning");
     }
     const view = await gameRuntime.currentDriver()?.peek().catch(() => null) ?? null;
