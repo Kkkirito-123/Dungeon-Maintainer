@@ -7,8 +7,9 @@
  */
 
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { appendEvent } from "../logging/events.js";
 import { redactText } from "../logging/redact.js";
 import type { TaskStore } from "../task/store.js";
@@ -86,6 +87,48 @@ function safeEnvironment(): NodeJS.ProcessEnv {
   ));
 }
 
+function pnpmCliPath(): string | null {
+  const pathCandidates: string[] = [];
+  for (const directory of (process.env.PATH ?? "").split(delimiter).filter(Boolean)) {
+    pathCandidates.push(
+      join(directory, "node_modules", "pnpm", "bin", "pnpm.mjs"),
+      join(directory, "node_modules", "pnpm", "bin", "pnpm.cjs"),
+    );
+  }
+
+  const isJavaScriptCli = (candidate: string): boolean => (
+    candidate.length > 0
+    && /\.(?:cjs|mjs|js)$/iu.test(candidate)
+    && existsSync(candidate)
+  );
+  const isCorepack = (candidate: string): boolean => /[\\/]corepack[\\/]/iu.test(candidate);
+
+  // PATH 中的真实 pnpm 入口优先于 Corepack。Corepack 会按 packageManager
+  // 自动下载并切换版本；固定检查必须复用当前已安装的 pnpm，避免离线环境或
+  // 版本漂移把本来通过的游戏检查误报为失败。
+  const preferred = [process.env.npm_execpath ?? "", ...pathCandidates]
+    .filter((candidate) => !isCorepack(candidate) && isJavaScriptCli(candidate));
+  if (preferred.length > 0) return preferred[0] ?? null;
+
+  const fallback = [
+    process.env.npm_execpath ?? "",
+    ...pathCandidates,
+    join(dirname(process.execPath), "node_modules", "corepack", "dist", "pnpm.js"),
+  ];
+  return fallback.find(isJavaScriptCli) ?? null;
+}
+
+function checkInvocation(spec: CheckSpec): { file: string; args: readonly string[] } {
+  if (process.platform !== "win32" || spec.file !== "pnpm") {
+    return { file: spec.file, args: spec.args };
+  }
+  const cli = pnpmCliPath();
+  if (!cli) throw new Error("Windows 环境找不到可由 Node 直接执行的 pnpm CLI");
+  // Windows 的 pnpm 通常是 .cmd/.ps1，shell:false 无法直接 CreateProcess。固定检查
+  // 改由当前 Node 执行 pnpm 的 JS 入口，继续保持无 Shell、无模型参数拼接。
+  return { file: process.execPath, args: [cli, ...spec.args] };
+}
+
 async function runFixedCommand(
   spec: CheckSpec,
   cwd: string,
@@ -93,7 +136,8 @@ async function runFixedCommand(
 ): Promise<{ code: number | null; output: string; durationMs: number }> {
   const started = performance.now();
   return await new Promise((resolve, reject) => {
-    const child = spawn(spec.file, spec.args, {
+    const invocation = checkInvocation(spec);
+    const child = spawn(invocation.file, invocation.args, {
       cwd,
       env: safeEnvironment(),
       shell: false,

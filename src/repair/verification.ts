@@ -12,7 +12,9 @@ import type { TaskStore } from "../task/store.js";
 import type { TaskRecord, VerificationRecord } from "../task/types.js";
 import type { GameDriver } from "../game/driver.js";
 import { capturePatch } from "../workspace/apply.js";
+import { syncWorktreeChanges } from "../workspace/changes.js";
 import { hashWorktree } from "../workspace/git.js";
+import { assertChangedPathsWithinApprovedScope } from "../workspace/write-scope.js";
 import {
   requiredChecks,
   runCheck,
@@ -51,9 +53,16 @@ export async function verifyTask(
   driver: GameDriver | null,
   signal?: AbortSignal,
 ): Promise<VerificationResult> {
+  // Pi 原生 edit/write/bash 不经过 patch 工具；验证前以 Git 事实同步变化，确保固定
+  // 检查、补丁封装和 apply 看到同一组文件，而不是依赖模型是否主动登记路径。
+  await syncWorktreeChanges(store, task, "verify");
   if (task.changedPaths.length === 0) {
-    throw new Error("任务没有通过 patch 工具记录的代码变化");
+    throw new Error("任务 worktree 没有代码变化");
   }
+  task.changedPaths = assertChangedPathsWithinApprovedScope(
+    task,
+    task.changedPaths,
+  );
   if (task.state === "ready_to_apply") await store.transition(task, "active");
   if (task.state === "active") await store.transition(task, "verifying");
   if (task.state !== "verifying") {
@@ -91,7 +100,7 @@ export async function verifyTask(
     replayPassed = replay.passed;
     if (!replayPassed) {
       throw new Error(
-        "复现动作重放失败："
+        "复现动作或结果断言失败："
         + (replay.failure ?? "未知浏览器错误"),
       );
     }
@@ -101,7 +110,7 @@ export async function verifyTask(
   const expected = [...task.changedPaths].sort();
   const actual = [...captured.paths].sort();
   if (expected.join("\n") !== actual.join("\n")) {
-    throw new Error("worktree 包含未经过 patch 工具登记的文件变化");
+    throw new Error("worktree 在验证期间又发生了变化");
   }
   task.changedPaths = actual;
   task.baseHashes = captured.baseHashes;

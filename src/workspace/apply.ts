@@ -2,8 +2,9 @@
  * 补丁封装、显式 apply 与丢弃前快照。
  *
  * 本模块把 worktree 变化保存为 patch.diff 和 reverse.diff，并在写回正式仓库前重新
- * 验证任务状态、VerificationRecord、完整 worktree Hash、目标 HEAD、工作区洁净度
- * 和每个文件的真实字节 Hash。任一条件不满足都在 git apply 前拒绝，不尝试自动合并。
+ * 验证任务状态、VerificationRecord、完整 worktree Hash、目标 HEAD、来源启动快照 Hash
+ * 和每个文件的真实字节 Hash。来源可以保留启动时的脏状态，但任何新增漂移都会在
+ * git apply 前拒绝；维护器不尝试自动合并。
  *
  * reverse.diff 与 patch.diff 保存同一份已验证补丁，回滚方向由 Git 解释；V1 不暴露
  * 自动回滚命令，但保留恢复产物供人工检查。所有操作都不会 commit、push 或创建 PR。
@@ -21,6 +22,7 @@ import {
   runGitRaw,
 } from "./git.js";
 import { normalizeProjectPath } from "./policy.js";
+import { assertChangedPathsWithinApprovedScope } from "./write-scope.js";
 
 async function includeUntrackedFiles(worktreeRoot: string): Promise<void> {
   const raw = await runGitRaw(worktreeRoot, [
@@ -31,6 +33,22 @@ async function includeUntrackedFiles(worktreeRoot: string): Promise<void> {
   ]);
   for (const path of raw.split("\0").filter(Boolean)) {
     await runGit(worktreeRoot, ["add", "--intent-to-add", "--", path]);
+  }
+}
+
+async function assertSourceSnapshot(task: TaskRecord): Promise<void> {
+  const state = await readRepo(task.repoRoot);
+  if (state.head !== task.baseHead) {
+    throw new Error("目标仓库 HEAD 与任务 baseHead 不一致");
+  }
+  if (task.sourceSnapshotHash) {
+    if (await hashWorktree(task.repoRoot) !== task.sourceSnapshotHash) {
+      throw new Error("来源工作树已偏离任务启动快照");
+    }
+    return;
+  }
+  if (!state.clean) {
+    throw new Error("旧任务没有来源快照且目标仓库存在未提交修改");
   }
 }
 
@@ -78,13 +96,7 @@ export async function capturePatch(
   task: TaskRecord,
   taskDir: string,
 ): Promise<CapturedPatch> {
-  const targetState = await readRepo(task.repoRoot);
-  if (!targetState.clean) {
-    throw new Error("目标仓库存在未提交修改，不能生成可应用补丁");
-  }
-  if (targetState.head !== task.baseHead) {
-    throw new Error("目标仓库 HEAD 已变化，不能生成旧基线补丁");
-  }
+  await assertSourceSnapshot(task);
   await includeUntrackedFiles(task.worktreeRoot);
   const rawNames = await runGitRaw(task.worktreeRoot, [
     "diff",
@@ -110,6 +122,9 @@ export async function capturePatch(
 
   const baseHashes = Object.fromEntries(await Promise.all(paths.map(
     async (path) => {
+      if (task.sourceSnapshotHash) {
+        return [path, await hashFile(task.repoRoot, path)] as const;
+      }
       let expectedBlob: string | null = null;
       try {
         expectedBlob = await runGit(
@@ -160,15 +175,15 @@ export async function applyTaskPatch(
   if (!await pathExists(task.patchPath)) {
     throw new Error("任务补丁文件已丢失");
   }
+  task.changedPaths = assertChangedPathsWithinApprovedScope(
+    task,
+    task.changedPaths,
+  );
   const currentWorktreeHash = await hashWorktree(task.worktreeRoot);
   if (currentWorktreeHash !== task.verification.worktreeHash) {
     throw new Error("worktree 在验证后发生变化，请重新 /verify");
   }
-  const state = await readRepo(task.repoRoot);
-  if (!state.clean) throw new Error("目标仓库存在未提交修改，拒绝 apply");
-  if (state.head !== task.baseHead) {
-    throw new Error("目标仓库 HEAD 与任务 baseHead 不一致");
-  }
+  await assertSourceSnapshot(task);
   for (const path of task.changedPaths) {
     const expected = task.baseHashes[path];
     if (expected === undefined || await hashFile(task.repoRoot, path) !== expected) {

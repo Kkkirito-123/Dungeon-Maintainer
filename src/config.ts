@@ -21,12 +21,14 @@ export interface MaintainerConfig {
   apiKey: string | null;
   /** OpenAI 兼容接口根地址，不包含 chat/completions 后缀。 */
   baseUrl: string;
-  /** Pi 启动时固定选择的模型标识。 */
+  /** 没有活动模型档案时使用的默认模型标识。 */
   model: string;
   /** 注册给 Pi Provider 的上下文窗口大小。 */
   contextWindow: number;
   /** 注册给 Pi Provider 的单次最大输出 Token。 */
   maxOutputTokens: number;
+  /** 默认模型档案是否支持 Pi Thinking 等级。 */
+  reasoning: boolean;
   /** 任务、Pi 会话、检查日志和 worktree 的统一父目录。 */
   dataDir: string;
 }
@@ -41,6 +43,13 @@ function boundedInteger(
   return Number.isInteger(parsed) && parsed >= minimum && parsed <= maximum
     ? parsed
     : fallback;
+}
+
+function booleanValue(value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined) return fallback;
+  if (/^(?:1|true|yes|on)$/iu.test(value.trim())) return true;
+  if (/^(?:0|false|no|off)$/iu.test(value.trim())) return false;
+  return fallback;
 }
 
 /**
@@ -127,12 +136,13 @@ export function loadConfig(
 ): MaintainerConfig {
   const localData = environment.LOCALAPPDATA?.trim()
     || resolve(homedir(), ".local", "share");
+  const baseUrl = normalizeBaseUrl(
+    environment.MAINTAINER_BASE_URL?.trim()
+    || "https://api.deepseek.com/v1",
+  );
   return {
     apiKey: environment.MAINTAINER_API_KEY?.trim() || null,
-    baseUrl: normalizeBaseUrl(
-      environment.MAINTAINER_BASE_URL?.trim()
-      || "https://api.deepseek.com/v1",
-    ),
+    baseUrl,
     model: environment.MAINTAINER_MODEL?.trim() || "deepseek-chat",
     contextWindow: boundedInteger(
       environment.MAINTAINER_CONTEXT_WINDOW,
@@ -145,6 +155,10 @@ export function loadConfig(
       4_096,
       256,
       64_000,
+    ),
+    reasoning: booleanValue(
+      environment.MAINTAINER_REASONING,
+      /deepseek/iu.test(baseUrl),
     ),
     dataDir: resolve(localData, "dungeon-maintainer"),
   };

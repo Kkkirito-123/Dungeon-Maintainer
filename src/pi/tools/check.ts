@@ -13,6 +13,11 @@ import type { TaskStore } from "../../task/store.js";
 import type { TaskRecord } from "../../task/types.js";
 import { runCheck } from "../../workspace/check.js";
 
+function clipCheckTail(value: string): string {
+  const text = value.slice(-4 * 1024);
+  return text.length === value.length ? text : "[检查输出已按 4 KiB 截断]\n" + text;
+}
+
 /** `check` 的固定标识参数。 */
 export const CheckParameters = Type.Object({
   id: Type.Union([
@@ -65,7 +70,7 @@ export function registerCheckTool(
           text: [
             input.id + ": " + result.record.status,
             result.cached ? "[CACHE]" : "[FRESH]",
-            result.tail,
+            clipCheckTail(result.tail),
           ].filter(Boolean).join("\n"),
         }],
         details: {

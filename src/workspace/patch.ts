@@ -13,7 +13,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { appendEvent } from "../logging/events.js";
-import { containsPrivateText } from "../logging/redact.js";
+import { containsCredentialText } from "../logging/redact.js";
 import type { TaskStore } from "../task/store.js";
 import type { TaskRecord } from "../task/types.js";
 import { hashBytes, hashFile, pathExists } from "./git.js";
@@ -22,6 +22,7 @@ import {
   decidePatch,
   resolveProjectPath,
 } from "./policy.js";
+import { assertWritePathAllowed } from "./write-scope.js";
 
 const MAX_FILES = 3;
 const MAX_LINES = 120;
@@ -113,7 +114,7 @@ export async function applyPrecisePatch(
   if (input.edits.length < 1 || input.edits.length > MAX_FILES) {
     throw new Error("patch 每次必须包含 1 到 3 个文件");
   }
-  const rawPaths = input.edits.map((edit) => edit.path);
+  const rawPaths = input.edits.map((edit) => assertWritePathAllowed(task, edit.path));
   if (new Set(rawPaths).size !== rawPaths.length) {
     throw new Error("同一批 patch 不能重复修改同一路径");
   }
@@ -135,9 +136,9 @@ export async function applyPrecisePatch(
     throw new Error("单个 patch 文本不能超过 64 KiB");
   }
   if (input.edits.some((edit) => (
-    containsPrivateText(edit.oldText) || containsPrivateText(edit.newText)
+    containsCredentialText(edit.oldText) || containsCredentialText(edit.newText)
   ))) {
-    throw new Error("patch 不允许 SQL、答案、完整游戏状态或凭据正文");
+    throw new Error("patch 不允许凭据正文");
   }
 
   const staged: Array<{

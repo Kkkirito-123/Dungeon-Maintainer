@@ -15,7 +15,7 @@ import {
 import { TaskStore } from "../src/task/store.js";
 import { createTemporaryGitRepository } from "./testSupport.js";
 
-describe("schema v2 任务状态与审批", () => {
+describe("schema v3 任务状态、迁移与审批", () => {
   it("原子持久化任务、拒绝非法迁移并只消费一次精确审批", async () => {
     const repository = await createTemporaryGitRepository({ "README.md": "test\n" });
     try {
@@ -29,7 +29,10 @@ describe("schema v2 任务状态与审批", () => {
         piSessionDir: join(repository.temporaryRoot, "data", "tasks", "task-state", "pi"),
       });
 
-      assert.equal(task.schemaVersion, 2);
+      assert.equal(task.schemaVersion, 3);
+      assert.equal(task.modelProfileId, "default");
+      assert.equal(task.thinkingLevel, "off");
+      assert.equal(task.writeScope.state, "unapproved");
       assert.ok(!task.objective.includes("abcdefghijklmnop"));
       await store.transition(task, "active");
       await assert.rejects(store.transition(task, "applied"), /非法任务状态迁移/u);
@@ -44,6 +47,47 @@ describe("schema v2 任务状态与审批", () => {
         /不匹配/u,
       );
       assert.equal((await store.read(task.id)).state, "active");
+    } finally {
+      await repository.dispose();
+    }
+  });
+
+  it("schema v2 自动迁移并要求重新确认修改范围", async () => {
+    const repository = await createTemporaryGitRepository({ "README.md": "test\n" });
+    try {
+      const store = new TaskStore(join(repository.temporaryRoot, "data"));
+      const task = await store.create({
+        id: "legacy-v2-task",
+        objective: "恢复旧任务",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: join(repository.temporaryRoot, "worktree"),
+        piSessionDir: join(repository.temporaryRoot, "data", "tasks", "legacy-v2-task", "pi"),
+      });
+      const taskPath = join(store.taskDir(task.id), "task.json");
+      const legacy = JSON.parse(await readFile(taskPath, "utf8")) as Record<string, unknown>;
+      legacy.schemaVersion = 2;
+      delete legacy.modelProfileId;
+      delete legacy.thinkingLevel;
+      delete legacy.writeScope;
+      await writeFile(taskPath, JSON.stringify(legacy, null, 2) + "\n", "utf8");
+
+      const migrated = await store.read(task.id);
+
+      assert.equal(migrated.schemaVersion, 3);
+      assert.equal(migrated.modelProfileId, "default");
+      assert.equal(migrated.thinkingLevel, "off");
+      assert.deepEqual(migrated.writeScope, {
+        state: "unapproved",
+        allowedPaths: [],
+        digest: null,
+        approvedAt: null,
+        closedAt: null,
+      });
+      assert.match(
+        await readFile(join(store.taskDir(task.id), "events.jsonl"), "utf8"),
+        /task\.migrated/u,
+      );
     } finally {
       await repository.dispose();
     }
@@ -133,13 +177,34 @@ describe("低敏日志与可重放语义 Trace", () => {
         expected: "进入战斗",
         actual: "api_key=abcdefghijklmnop",
         evidence: ["右侧页面状态"],
+        assertions: {
+          floor: 2,
+          mode: "explore",
+          minLessons: 5,
+          advancedFromFloor: 1,
+          bossDefeated: true,
+        },
       });
       assert.equal(reproduction.actions.length, 2);
       assert.ok(!reproduction.actual.includes("abcdefghijklmnop"));
-      assert.equal((await readActiveReproduction(store, task))?.id, reproduction.id);
+      assert.deepEqual(
+        (await readActiveReproduction(store, task))?.assertions,
+        reproduction.assertions,
+      );
 
       const index = task.reproductions[0];
       assert.ok(index);
+      const currentRecord = await readFile(index.path, "utf8");
+      await writeFile(
+        index.path,
+        currentRecord.replace('"schemaVersion": 2', '"schemaVersion": 1'),
+        "utf8",
+      );
+      await assert.rejects(
+        readActiveReproduction(store, task),
+        /旧 schema v1 复现缺少结构化断言/u,
+      );
+      await writeFile(index.path, currentRecord, "utf8");
       index.path = join(repository.temporaryRoot, "outside.json");
       await assert.rejects(
         readActiveReproduction(store, task),
@@ -154,5 +219,10 @@ describe("低敏日志与可重放语义 Trace", () => {
     assert.equal(containsPrivateText("SELECT id FROM monsters"), true);
     assert.equal(containsPrivateText("const value = 1;"), false);
     assert.ok(!redactText("token=abcdefghijklmnop").includes("abcdefghijklmnop"));
+    assert.equal(redactText("SELECT id FROM monsters"), "[SQL REDACTED]");
+    assert.equal(
+      redactText("进入 SELECT 战斗后终端不出现，请直接定位并修复。"),
+      "进入 SELECT 战斗后终端不出现，请直接定位并修复。",
+    );
   });
 });

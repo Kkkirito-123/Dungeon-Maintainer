@@ -1,16 +1,31 @@
 /**
  * detached worktree 创建、依赖复用和安全清理。
  *
- * 修改任务始终从目标仓库 baseHead 创建隔离 worktree；目标工作区必须干净且 HEAD
- * 不得漂移。游戏 node_modules 是可再生忽略目录，可以通过 junction 或符号链接复用，
- * 但路径策略永久禁止 Agent 访问。清理前会确认目标正好位于配置的 worktrees 父目录，
- * 防止错误路径导致递归删除用户文件。
+ * 修改任务始终从来源工作树 baseHead 创建隔离 worktree；来源可以包含未提交修改，
+ * 这些修改会被精确复制并暂存在任务 worktree 的 Git index 中，成为只读快照基线。
+ * Agent 后续修改保持未暂存，因此 diff/apply 只包含 Agent 增量，不会把用户原改动重复写回。
+ * 游戏 node_modules 是可再生忽略目录，可以通过 junction 或符号链接复用，但路径策略
+ * 永久禁止 Agent 访问。清理前会确认目标正好位于配置的 worktrees 父目录。
  */
 
-import { lstat, mkdir, rm, symlink } from "node:fs/promises";
+import {
+  copyFile,
+  lstat,
+  mkdir,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { dirname, relative, resolve } from "node:path";
 import type { TaskRecord } from "../task/types.js";
-import { pathExists, readRepo, runGit } from "./git.js";
+import {
+  hashWorktree,
+  pathExists,
+  readRepo,
+  runGit,
+  runGitRaw,
+} from "./git.js";
+import { classifyPath, normalizeProjectPath } from "./policy.js";
 
 async function linkGameDependencies(
   repoRoot: string,
@@ -41,17 +56,115 @@ export async function createTaskWorktree(
   baseHead: string,
   worktreesDir: string,
 ): Promise<string> {
+  return (await createTaskWorktreeSnapshot(
+    taskId,
+    repoRoot,
+    baseHead,
+    worktreesDir,
+  )).root;
+}
+
+/** 创建来源工作树快照后返回的低敏事实。 */
+export interface TaskWorktreeSnapshot {
+  root: string;
+  sourceBranch: string;
+  sourceDirtyFiles: number;
+  sourceSnapshotHash: string;
+}
+
+async function copyUntrackedSnapshot(
+  sourceRoot: string,
+  targetRoot: string,
+): Promise<void> {
+  const raw = await runGitRaw(sourceRoot, [
+    "ls-files",
+    "-z",
+    "--others",
+    "--exclude-standard",
+  ]);
+  for (const rawPath of raw.split("\0").filter(Boolean)) {
+    const path = normalizeProjectPath(rawPath);
+    if (classifyPath(path, "read") === "denied") {
+      // 未跟踪文件没有 Git blob 可以作为安全替代；静默跳过会让右侧展示的并非用户
+      // 当前工作树，所以必须明确阻断这一种无法可信复制的输入。
+      throw new Error("脏工作树包含禁止读取的未跟踪路径，无法建立完整快照");
+    }
+    const source = resolve(sourceRoot, path);
+    const information = await lstat(source);
+    if (information.isSymbolicLink() || !information.isFile()) {
+      throw new Error("脏工作树包含无法安全复制的未跟踪链接或特殊文件");
+    }
+    const target = resolve(targetRoot, path);
+    await mkdir(dirname(target), { recursive: true });
+    await copyFile(source, target);
+  }
+}
+
+/**
+ * 从当前来源工作树建立隔离快照。
+ *
+ * @param taskId 新任务 ID。
+ * @param repoRoot 用户选中的本地 Git 工作树。
+ * @param baseHead 启动检查时记录的 HEAD。
+ * @param worktreesDir 维护器专用 worktree 父目录。
+ * @returns 隔离根目录以及不含文件正文的来源分支、脏文件数和完整快照 Hash。
+ * @throws HEAD 漂移、来源在复制中变化、禁止路径或特殊文件无法安全复制时回收目标并拒绝。
+ */
+export async function createTaskWorktreeSnapshot(
+  taskId: string,
+  repoRoot: string,
+  baseHead: string,
+  worktreesDir: string,
+): Promise<TaskWorktreeSnapshot> {
   const state = await readRepo(repoRoot);
-  if (!state.clean) throw new Error("start 要求目标游戏仓库工作区干净");
   if (state.head !== baseHead) {
     throw new Error("目标仓库 HEAD 已变化，不能创建旧基线任务");
   }
+  const sourceSnapshotHash = await hashWorktree(state.root);
   const target = resolve(worktreesDir, taskId);
   if (await pathExists(target)) throw new Error("任务 worktree 已存在");
   await mkdir(dirname(target), { recursive: true });
-  await runGit(state.root, ["worktree", "add", "--detach", target, baseHead]);
-  await linkGameDependencies(state.root, target);
-  return target;
+  const temporaryPatch = resolve(worktreesDir, "." + taskId + ".source.patch");
+  let created = false;
+  try {
+    await runGit(state.root, ["worktree", "add", "--detach", target, baseHead]);
+    created = true;
+    const trackedPatch = await runGitRaw(state.root, [
+      "diff",
+      "--binary",
+      "--no-ext-diff",
+      "HEAD",
+      "--",
+    ]);
+    if (trackedPatch) {
+      await writeFile(temporaryPatch, trackedPatch, "utf8");
+      await runGit(target, ["apply", "--binary", "--", temporaryPatch]);
+    }
+    await copyUntrackedSnapshot(state.root, target);
+    // 来源未提交内容只进入任务 index 作为基线；后续普通 git diff 因而只看到
+    // Agent 增量，既能渲染用户当前树，又不会在 /apply 时重复用户已有修改。
+    await runGit(target, ["add", "-A", "--"]);
+    if (await hashWorktree(state.root) !== sourceSnapshotHash) {
+      throw new Error("来源工作树在建立快照期间发生变化，请重新 start");
+    }
+    await linkGameDependencies(state.root, target);
+    return {
+      root: target,
+      sourceBranch: state.branch,
+      sourceDirtyFiles: state.status
+        ? state.status.split(/\r?\n/u).filter(Boolean).length
+        : 0,
+      sourceSnapshotHash,
+    };
+  } catch (error) {
+    if (created) {
+      await runGit(state.root, ["worktree", "remove", "--force", target])
+        .catch(() => undefined);
+    }
+    throw error;
+  } finally {
+    await rm(temporaryPatch, { force: true }).catch(() => undefined);
+  }
 }
 
 /**

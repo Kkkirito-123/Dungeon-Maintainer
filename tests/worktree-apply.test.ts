@@ -3,6 +3,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { TaskStore } from "../src/task/store.js";
+import { syncWorktreeChanges } from "../src/workspace/changes.js";
 import {
   applyTaskPatch,
   capturePatch,
@@ -16,6 +17,7 @@ import {
 import { applyPrecisePatch } from "../src/workspace/patch.js";
 import {
   createTaskWorktree,
+  createTaskWorktreeSnapshot,
   removeTaskWorktree,
   verifyTaskWorktree,
 } from "../src/workspace/worktree.js";
@@ -26,6 +28,67 @@ import {
 } from "./testSupport.js";
 
 describe("detached worktree 与显式 apply", () => {
+  it("Pi 原生编辑会登记真实 worktree 增量并使旧验证失效", async () => {
+    const path = "game/src/presentation/native-edit.ts";
+    const repository = await createTemporaryGitRepository({
+      [path]: "export const value = 'before';\n",
+    });
+    const dataDir = join(repository.temporaryRoot, "data");
+    const worktreesDir = join(dataDir, "worktrees");
+    let worktreeRoot: string | null = null;
+    try {
+      worktreeRoot = await createTaskWorktree(
+        "task-native-edit",
+        repository.repoRoot,
+        repository.baseHead,
+        worktreesDir,
+      );
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "task-native-edit",
+        objective: "验证 Pi 原生编辑同步",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot,
+        piSessionDir: join(store.taskDir("task-native-edit"), "pi"),
+      });
+      await store.transition(task, "active");
+
+      // 直接写文件模拟 Pi 原生 edit/write；它不经过维护器 patch 工具。
+      await writeFile(join(worktreeRoot, path), "export const value = 'native';\n", "utf8");
+      assert.deepEqual(await syncWorktreeChanges(store, task, "edit"), [path]);
+      assert.deepEqual(task.changedPaths, [path]);
+      assert.equal(
+        await readTestFile(join(repository.repoRoot, path)),
+        "export const value = 'before';\n",
+      );
+
+      task.verification = {
+        worktreeHash: await hashWorktree(worktreeRoot),
+        checkIds: [],
+        reproductionId: null,
+        replayPassed: true,
+        verifiedAt: new Date().toISOString(),
+      };
+      await store.transition(task, "verifying");
+      await store.transition(task, "ready_to_apply");
+      await writeFile(join(worktreeRoot, path), "export const value = 'changed-again';\n", "utf8");
+      await syncWorktreeChanges(store, task, "write");
+      assert.equal(task.state, "active");
+      assert.equal(task.verification, null);
+      assert.deepEqual(task.changedPaths, [path]);
+    } finally {
+      if (worktreeRoot) {
+        await removeTaskWorktree(
+          repository.repoRoot,
+          worktreeRoot,
+          worktreesDir,
+        ).catch(() => undefined);
+      }
+      await repository.dispose();
+    }
+  });
+
   it("验证前所有修改只在 worktree，验证后 apply 到正式工作区但不提交", async () => {
     const path = "game/src/presentation/status.ts";
     const repository = await createTemporaryGitRepository({
@@ -47,10 +110,14 @@ describe("detached worktree 与显式 apply", () => {
         objective: "更新状态展示",
         repoRoot: repository.repoRoot,
         baseHead: repository.baseHead,
+        sourceBranch: "main",
+        sourceDirtyFiles: 0,
+        sourceSnapshotHash: null,
         worktreeRoot,
         piSessionDir: join(store.taskDir("task-apply"), "pi"),
       });
       await store.transition(task, "active");
+      await store.approveWriteScope(task, [path], "scope-task-apply");
       await verifyTaskWorktree(task);
       await applyPrecisePatch({
         task,
@@ -136,11 +203,15 @@ describe("detached worktree 与显式 apply", () => {
         objective: "验证冲突保护",
         repoRoot: repository.repoRoot,
         baseHead: repository.baseHead,
+        sourceBranch: "main",
+        sourceDirtyFiles: 0,
+        sourceSnapshotHash: null,
         worktreeRoot,
         piSessionDir: join(store.taskDir("task-drift"), "pi"),
       });
       await store.transition(task, "active");
       await assert.rejects(applyTaskPatch(task), /尚未完成验证/u);
+      await store.approveWriteScope(task, [path], "scope-task-drift");
 
       await writeFile(join(worktreeRoot, path), "export const status = 'after';\n", "utf8");
       task.changedPaths = [path];
@@ -194,13 +265,26 @@ describe("detached worktree 与显式 apply", () => {
       const taskDir = join(dataDir, "tasks", "task-discard");
       await writeFile(join(worktreeRoot, path), "export const status = 'discarded';\n", "utf8");
       const patchPath = await snapshotWorktreePatch({
-        schemaVersion: 2,
+        schemaVersion: 3,
         id: "task-discard",
+        displayName: "丢弃测试",
         objective: "discard",
         repoRoot: repository.repoRoot,
         baseHead: repository.baseHead,
+        sourceBranch: "main",
+        sourceDirtyFiles: 0,
+        sourceSnapshotHash: null,
         worktreeRoot,
         piSessionDir: join(taskDir, "pi"),
+        modelProfileId: "default",
+        thinkingLevel: "off",
+        writeScope: {
+          state: "unapproved",
+          allowedPaths: [path],
+          digest: null,
+          approvedAt: null,
+          closedAt: null,
+        },
         state: "active",
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -229,6 +313,111 @@ describe("detached worktree 与显式 apply", () => {
       assert.equal(
         await readTestFile(join(repository.repoRoot, path)),
         "export const status = 'before';\n",
+      );
+    } finally {
+      if (worktreeRoot) {
+        await removeTaskWorktree(
+          repository.repoRoot,
+          worktreeRoot,
+          worktreesDir,
+        ).catch(() => undefined);
+      }
+      await repository.dispose();
+    }
+  });
+
+  it("脏来源树成为隔离基线，apply 只写回 Agent 增量", async () => {
+    const existingPath = "game/src/presentation/status.ts";
+    const untrackedPath = "game/src/presentation/local.ts";
+    const repository = await createTemporaryGitRepository({
+      [existingPath]: "export const status = 'committed';\n",
+    });
+    const dataDir = join(repository.temporaryRoot, "data");
+    const worktreesDir = join(dataDir, "worktrees");
+    let worktreeRoot: string | null = null;
+    try {
+      await writeFile(join(repository.repoRoot, existingPath), "export const status = 'local';\n", "utf8");
+      await writeFile(join(repository.repoRoot, untrackedPath), "export const local = true;\n", "utf8");
+      const snapshot = await createTaskWorktreeSnapshot(
+        "task-dirty-source",
+        repository.repoRoot,
+        repository.baseHead,
+        worktreesDir,
+      );
+      worktreeRoot = snapshot.root;
+      assert.equal(snapshot.sourceDirtyFiles, 2);
+      assert.equal(
+        await readTestFile(join(worktreeRoot, existingPath)),
+        "export const status = 'local';\n",
+      );
+      assert.equal(
+        await readTestFile(join(worktreeRoot, untrackedPath)),
+        "export const local = true;\n",
+      );
+      assert.equal(await runTestGit(worktreeRoot, ["diff", "--name-only"]), "");
+
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "task-dirty-source",
+        objective: "在本地修改基础上继续修复",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        sourceBranch: snapshot.sourceBranch,
+        sourceDirtyFiles: snapshot.sourceDirtyFiles,
+        sourceSnapshotHash: snapshot.sourceSnapshotHash,
+        worktreeRoot,
+        piSessionDir: join(store.taskDir("task-dirty-source"), "pi"),
+      });
+      await store.transition(task, "active");
+      await store.approveWriteScope(
+        task,
+        [existingPath, untrackedPath],
+        "scope-task-dirty-source",
+      );
+      await applyPrecisePatch({
+        task,
+        store,
+        confirmCore: async () => {
+          throw new Error("presentation 路径不应请求核心审批");
+        },
+        beforePatch: async () => undefined,
+        afterPatch: async () => undefined,
+      }, { edits: [
+        {
+          path: existingPath,
+          baseHash: await hashFile(worktreeRoot, existingPath),
+          oldText: "export const status = 'local';",
+          newText: "export const status = 'agent';",
+        },
+        {
+          path: untrackedPath,
+          baseHash: await hashFile(worktreeRoot, untrackedPath),
+          oldText: "export const local = true;",
+          newText: "export const local = false;",
+        },
+      ] });
+      const captured = await capturePatch(task, store.taskDir(task.id));
+      assert.deepEqual(captured.paths.sort(), [existingPath, untrackedPath].sort());
+      task.baseHashes = captured.baseHashes;
+      task.patchPath = captured.patchPath;
+      task.reversePatchPath = captured.reversePatchPath;
+      task.verification = {
+        worktreeHash: await hashWorktree(worktreeRoot),
+        checkIds: [],
+        reproductionId: "reproduction-1",
+        replayPassed: true,
+        verifiedAt: new Date().toISOString(),
+      };
+      await store.transition(task, "verifying");
+      await store.transition(task, "ready_to_apply");
+      await applyTaskPatch(task);
+      assert.equal(
+        await readTestFile(join(repository.repoRoot, existingPath)),
+        "export const status = 'agent';\n",
+      );
+      assert.equal(
+        await readTestFile(join(repository.repoRoot, untrackedPath)),
+        "export const local = false;\n",
       );
     } finally {
       if (worktreeRoot) {

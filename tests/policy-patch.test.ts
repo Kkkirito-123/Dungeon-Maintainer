@@ -14,6 +14,7 @@ import {
   normalizeProjectPath,
   resolveProjectPath,
 } from "../src/workspace/policy.js";
+import { validateWriteScopePaths } from "../src/workspace/write-scope.js";
 import {
   createTaskWorktree,
   removeTaskWorktree,
@@ -55,6 +56,27 @@ describe("项目路径和真实路径边界", () => {
       await repository.dispose();
     }
   });
+
+  it("写入范围只接受精确文件，并允许显式声明尚未创建的新文件", async () => {
+    const repository = await createTemporaryGitRepository({
+      "game/src/existing.ts": "export const value = 1;\n",
+    });
+    try {
+      assert.deepEqual(
+        await validateWriteScopePaths(repository.repoRoot, [
+          "game/src/existing.ts",
+          "game/src/new-file.ts",
+        ]),
+        ["game/src/existing.ts", "game/src/new-file.ts"],
+      );
+      await assert.rejects(
+        validateWriteScopePaths(repository.repoRoot, ["game/src"]),
+        /必须指向具体文件，不能是目录/u,
+      );
+    } finally {
+      await repository.dispose();
+    }
+  });
 });
 
 describe("baseHash 精确补丁与一次性核心审批", () => {
@@ -84,6 +106,7 @@ describe("baseHash 精确补丁与一次性核心审批", () => {
       });
       await store.transition(task, "active");
       const path = "game/src/domain/core.ts";
+      await store.approveWriteScope(task, [path], "scope-task-patch");
       const baseHash = await hashFile(worktreeRoot, path);
       let checkpointCalls = 0;
       let replayCalls = 0;
@@ -172,6 +195,10 @@ describe("baseHash 精确补丁与一次性核心审批", () => {
         piSessionDir: join(store.taskDir("task-conflict"), "pi"),
       });
       await store.transition(task, "active");
+      await store.approveWriteScope(task, [
+        "game/src/presentation/view.ts",
+        "game/src/presentation/large.ts",
+      ], "scope-task-conflict");
       let beforePatchCalled = false;
       const context = {
         task,

@@ -1,7 +1,7 @@
 /**
  * 浏览器语义动作的短期环形 Trace。
  *
- * Trace 只保存 look/go/use/query 的动作类型、有限参数、公开结果摘要与序号，不保存
+ * Trace 只保存 look/go/use/input-sql/query 的动作类型、有限参数、公开结果摘要与序号，不保存
  * SQL、鼠标轨迹、渲染帧或完整快照。内存上限固定为 500 条；只有复现流程明确截取
  * 的窗口才会写入 reproductions 目录。
  */
@@ -14,7 +14,7 @@ import { redactText } from "./redact.js";
 export interface SemanticTraceEntry {
   sequence: number;
   at: string;
-  action: "look" | "go" | "use" | "query";
+  action: "look" | "go" | "use" | "input-sql" | "query";
   arguments: Record<string, string | number | boolean | null>;
   ok: boolean;
   summary: string;

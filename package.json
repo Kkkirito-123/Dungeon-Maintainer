@@ -17,7 +17,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint \"src/**/*.ts\" \"tests/**/*.ts\"",
     "test": "pnpm build && node --test \"dist/tests/*.test.js\"",
-    "check": "pnpm lint && pnpm typecheck && pnpm test"
+    "check": "pnpm lint && pnpm typecheck && pnpm test",
+    "benchmark": "pnpm build && node dist/src/benchmark/main.js"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.84.2",
