@@ -1,0 +1,11 @@
+diff --git a/game/src/domain/session/GameSession.ts b/game/src/domain/session/GameSession.ts
+--- a/game/src/domain/session/GameSession.ts
++++ b/game/src/domain/session/GameSession.ts
+@@ -2951,6 +2951,6 @@ export class GameSession {
+     }
+     this.campaign = completion.progress;
+     this.mode = "victory";
+-    this.profile.victories += 1;
++    this.profile.victories += 2;
+     this.profile.bestRunQueries = this.profile.bestRunQueries === null
+       ? this.queryCount

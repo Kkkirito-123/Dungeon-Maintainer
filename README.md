@@ -269,6 +269,10 @@ Shell 只展示低敏摘要，不传输 API Key、完整 Prompt、thinking、SQL
 短复现窗口的检查点恢复与同动作重放；它不依赖隐藏答案。详细指标和真实 Pi 任务分析见
 [docs/BENCHMARK.md](docs/BENCHMARK.md)。
 
+内置回归样本位于 [test-fixtures](test-fixtures/)，分为可物化的 `agent-evals` 仓库 fixture 和
+不启动模型的 `smoke-tasks` 生命周期 fixture；使用方式、目录约束和新增的续跑/终态 token 指标见
+[Benchmark 文档](docs/BENCHMARK.md#内置-fixture)。
+
 发给模型的临时上下文会优先保留最新游戏/源码证据并对完全重复的工具结果去重，单个临时工具结果
 最多约 2.25 KiB，单轮所有临时工具结果最多约 20 KiB；原始 session 和证据文件不改写。底部状态栏分开显示本轮与会话 input/cache/output 及缓存命中率。
 每条自然语言输入发送前还会刷新 Pi 的上下文用量；预计超过状态栏“安全线”时先同步压缩，压缩后

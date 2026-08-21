@@ -23,7 +23,7 @@ pnpm benchmark
 ### 2. 真实游戏桥基准（零模型 token）
 
 ```powershell
-pnpm benchmark -- --repo "C:\Users\14405\Desktop\龙与地下城\select-from-dungeon"
+pnpm benchmark -- --repo "C:\path\to\select-from-dungeon"
 ```
 
 它启动真实 Vite 和无界面 Chromium。控制器只使用 `look/go/use/input_sql/query`，不知道地图坐标或
@@ -43,7 +43,7 @@ pnpm benchmark -- --repo "C:\Users\14405\Desktop\龙与地下城\select-from-dun
 
 ```powershell
 pnpm benchmark -- `
-  --repo "C:\Users\14405\Desktop\龙与地下城\select-from-dungeon" `
+  --repo "C:\path\to\select-from-dungeon" `
   --task-dir "$env:LOCALAPPDATA\dungeon-maintainer\tasks\<task-id>" `
   --out ".\benchmark-results\<task-id>.json"
 ```
@@ -59,6 +59,12 @@ pnpm benchmark -- `
 | 每个自然语言问题的输出 | ≤ 6,000 token |
 | 每个自然语言问题的工具调用 | ≤ 16 |
 | 同参数连续工具调用 | ≤ 2 |
+| 自动续跑创建 / 准入 | ≤ 4 / ≤ 4 |
+| 过期 continuation | 0 |
+| 终态后模型回合 / 工具调用 / token | 0 / 0 / 0 |
+| 重复 finish / 语义重复结果 | 0 / 0 |
+| 到 proposed 前 inspect 次数 | ≤ 10 |
+| 诊断耗时 | ≤ 300,000 ms |
 | 单次最大 prompt | ≤ context window 的 75% |
 | 额外自然语言追问 | 0 |
 | 修复方案确认 | ≤ 1 次 |
@@ -67,6 +73,75 @@ pnpm benchmark -- `
 对于产生代码修改的任务，`autonomous_closure_recorded` 还要求：保存复现、至少一个检查通过、
 至少一次右侧刷新回放通过，并由 Agent 写下最终结论。分析器只看结构化元数据，不读取或输出
 对话和工具正文。
+
+## 内置 fixture
+
+仓库已经把可复现的最小样本放在 `test-fixtures/`，布局与 Sigma 的测试目录类似：
+
+```text
+test-fixtures/
+├─ agent-evals/       # 可物化的仓库基线 + source.patch
+└─ smoke-tasks/       # 已脱敏的 task/events/Pi JSONL 回归样本
+```
+
+`agent-evals/_bases/game-repair-v1/` 保存一份 467 文件共享正常基线；
+`agent-evals/terminal-action-bug/` 只保存一行 Bug Patch，并在 `fixture.json` 中记录共享基线 ID、
+唯一脏路径和补丁 SHA-256。这样既能复现真实 Git 修复语义，又不会为每道题复制整个游戏，
+也不会把个人绝对路径、`.git` 目录或外部 `node_modules` Junction 带进仓库。需要物化时由
+fixture materializer 创建新的临时目标目录并应用补丁，例如：
+
+```ts
+import { materializeAgentEvalFixture } from "./src/benchmark/agent-eval-fixture.js";
+
+await materializeAgentEvalFixture({
+  id: "terminal-action-bug",
+  destination: "C:/temp/dungeon-terminal-action-bug",
+});
+```
+
+物化目录必须不存在；函数会重新建立固定 Git 基线并核对预期 dirty paths，失败时清理本次创建的
+目标。`smoke-tasks/stale-follow-up-after-result/` 不启动模型或游戏，专门回归“终态后旧续跑”、
+重复 `finish(proposed)`、终态后的工具调用和 token 浪费。
+
+### 游戏修复 Agent Eval
+
+每个游戏案例都先运行零 Token 预检，确认 Bug Patch 能物化、真实 Chromium 能复现初始故障、
+隐藏 Oracle 能命中。预检失败属于基础设施错误，不能计入 Agent 失败率：
+
+```powershell
+pnpm benchmark -- preflight `
+  --fixture terminal-action-bug `
+  --dependency-repo "C:\path\to\select-from-dungeon"
+```
+
+预检通过后再运行一次隔离的原版 Pi。Agent 只收到 `case.json` 的公开任务，不会收到
+`expected.json` 的隐藏 SQL、答案或 Oracle：
+
+```powershell
+pnpm benchmark -- game-repair `
+  --profile pi-original `
+  --fixture terminal-action-bug `
+  --dependency-repo "C:\path\to\select-from-dungeon" `
+  --repetition 1 `
+  --timeout-ms 600000
+```
+
+当前矩阵包含 12 个可实机复现案例：
+
+| 类别 | 案例 |
+|---|---|
+| 战斗与 SQL 状态 | `terminal-action-bug`、`admin-answer-hint-rejected`、`accepted-query-without-progress`、`final-stage-boss-stuck-at-one-hp`、`boss-hp-reset-after-death` |
+| 奖励与地图门禁 | `lesson-complete-reward-missing`、`dead-area-boss-still-blocks-portal` |
+| 传送、死亡与持久化 | `admin-floor-transition-deadlock`、`transition-lost-after-reload` |
+| 高级 SQL 与终局 | `transaction-sandbox-state-leak`、`stale-query-plan-evidence`、`duplicate-final-victory-commit` |
+
+正式比较矩阵是 `12 案例 × 原版/优化版 × 3 次 = 72 次`。先用固定的 5 案例 smoke
+验证方向，确认成功率、诊断时间、工具调用和 Token 有收益后再运行正式矩阵。Token 与工具均值
+只统计成功运行；基础设施失败单独报告，不能稀释 Agent 失败率。
+
+真实任务报告还会输出自动续跑创建/准入/过期丢弃、终态后模型回合/工具调用/token、重复完成提交、
+语义重复结果、到方案前 inspect 次数和诊断耗时。这些指标直接对应任务编排、证据去重和诊断效率，
+不需要把提示词或工具正文写进报告。
 
 ## 推荐固定用例
 

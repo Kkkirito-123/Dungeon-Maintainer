@@ -469,7 +469,7 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
       assert.equal(secondNativeResult.isError, undefined);
       assert.deepEqual([...task.changedPaths].sort(), ["first.txt", "second.txt"]);
       assert.equal(refreshNotifications.length, 1);
-      assert.equal(pi.sentMessages.length, 1);
+      assert.equal(pi.sentMessages.length, 0);
 
       const checkGate = await toolCallHook({
         type: "tool_call",
@@ -514,6 +514,15 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
         "verify",
       ]);
       assert.deepEqual(pi.activeTools, [...FULL_CODING_TOOLS]);
+      await requireHook(pi, "agent_end")(
+        { type: "agent_end", messages: [] },
+        {
+          getContextUsage: () => ({ percent: 20 }),
+          ui: { notify: () => undefined },
+        },
+      );
+      assert.equal(task.state, "ready_to_apply");
+      assert.equal(pi.sentMessages.length, 0);
 
       const deniedProposal = await finishTool.execute(
         "call-denied",
@@ -543,7 +552,7 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
           notify: (message: string) => budgetNotifications.push(message),
         },
       };
-      agentStartHook({});
+      await agentStartHook({});
       for (let index = 0; index < 3; index += 1) {
         assert.equal(await toolCallHook({
           toolName: "inspect",
@@ -567,7 +576,7 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
         source: "rpc",
         text: "新的状态问题",
       });
-      agentStartHook({});
+      await agentStartHook({});
       for (let index = 0; index < 6; index += 1) {
         assert.equal(await toolCallHook({
           toolName: "use",
@@ -580,22 +589,37 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
         source: "rpc",
         text: "请重新定位并修复右侧游戏动作失败的问题。",
       });
-      agentStartHook({});
-      assert.equal(await toolCallHook({ toolName: "inspect", input: { action: "status" } }, budgetContext), undefined);
-      assert.equal(await toolCallHook({ toolName: "inspect", input: { action: "status" } }, budgetContext), undefined);
+      await agentStartHook({});
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        assert.equal(await toolCallHook({
+          toolCallId: "repeated-inspect-" + String(attempt),
+          toolName: "inspect",
+          input: { action: "status" },
+        }, budgetContext), undefined);
+        await toolResultHook({
+          type: "tool_result",
+          toolCallId: "repeated-inspect-" + String(attempt),
+          toolName: "inspect",
+          input: { action: "status" },
+          content: [{ type: "text", text: "same-status" }],
+          details: { status: "same" },
+          isError: false,
+        }, budgetContext);
+      }
       const repeatedInspect = await toolCallHook({
+        toolCallId: "repeated-inspect-third",
         toolName: "inspect",
         input: { action: "status" },
       }, budgetContext) as { block?: boolean; terminate?: boolean };
       assert.equal(repeatedInspect.block, true);
-      assert.equal(repeatedInspect.terminate, false);
-      assert.match(budgetNotifications.at(-1) ?? "", /相同参数/u);
+      assert.equal(repeatedInspect.terminate, true);
+      assert.match(budgetNotifications.at(-1) ?? "", /相同工具动作/u);
 
       await requireHook(pi, "input")({
         source: "rpc",
         text: "请定位并修复右侧游戏动作失败的问题。",
       });
-      agentStartHook({});
+      await agentStartHook({});
       for (let attempt = 0; attempt < 2; attempt += 1) {
         assert.equal(await toolCallHook({
           type: "tool_call",
@@ -722,7 +746,7 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
       };
 
       await inputHook({ source: "rpc", text: "当前状态是什么？" });
-      agentEndHook({ type: "agent_end", messages: [] }, agentEndContext);
+      await agentEndHook({ type: "agent_end", messages: [] }, agentEndContext);
       assert.equal(pi.sentMessages.length, 0);
 
       const selectCombatRepair = "第一层进入 SELECT 战斗后终端不出现，请直接定位并修复。";
@@ -888,9 +912,9 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
       });
 
       for (let index = 0; index < 5; index += 1) {
-        agentEndHook({ type: "agent_end", messages: [] }, agentEndContext);
+        await agentEndHook({ type: "agent_end", messages: [] }, agentEndContext);
       }
-      assert.equal(pi.sentMessages.length, 4);
+      assert.equal(pi.sentMessages.length, 1);
       for (const entry of pi.sentMessages) {
         assert.deepEqual(entry.options, {
           triggerTurn: true,
@@ -903,18 +927,18 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
         source: "rpc",
         text: "请继续修复默认 SQL 错误。",
       });
-      agentEndHook(
+      await agentEndHook(
         { type: "agent_end", messages: [] },
         {
           ...agentEndContext,
           getContextUsage: () => ({ percent: 85 }),
         },
       );
-      assert.equal(pi.sentMessages.length, 4);
+      assert.equal(pi.sentMessages.length, 1);
       assert.match(continuationNotifications.at(-1) ?? "", /上下文已接近上限/u);
 
       const agentStartHook = requireHook(pi, "agent_start");
-      agentStartHook({ type: "agent_start" });
+      await agentStartHook({ type: "agent_start" });
       for (let index = 0; index < 8; index += 1) {
         assert.equal(await toolCallHook({
           type: "tool_call",
@@ -927,7 +951,7 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
         }, agentEndContext), undefined);
       }
       // follow-up 不会重置累计总预算；换用另一工具族仍可继续到总上限。
-      agentStartHook({ type: "agent_start" });
+      await agentStartHook({ type: "agent_start" });
       for (let index = 0; index < 8; index += 1) {
         assert.equal(await toolCallHook({
           type: "tool_call",
@@ -936,7 +960,7 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
           input: { actionId: "budget-game-" + String(index) },
         }, agentEndContext), undefined);
       }
-      agentStartHook({ type: "agent_start" });
+      await agentStartHook({ type: "agent_start" });
       const cumulativeBudget = await toolCallHook({
         type: "tool_call",
         toolCallId: "repair-budget-overflow",
@@ -946,13 +970,13 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
       assert.equal(cumulativeBudget.block, true);
       assert.equal(cumulativeBudget.terminate, false);
       assert.match(cumulativeBudget.reason ?? "", /达到工具预算上限/u);
-      agentEndHook({ type: "agent_end", messages: [] }, agentEndContext);
-      assert.equal(pi.sentMessages.length, 5);
+      await agentEndHook({ type: "agent_end", messages: [] }, agentEndContext);
+      assert.equal(pi.sentMessages.length, 2);
 
       const repairObjective = task.objective;
       await inputHook({ source: "rpc", text: "现在状态如何？" });
-      agentEndHook({ type: "agent_end", messages: [] }, agentEndContext);
-      assert.equal(pi.sentMessages.length, 5);
+      await agentEndHook({ type: "agent_end", messages: [] }, agentEndContext);
+      assert.equal(pi.sentMessages.length, 2);
       assert.equal(task.objective, repairObjective);
     } finally {
       await repository.dispose();
@@ -1093,7 +1117,7 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
         },
       }, hookContext), undefined);
 
-      agentEndHook({ type: "agent_end", messages: [] }, hookContext);
+      await agentEndHook({ type: "agent_end", messages: [] }, hookContext);
       assert.match(
         JSON.stringify(pi.sentMessages.at(-1)?.message),
         /terminal 的动作映射字面量.*真实 DOM 按钮定义/u,

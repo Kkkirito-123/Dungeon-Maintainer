@@ -1,0 +1,14 @@
+.DS_Store
+.idea/
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+*.egg-info/
+node_modules/
+dist/
+coverage/
+.vite/
+output/playwright/
+.playwright-cli/

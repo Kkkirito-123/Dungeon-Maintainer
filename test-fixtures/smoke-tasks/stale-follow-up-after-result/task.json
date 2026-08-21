@@ -1,0 +1,17 @@
+{
+  "changedPaths": [
+    "game/src/example.ts"
+  ],
+  "checks": [
+    {
+      "status": "passed"
+    }
+  ],
+  "reproductions": [
+    {
+      "id": "synthetic-reproduction"
+    }
+  ],
+  "conclusion": "合成任务已完成验证",
+  "state": "ready_to_apply"
+}

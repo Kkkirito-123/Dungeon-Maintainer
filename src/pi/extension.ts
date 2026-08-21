@@ -5,15 +5,23 @@
  * 到 Pi。会话安全策略由 `session-policy.ts` 负责，Vite/Chromium 生命周期由
  * `game-runtime.ts` 负责，补丁、检查、复现和 apply 仍属于各自 workspace/repair 模块。
  *
+ * 输入是父进程已经校验并固定绑定的 TaskRecord、TaskStore、配置和可选测试运行时；输出是
+ * 注册到 Pi 的十个领域工具、五个命令、系统提示和事件钩子，不返回可跨任务复用的运行时对象。
+ * 自动续跑由 ContinuationController 绑定请求/进展 revision，工具循环由 LoopGuard 使用低敏
+ * 摘要阻断；两者都不替代 TaskStore 的权威状态，也不持久化 Prompt、源码、SQL 或工具正文。
+ *
  * 一个 Extension 实例始终绑定一个 taskId、一个 detached worktree、一个 Pi session 和
  * 一个游戏运行时。关闭时只停止浏览器与 Vite；未完成任务、日志和 worktree 继续保留供
- * `resume` 使用。API Key 只通过 Provider 的环境变量引用传递，不写入任务或事件文件。
+ * `resume` 使用。所有写入仍受 detached worktree、realpath、一次性方案授权和刷新重放门禁；
+ * API Key 只通过 Provider 的环境变量引用传递，不写入任务或事件文件。权威任务读取失败、
+ * 旧 requestRevision、终态任务或刷新恢复失败都会停止自动续跑，由用户输入或 resume 恢复。
  */
 
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type {
   ExtensionAPI,
   ExtensionContext,
+  ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
 import { loadConfig, requireApiKey, type MaintainerConfig } from "../config.js";
 import type { GameDriver } from "../game/driver.js";
@@ -29,6 +37,7 @@ import { TaskStore } from "../task/store.js";
 import {
   INITIAL_TASK_OBJECTIVE,
   type TaskRecord,
+  type TaskState,
 } from "../task/types.js";
 import {
   defaultModelProfile,
@@ -48,6 +57,17 @@ import {
 } from "./session-policy.js";
 import { registerMaintainerTools } from "./tools/index.js";
 import { shapeModelContext } from "./context-shaping.js";
+import {
+  ContinuationController,
+  type ContinuationKind,
+  type ContinuationPhase,
+  type ContinuationTicket,
+} from "./continuation-controller.js";
+import {
+  LoopGuard,
+  type LoopAction,
+  type LoopGuardDecision,
+} from "./loop-guard.js";
 import { syncWorktreeChanges } from "../workspace/changes.js";
 import { hashWorktree } from "../workspace/git.js";
 import { resolveProjectPath } from "../workspace/policy.js";
@@ -68,6 +88,14 @@ const DIAGNOSTIC_EVIDENCE_TOOLS = new Set([
   ...SOURCE_EVIDENCE_TOOLS,
   "look",
   ...GAME_FAILURE_EVIDENCE_TOOLS,
+]);
+const CONTINUATION_STOP_STATES = new Set<TaskState>([
+  "awaiting_approval",
+  "verifying",
+  "ready_to_apply",
+  "applied",
+  "blocked",
+  "discarded",
 ]);
 
 type FinishStatus =
@@ -129,6 +157,51 @@ function finishStatus(value: unknown): FinishStatus | null {
 
 function toolSignature(toolName: string, input: unknown): string {
   return toolName + ":" + JSON.stringify(input);
+}
+
+/**
+ * 把一次工具调用投影成循环门禁使用的稳定动作与较粗路线。
+ *
+ * @param toolName Pi 固定工具名。
+ * @param input 已由工具 schema 校验的调用参数；正文只在本进程内生成摘要，不会写入日志。
+ * @returns 完整动作用于精确重复判断，路线用于识别无进展的 A-B-A-B 切换。
+ * @remarks 本函数不执行工具、不读取文件，也不改变诊断或写入权限。
+ */
+function loopAction(toolName: string, input: Record<string, unknown>): LoopAction {
+  const route = toolName === "inspect"
+    ? { action: input.action }
+    : toolName === "finish"
+      ? { status: input.status }
+      : NATIVE_WRITE_TOOLS.has(toolName)
+        ? { path: input.path }
+        : toolName === "patch"
+          ? { path: input.path }
+          : GAME_FAILURE_EVIDENCE_TOOLS.has(toolName)
+            ? {
+                actionId: input.actionId,
+                target: input.target,
+                toolName,
+              }
+            : { toolName };
+  return { toolName, input, route };
+}
+
+/**
+ * 生成循环门禁的中文阻断说明。
+ *
+ * @param decision 非 allow 的确定性门禁决策。
+ * @returns 不含源码、SQL 或模型正文的短说明，可安全显示给用户和模型。
+ */
+function loopGuardNotice(decision: Exclude<LoopGuardDecision, { kind: "allow" }>): string {
+  if (decision.kind === "hard_stop") {
+    return "连续 8 次工具结果没有产生新证据，自动诊断已硬停止；请检查现有证据或由用户调整任务方向。";
+  }
+  if (decision.kind === "strategy_reset") {
+    return "连续 5 次工具结果没有产生新证据，当前路线已停止；下一回合必须更换诊断策略，不能继续扩散搜索。";
+  }
+  return decision.reason === "alternating_route"
+    ? "检测到无进展的 A-B-A-B 工具路线，当前路线已停止；必须基于证据缺口更换策略。"
+    : "相同工具动作已经得到两次相同结果，第三次执行已阻止；必须使用已有证据或更换策略。";
 }
 
 /** Extension 安装所需的已验证任务事实。 */
@@ -252,14 +325,20 @@ export function installDungeonMaintainerExtension(
   let executionApproved = false;
   let latestNaturalRequest = "";
   let repairRequested = false;
-  let repairFollowUps = 0;
   let repairToolCalls = 0;
   let repairStopped = false;
   let budgetStopRequested = false;
   let budgetStopAttempts = 0;
-  let budgetFollowUpSent = false;
-  let budgetFollowUpPending = false;
   let approvedProposalInRun = false;
+  let refreshRecoveryMessage: string | null = null;
+  let strategyResetRequested: string | null = null;
+  let currentRunContinuation: ContinuationTicket | null = null;
+  const continuationController = new ContinuationController(
+    task.id,
+    MAX_REPAIR_FOLLOW_UPS,
+  );
+  const loopGuard = new LoopGuard();
+  const pendingLoopActions = new Map<string, LoopAction>();
   const repairEvidenceTools = new Set<string>();
   const repairSourceEvidenceActions = new Set<"read" | "search">();
   let repairSourceReadCount = 0;
@@ -371,18 +450,23 @@ export function installDungeonMaintainerExtension(
     }
   };
 
-  const beginNaturalRequest = (text: string, continuation = false): void => {
+  const beginNaturalRequest = (
+    text: string,
+    continuation = false,
+  ): ContinuationTicket[] => {
     latestNaturalRequest = normalizedRequest(text);
     repairRequested = continuation || requiresRepair(latestNaturalRequest);
-    repairFollowUps = 0;
     repairToolCalls = 0;
     repairStopped = false;
     budgetStopRequested = false;
     budgetStopAttempts = 0;
-    budgetFollowUpSent = false;
-    budgetFollowUpPending = false;
     approvedProposalInRun = false;
+    refreshRecoveryMessage = null;
+    strategyResetRequested = null;
+    pendingLoopActions.clear();
+    const staleContinuations = continuationController.beginRequest(continuation);
     if (!continuation) {
+      loopGuard.resetForNewTask();
       repairEvidenceTools.clear();
       repairSourceEvidenceActions.clear();
       repairSourceReadCount = 0;
@@ -410,6 +494,98 @@ export function installDungeonMaintainerExtension(
     ) {
       successfulFinishStatuses.add("reproduced");
     }
+    return staleContinuations;
+  };
+
+  const recordContinuation = async (ticket: ContinuationTicket): Promise<void> => {
+    await appendEvent(store, task.id, "continuation." + ticket.status, {
+      continuationId: ticket.id,
+      kind: ticket.kind,
+      requestRevision: ticket.requestRevision,
+      progressRevision: ticket.progressRevision,
+      phase: ticket.phase,
+      nextAction: ticket.nextAction,
+      attempt: ticket.attempt,
+      reason: ticket.reason,
+    });
+  };
+
+  const recordContinuations = async (
+    tickets: readonly ContinuationTicket[],
+  ): Promise<void> => {
+    for (const ticket of tickets) await recordContinuation(ticket);
+  };
+
+  const advanceProgress = async (reason: string): Promise<void> => {
+    await recordContinuations(continuationController.advanceProgress(reason));
+  };
+
+  const markObjectiveProgress = async (
+    reason: string,
+    loopGuardAlreadyAdvanced: boolean,
+  ): Promise<void> => {
+    if (!loopGuardAlreadyAdvanced) loopGuard.noteProgress();
+    await advanceProgress(reason);
+  };
+
+  const currentContinuationPhase = (): ContinuationPhase => {
+    if (executionApproved || approvedProposalInRun) return "execute";
+    if (
+      successfulFinishStatuses.has("reproduced")
+      && hasSufficientSourceEvidence()
+    ) return "propose";
+    if (successfulFinishStatuses.has("reproduced")) return "diagnose";
+    return "reproduce";
+  };
+
+  const queueContinuation = async (input: {
+    kind: ContinuationKind;
+    phase: ContinuationPhase;
+    nextAction: string;
+    customType: string;
+    content: string;
+  }): Promise<boolean> => {
+    const reservation = continuationController.reserve({
+      kind: input.kind,
+      phase: input.phase,
+      nextAction: input.nextAction,
+    });
+    if (!reservation.ticket) return false;
+    try {
+      await recordContinuation(reservation.ticket);
+    } catch (error) {
+      await recordContinuations(continuationController.invalidate(
+        "cancelled",
+        "event-write-failed",
+      )).catch(() => undefined);
+      throw error;
+    }
+    try {
+      pi.sendMessage({
+        customType: input.customType,
+        content: input.content,
+        display: false,
+        details: {
+          continuationId: reservation.ticket.id,
+          kind: reservation.ticket.kind,
+          requestRevision: reservation.ticket.requestRevision,
+          progressRevision: reservation.ticket.progressRevision,
+          phase: reservation.ticket.phase,
+          nextAction: reservation.ticket.nextAction,
+          attempt: reservation.ticket.attempt,
+        },
+      }, {
+        triggerTurn: true,
+        deliverAs: "followUp",
+      });
+    } catch (error) {
+      await recordContinuations(continuationController.invalidate(
+        "cancelled",
+        "pi-send-failed",
+      )).catch(() => undefined);
+      throw error;
+    }
+    return true;
   };
 
   const setExecutionApproved = (approved: boolean): void => {
@@ -446,8 +622,6 @@ export function installDungeonMaintainerExtension(
   });
 
   let turnToolCalls = 0;
-  let lastToolSignature = "";
-  let repeatedToolCalls = 0;
   let nativeWriteBatch: NativeWriteBatch | null = null;
   let lastRefreshFailure: string | null = null;
 
@@ -456,11 +630,46 @@ export function installDungeonMaintainerExtension(
     outcome: NativeRefreshOutcome,
   ): void => {
     context.ui.notify(outcome.text, outcome.passed ? "info" : "error");
-    pi.sendMessage({
-      customType: "dungeon-refresh",
-      content: outcome.text,
-      display: false,
-    }, { deliverAs: "steer" });
+  };
+
+  const scalarToolDetails = (details: unknown): Record<string, unknown> => {
+    if (!details || typeof details !== "object" || Array.isArray(details)) return {};
+    return Object.fromEntries(Object.entries(details).filter(([, value]) => (
+      value === null
+      || typeof value === "string"
+      || typeof value === "number"
+      || typeof value === "boolean"
+      || (
+        Array.isArray(value)
+        && value.every((item) => (
+          item === null
+          || typeof item === "string"
+          || typeof item === "number"
+          || typeof item === "boolean"
+        ))
+      )
+    )));
+  };
+
+  const recordLoopToolResult = (event: ToolResultEvent): boolean => {
+    const action = pendingLoopActions.get(event.toolCallId)
+      ?? loopAction(event.toolName, event.input);
+    pendingLoopActions.delete(event.toolCallId);
+    const text = inspectEvidenceText(event.content);
+    const details = scalarToolDetails(event.details);
+    const result = {
+      details,
+      isError: event.isError,
+      text,
+    };
+    const hasEvidence = text.length > 0 || Object.keys(details).length > 0;
+    return loopGuard.recordOutcome({
+      action,
+      result,
+      // “尝试了另一组参数”不是客观进展；只有结果本身出现新的领域事实才推进
+      // revision，否则模型可用不断改 query/path 的方式规避 A-B-A-B 和无进展门禁。
+      evidence: hasEvidence ? [{ toolName: event.toolName, result }] : [],
+    });
   };
 
   const flushNativeWriteBatch = async (): Promise<NativeRefreshOutcome | null> => {
@@ -534,61 +743,105 @@ export function installDungeonMaintainerExtension(
 
   // 工具预算在 Extension 层阻断，避免模型因为一次错误判断不断重复 inspect 或游戏动作；
   // 这不是提示词建议，而是运行时硬限制，因此不会因模型输出变长而失效。
-  pi.on("agent_start", () => {
+  pi.on("agent_start", async () => {
     turnToolCalls = 0;
-    lastToolSignature = "";
-    repeatedToolCalls = 0;
-    // 独立的新回合重新获得本轮预算；预算收尾 follow-up 则保留门禁，
-    // 防止模型在被要求总结后再次开始扩散搜索。
-    if (!budgetFollowUpPending) {
+    const admitted = continuationController.admitQueued();
+    currentRunContinuation = admitted;
+    if (admitted) await recordContinuation(admitted);
+    // 独立用户回合和普通 repair continuation 重新获得单回合预算；预算收尾
+    // continuation 保留门禁，只允许 finish，防止“总结”回合再次开始扩散搜索。
+    if (admitted?.kind !== "budget") {
       budgetStopRequested = false;
       budgetStopAttempts = 0;
     }
-    budgetFollowUpPending = false;
+    strategyResetRequested = null;
   });
   pi.on("agent_settled", () => {
     // 方案授权只覆盖当前完整 Agent 运行；即使模型忘记提交 result，下一条用户消息也
     // 必须重新经过“病因 + 总方案 + 确认”，不能继承上一轮的 write/edit 权限。
     setExecutionApproved(hasActiveWriteScope(task));
-    // 自动收尾回合已经结束；下一条明确用户消息或独立回合可以重新获得预算，
-    // 但同一收尾回合内仍由 budgetFollowUpSent 保持工具门禁。
-    if (budgetFollowUpSent) {
-      budgetStopRequested = false;
-      budgetStopAttempts = 0;
-      budgetFollowUpSent = false;
-      budgetFollowUpPending = false;
-    }
+    budgetStopRequested = false;
+    budgetStopAttempts = 0;
+    currentRunContinuation = null;
   });
-  pi.on("agent_end", (_event, context) => {
-    if (
-      budgetStopRequested
-      && !budgetFollowUpSent
-      && !context.hasPendingMessages()
-    ) {
-      budgetFollowUpSent = true;
-      budgetFollowUpPending = true;
-      pi.sendMessage({
+  pi.on("agent_end", async (_event, context) => {
+    const runWasCurrent = continuationController.activeRunIsCurrent();
+    const completed = continuationController.completeActive();
+    currentRunContinuation = null;
+    if (completed) await recordContinuation(completed);
+    // 新用户输入可能在旧回合仍流式执行时到达。旧回合可以完成收尾，但不能替新
+    // requestRevision 生成自动消息，否则普通 Pi 消息队列又会被误当成任务队列。
+    if (!runWasCurrent) return;
+
+    let authoritativeTask: TaskRecord;
+    try {
+      authoritativeTask = await store.read(task.id);
+    } catch (error) {
+      await recordContinuations(continuationController.invalidate(
+        "cancelled",
+        "task-read-failed",
+      )).catch(() => undefined);
+      context.ui.notify(
+        "无法重新读取权威任务状态，已停止自动续跑：" + safeRefreshFailure(error),
+        "error",
+      );
+      return;
+    }
+    if (CONTINUATION_STOP_STATES.has(authoritativeTask.state)) {
+      await recordContinuations(continuationController.invalidate(
+        "cancelled",
+        "task-state-" + authoritativeTask.state,
+      ));
+      return;
+    }
+
+    if (refreshRecoveryMessage) {
+      const content = refreshRecoveryMessage;
+      refreshRecoveryMessage = null;
+      await queueContinuation({
+        kind: "refresh-recovery",
+        phase: executionApproved ? "execute" : currentContinuationPhase(),
+        nextAction: "consume-refresh-outcome",
+        customType: "dungeon-refresh-recovery",
+        content: content
+          + " 这是异常路径补发的唯一刷新结果；请据此继续当前步骤，不要重新执行已经完成的写入。",
+      });
+      return;
+    }
+
+    if (budgetStopRequested) {
+      await queueContinuation({
+        kind: "budget",
+        phase: currentContinuationPhase(),
+        nextAction: repairRequested
+          ? "finish-proposed-or-blocked"
+          : "answer-without-tools",
         customType: "dungeon-budget-follow-up",
         content: repairRequested
           ? "工具预算已达到本轮上限。禁止继续搜索；请立即根据已有证据调用 finish(status=proposed)，若证据确实不足则调用 finish(status=blocked)，不要再调用 inspect/look。"
           : "只读工具预算已达到本轮上限。禁止继续搜索；请根据已有证据直接用简短中文回答用户，不要再调用工具。",
-        display: false,
-        details: { repairRequested },
-      }, {
-        triggerTurn: true,
-        deliverAs: "followUp",
       });
       return;
     }
+
+    if (strategyResetRequested) {
+      const nextAction = strategyResetRequested;
+      strategyResetRequested = null;
+      if (repairRequested && !repairStopped) {
+        await queueContinuation({
+          kind: "repair",
+          phase: currentContinuationPhase(),
+          nextAction,
+          customType: "dungeon-strategy-reset",
+          content: "当前诊断路线已被循环门禁停止。只允许选择一个由现有证据支持、但尚未验证的不同假设；禁止重复刚才的工具或 A-B-A-B 路线。若没有新的可验证假设，立即调用 finish(status=proposed) 或 finish(status=blocked)。",
+        });
+      }
+      return;
+    }
+
     if (
       !repairRequested
       || repairStopped
-      || task.state === "ready_to_apply"
-      || task.state === "applied"
-      || task.state === "blocked"
-      || task.state === "discarded"
-      || repairFollowUps >= MAX_REPAIR_FOLLOW_UPS
-      || context.hasPendingMessages()
     ) return;
     const usage = context.getContextUsage();
     if (usage?.percent !== null && usage?.percent !== undefined && usage.percent >= 80) {
@@ -604,30 +857,47 @@ export function installDungeonMaintainerExtension(
     const hasGameEvidence = [...repairEvidenceTools].some(
       (toolName) => GAME_FAILURE_EVIDENCE_TOOLS.has(toolName),
     );
-    const instruction = approvedProposalInRun || executionApproved
-      ? "修复任务尚未完成。方案已经批准；不要总结或询问用户，立即完成剩余代码修改，并调用 finish(status=result) 运行固定验证。"
+    const continuation = approvedProposalInRun || executionApproved
+      ? {
+          nextAction: "complete-approved-plan",
+          content: "修复任务尚未完成。方案已经批准；不要总结或询问用户，立即完成剩余代码修改，并调用 finish(status=result) 运行固定验证。",
+        }
       : hasReproduction && sourceEvidenceReady
-        ? "修复任务尚未完成。复现和源码证据已经足够形成明确病因；下一步必须立即调用 finish(status=proposed) 一次提交完整修复步骤、验证方法、风险和 allowedPaths。不要再调用 inspect、look 或其他诊断工具，也不要用普通回复结束。"
+        ? {
+            nextAction: "finish-proposed",
+            content: "修复任务尚未完成。复现和源码证据已经足够形成明确病因；下一步必须立即调用 finish(status=proposed) 一次提交完整修复步骤、验证方法、风险和 allowedPaths。不要再调用 inspect、look 或其他诊断工具，也不要用普通回复结束。",
+          }
         : hasReproduction
-          ? "修复任务尚未完成。复现已经保存；"
-            + (actionNotAvailableFailure
-              ? actionEvidenceInstruction()
-              : "现在继续用 inspect(read) 读取候选源码并交叉确认明确病因。")
-            + " 证据齐全后调用 finish(status=proposed)，不要反问用户是否继续。"
+          ? {
+              nextAction: actionNotAvailableFailure
+                ? "inspect-action-evidence"
+                : "inspect-source",
+              content: "修复任务尚未完成。复现已经保存；"
+                + (actionNotAvailableFailure
+                  ? actionEvidenceInstruction()
+                  : "现在继续用 inspect(read) 读取候选源码并交叉确认明确病因。")
+                + " 证据齐全后调用 finish(status=proposed)，不要反问用户是否继续。",
+            }
           : hasGameEvidence
-            ? "修复任务尚未完成。已经取得右侧游戏故障证据；先调用 finish(status=reproduced) 保存可重放复现，再继续定位源码，不要只解释现象。"
+            ? {
+                nextAction: "save-reproduction",
+                content: "修复任务尚未完成。已经取得右侧游戏故障证据；先调用 finish(status=reproduced) 保存可重放复现，再继续定位源码，不要只解释现象。",
+              }
             : hasSourceEvidence
-              ? "修复任务尚未完成。已有诊断证据；继续定位并形成可执行总方案。若属于运行时故障，先用右侧语义动作复现并保存 reproduced；不要用普通回复结束。"
-              : "用户要求的是解决问题，不是快速答复。直接读取系统提示中的右侧玩家可见状态，使用游戏语义工具复现；随后检查源码、形成方案并执行验证。不要索要右侧已经可见的题目、SQL 或状态。";
-    repairFollowUps += 1;
-    pi.sendMessage({
+              ? {
+                  nextAction: "reproduce-or-propose",
+                  content: "修复任务尚未完成。已有诊断证据；继续定位并形成可执行总方案。若属于运行时故障，先用右侧语义动作复现并保存 reproduced；不要用普通回复结束。",
+                }
+              : {
+                  nextAction: "reproduce-visible-failure",
+                  content: "用户要求的是解决问题，不是快速答复。直接读取系统提示中的右侧玩家可见状态，使用游戏语义工具复现；随后检查源码、形成方案并执行验证。不要索要右侧已经可见的题目、SQL 或状态。",
+                };
+    await queueContinuation({
+      kind: "repair",
+      phase: currentContinuationPhase(),
+      nextAction: continuation.nextAction,
       customType: "dungeon-repair-follow-up",
-      content: instruction,
-      display: false,
-      details: { attempt: repairFollowUps },
-    }, {
-      triggerTurn: true,
-      deliverAs: "followUp",
+      content: continuation.content,
     });
   });
   pi.on("turn_end", async (_event, context) => {
@@ -636,9 +906,38 @@ export function installDungeonMaintainerExtension(
     if (!nativeWriteBatch) return;
     nativeWriteBatch.pendingToolCallIds.clear();
     const outcome = await flushNativeWriteBatch();
-    if (outcome?.changed) publishRefreshOutcome(context, outcome);
+    if (outcome?.changed) {
+      refreshRecoveryMessage = outcome.text;
+      publishRefreshOutcome(context, outcome);
+    }
   });
   pi.on("tool_call", async (event, context) => {
+    if (!continuationController.activeRunIsCurrent()) {
+      const reason = "这次工具调用属于已经被新用户请求替代的旧回合，禁止继续执行。";
+      context.ui.notify(reason, "warning");
+      return { block: true, terminate: true, reason };
+    }
+    if (currentRunContinuation) {
+      let authoritativeState: TaskState;
+      try {
+        authoritativeState = (await store.read(task.id)).state;
+      } catch (error) {
+        const reason = "无法确认自动续跑对应的权威任务状态，已拒绝工具调用："
+          + safeRefreshFailure(error);
+        context.ui.notify(reason, "error");
+        return { block: true, terminate: true, reason };
+      }
+      if (CONTINUATION_STOP_STATES.has(authoritativeState)) {
+        const reason = "自动续跑已经过期：任务当前处于 " + authoritativeState
+          + "，旧 proposed/result 或诊断工具均不得继续执行。";
+        await recordContinuations(continuationController.invalidate(
+          "cancelled",
+          "task-state-" + authoritativeState,
+        ));
+        context.ui.notify(reason, "warning");
+        return { block: true, terminate: true, reason };
+      }
+    }
     if (budgetStopRequested && event.toolName !== "finish") {
       budgetStopAttempts += 1;
       const reason = repairRequested
@@ -659,6 +958,32 @@ export function installDungeonMaintainerExtension(
         block: true,
         terminate: false,
         reason: "同一游戏动作已在相同参数下失败两次，禁止继续重试；请改用玩家投影中的其他 action/target，或直接 inspect 相关源码定位故障。",
+      };
+    }
+    const guardedAction = loopAction(event.toolName, event.input);
+    const loopDecision = loopGuard.evaluateAction(guardedAction);
+    if (loopDecision.kind !== "allow") {
+      const notice = loopGuardNotice(loopDecision);
+      context.ui.notify(notice, loopDecision.kind === "hard_stop" ? "error" : "warning");
+      if (loopDecision.kind === "hard_stop") {
+        repairStopped = true;
+        budgetStopRequested = false;
+        strategyResetRequested = null;
+        await recordContinuations(continuationController.invalidate(
+          "cancelled",
+          "loop-hard-stop",
+        ));
+      } else {
+        strategyResetRequested = loopDecision.kind === "strategy_reset"
+          ? "change-strategy-no-progress"
+          : loopDecision.reason === "alternating_route"
+            ? "change-alternating-route"
+            : "change-repeated-action";
+      }
+      return {
+        block: true,
+        terminate: true,
+        reason: notice,
       };
     }
     if (repairRequested) {
@@ -729,9 +1054,6 @@ export function installDungeonMaintainerExtension(
       }
     }
     turnToolCalls += 1;
-    if (signature === lastToolSignature) repeatedToolCalls += 1;
-    else repeatedToolCalls = 1;
-    lastToolSignature = signature;
     const toolFamily = event.toolName === "inspect"
       ? "inspect"
       : event.toolName === "tree" ? "tree"
@@ -756,12 +1078,9 @@ export function installDungeonMaintainerExtension(
       statusToolLimit
       || statusInspectLimit
       || turnToolCalls > 32
-      || repeatedToolCalls > 2
       || familyCalls > familyLimit
     ) {
-      const notice = repeatedToolCalls > 2
-        ? "检测到相同参数的工具调用连续重复，本轮已停止；请改变策略后再继续。"
-        : "本轮读取预算已达到上限；正在根据已有证据自动收尾。";
+      const notice = "本轮读取预算已达到上限；正在根据已有证据自动收尾。";
       budgetStopRequested = true;
       context.ui.notify(notice, "warning");
       return {
@@ -888,11 +1207,16 @@ export function installDungeonMaintainerExtension(
       }
       batch.pendingToolCallIds.add(event.toolCallId);
     }
+    pendingLoopActions.set(event.toolCallId, guardedAction);
     return undefined;
   });
 
   pi.on("tool_result", async (event, context) => {
-    if (!event.isError) {
+    const staleRun = !continuationController.activeRunIsCurrent();
+    if (staleRun) pendingLoopActions.delete(event.toolCallId);
+    const addedEvidence = staleRun ? false : recordLoopToolResult(event);
+    if (addedEvidence) await markObjectiveProgress("tool-evidence-added", true);
+    if (!staleRun && !event.isError) {
       const details = event.details && typeof event.details === "object"
         ? event.details as Record<string, unknown>
         : null;
@@ -902,9 +1226,27 @@ export function installDungeonMaintainerExtension(
         if (status) successfulFinishStatuses.add(status);
         if (status === "proposed") {
           approvedProposalInRun = details?.executionApproved === true;
+          if (approvedProposalInRun) {
+            budgetStopRequested = false;
+            budgetStopAttempts = 0;
+            repairToolCalls = Math.min(
+              repairToolCalls,
+              MAX_REPAIR_TOOL_CALLS - RESERVED_EXECUTION_TOOL_CALLS,
+            );
+          }
           if (details?.executionApproved === false) repairStopped = true;
         } else if (status === "result" || status === "blocked") {
           repairStopped = true;
+          await recordContinuations(continuationController.invalidate(
+            "cancelled",
+            "finish-" + status,
+          ));
+        }
+        if (
+          !addedEvidence
+          && (status === "reproduced" || status === "proposed")
+        ) {
+          await markObjectiveProgress("finish-" + status, false);
         }
       } else if (DIAGNOSTIC_EVIDENCE_TOOLS.has(event.toolName)) {
         if (
@@ -1051,7 +1393,10 @@ export function installDungeonMaintainerExtension(
           || task.changedPaths.length > 0
           || task.checks.some((record) => record.status !== "passed")
         );
-      beginNaturalRequest(continuation ? task.objective : text, continuation);
+      await recordContinuations(beginNaturalRequest(
+        continuation ? task.objective : text,
+        continuation,
+      ));
       if (
         task.objective === INITIAL_TASK_OBJECTIVE
         || (repairRequested && task.objective !== latestNaturalRequest)
@@ -1068,6 +1413,10 @@ export function installDungeonMaintainerExtension(
   });
 
   pi.on("session_shutdown", async (event) => {
+    await recordContinuations(continuationController.invalidate(
+      "cancelled",
+      "session-shutdown",
+    )).catch(() => undefined);
     await gameRuntime.close();
     await appendEvent(store, task.id, "pi.session_shutdown", {
       reason: event.reason,

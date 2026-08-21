@@ -320,6 +320,11 @@ export class GameDriver {
     return await this.browser.judge(floor);
   }
 
+  /** 读取当前玩家投影与检查器分离的实时视图。 */
+  async currentView(): Promise<PlayView> {
+    return await this.peek();
+  }
+
   private async settleAutomaticTransition(): Promise<void> {
     const transition = this.lastView;
     if (!transition || transition.mode !== "transition") return;
