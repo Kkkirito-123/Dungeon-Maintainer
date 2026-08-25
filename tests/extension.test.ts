@@ -188,6 +188,126 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
     }
   });
 
+  it("并行相同写入只允许两个 pending，结果与异常回合都会释放计数", async () => {
+    const repository = await createTemporaryGitRepository({ "README.md": "baseline\n" });
+    try {
+      const dataDir = join(repository.temporaryRoot, "data-pending-write");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "task-pending-write",
+        objective: "修复并行重复写入",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(store.taskDir("task-pending-write"), "pi"),
+      });
+      const pi = new RecordingExtensionApi();
+      const driver = {} as GameDriver;
+      installDungeonMaintainerExtension(pi as unknown as ExtensionAPI, {
+        config: loadConfig({ LOCALAPPDATA: dataDir, MAINTAINER_API_KEY: "provider-secret" }),
+        store,
+        task,
+        gameRuntime: {
+          currentDriver: () => null,
+          requireDriver: () => driver,
+          ensure: async () => driver,
+          close: async () => undefined,
+        },
+      });
+      const finish = pi.toolDefinitions.get("finish");
+      assert.ok(finish?.execute);
+      await finish.execute(
+        "approve-pending-write",
+        {
+          status: "proposed",
+          summary: "定位到并行写入门禁测试路径。",
+          risk: "仅验证执行前拒绝。",
+          plan: {
+            title: "验证并行 pending 门禁",
+            steps: ["并行请求同一原生写入。"],
+            verification: "第三个请求执行前被拒绝。",
+            allowedPaths: ["README.md"],
+          },
+        },
+        undefined,
+        undefined,
+        { ui: { confirm: async () => true } },
+      );
+      const call = requireHook(pi, "tool_call");
+      const result = requireHook(pi, "tool_result");
+      const turnEnd = requireHook(pi, "turn_end");
+      const context = { ui: { notify: () => undefined } };
+      const input = { path: "README.md", content: "changed\n" };
+      for (const id of ["pending-write-1", "pending-write-2"]) {
+        assert.equal(await call({
+          type: "tool_call",
+          toolCallId: id,
+          toolName: "write",
+          input,
+        }, context), undefined);
+      }
+      const third = await call({
+        type: "tool_call",
+        toolCallId: "pending-write-3",
+        toolName: "write",
+        input,
+      }, context) as { block: boolean; terminate: boolean; reason: string };
+      assert.equal(third.block, true);
+      assert.equal(third.terminate, false);
+      assert.match(third.reason, /循环门禁/u);
+
+      await result({
+        type: "tool_result",
+        toolCallId: "pending-write-1",
+        toolName: "write",
+        input,
+        content: [{ type: "text", text: "write noop" }],
+        details: undefined,
+        isError: false,
+      }, context);
+      await result({
+        type: "tool_result",
+        toolCallId: "pending-write-2",
+        toolName: "write",
+        input,
+        content: [{ type: "text", text: "write failed" }],
+        details: undefined,
+        isError: true,
+      }, context);
+      assert.equal(await call({
+        type: "tool_call",
+        toolCallId: "pending-write-4",
+        toolName: "write",
+        input,
+      }, context), undefined);
+
+      await turnEnd({}, context);
+      assert.equal(await call({
+        type: "tool_call",
+        toolCallId: "pending-write-5",
+        toolName: "write",
+        input,
+      }, context), undefined);
+      await turnEnd({}, context);
+
+      const events = (await readFile(join(store.taskDir(task.id), "events.jsonl"), "utf8"))
+        .split(/\r?\n/u)
+        .filter(Boolean)
+        .map((row) => JSON.parse(row) as { type: string; detail: Record<string, unknown> });
+      assert.equal(events.filter((event) => (
+        event.type === "tool.loop_guard"
+        && event.detail.reasonCode === "block-pending_action"
+      )).length, 1);
+      assert.equal(events.filter((event) => (
+        event.type === "tool.write_outcome"
+        && event.detail.outcome === "rejected"
+        && event.detail.reasonCode === "loop-guard-pending_action"
+      )).length, 1);
+    } finally {
+      await repository.dispose();
+    }
+  });
+
   it("注册十个领域工具，并用执行门禁保护固定 Coding 工具面", async () => {
     const repository = await createTemporaryGitRepository({
       ".maintainer/project.json": JSON.stringify({
@@ -947,6 +1067,262 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       assert.equal(blockedResult.terminate, false);
       assert.match(blockedResult.reason, /继续修复后重试/u);
       assert.deepEqual(pi.activeTools, [...FULL_CODING_TOOLS]);
+    } finally {
+      await repository.dispose();
+    }
+  });
+
+  it("旧 write 刷新失败后，成功 patch 清除统一刷新门禁", async () => {
+    const repository = await createTemporaryGitRepository({
+      "README.md": "baseline\n",
+    });
+    try {
+      const dataDir = join(repository.temporaryRoot, "data-patch-refresh-recovery");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "task-patch-refresh-recovery",
+        objective: "验证 patch 可以修复旧刷新失败",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(store.taskDir("task-patch-refresh-recovery"), "pi"),
+      });
+      const pi = new RecordingExtensionApi();
+      const driver = {
+        ensureReproductionCheckpoint: async () => undefined,
+        reloadAndReplay: async () => {
+          throw new Error("bridge unavailable");
+        },
+      } as unknown as GameDriver;
+      installDungeonMaintainerExtension(pi as unknown as ExtensionAPI, {
+        config: loadConfig({
+          LOCALAPPDATA: dataDir,
+          MAINTAINER_API_KEY: "provider-secret",
+        }),
+        store,
+        task,
+        gameRuntime: {
+          currentDriver: () => driver,
+          requireDriver: () => driver,
+          ensure: async () => driver,
+          close: async () => undefined,
+        },
+      });
+      const finishTool = pi.toolDefinitions.get("finish");
+      assert.ok(finishTool?.execute);
+      await finishTool.execute(
+        "approve-patch-refresh-recovery",
+        {
+          status: "proposed",
+          summary: "已定位刷新失败后的修复路径。",
+          risk: "仅验证统一刷新门禁。",
+          plan: {
+            title: "用精确补丁恢复刷新",
+            steps: ["先触发旧刷新失败，再应用成功补丁。"],
+            verification: "确认 check 和 result 不再被旧失败阻断。",
+            allowedPaths: ["changed.txt", "README.md"],
+          },
+        },
+        undefined,
+        undefined,
+        { ui: { confirm: async () => true } },
+      );
+
+      const toolCallHook = requireHook(pi, "tool_call");
+      const toolResultHook = requireHook(pi, "tool_result");
+      const hookContext = { ui: { notify: () => undefined } };
+      const writeInput = { path: "changed.txt", content: "changed\n" };
+      assert.equal(await toolCallHook({
+        type: "tool_call",
+        toolCallId: "write-before-patch-recovery",
+        toolName: "write",
+        input: writeInput,
+      }, hookContext), undefined);
+      await writeFile(join(task.worktreeRoot, "changed.txt"), "changed\n", "utf8");
+      const failedWrite = await toolResultHook({
+        type: "tool_result",
+        toolCallId: "write-before-patch-recovery",
+        toolName: "write",
+        input: writeInput,
+        content: [{ type: "text", text: "native write completed" }],
+        details: undefined,
+        isError: false,
+      }, hookContext) as { isError: boolean };
+      assert.equal(failedWrite.isError, true);
+      const blockedBeforePatch = await toolCallHook({
+        type: "tool_call",
+        toolCallId: "check-before-patch-recovery",
+        toolName: "check",
+        input: { id: "rules-validate" },
+      }, hookContext) as { block: boolean };
+      assert.equal(blockedBeforePatch.block, true);
+
+      const patchInput = {
+        edits: [{
+          path: "README.md",
+          baseHash: "baseline-hash",
+          oldText: "baseline",
+          newText: "fixed",
+        }],
+      };
+      assert.equal(await toolCallHook({
+        type: "tool_call",
+        toolCallId: "patch-refresh-recovery",
+        toolName: "patch",
+        input: patchInput,
+      }, hookContext), undefined);
+      await writeFile(join(task.worktreeRoot, "README.md"), "fixed\n", "utf8");
+      await toolResultHook({
+        type: "tool_result",
+        toolCallId: "patch-refresh-recovery",
+        toolName: "patch",
+        input: patchInput,
+        content: [{ type: "text", text: "patch replay passed" }],
+        details: {
+          replay: { passed: true, actionCount: 0, failure: null },
+        },
+        isError: false,
+      }, hookContext);
+
+      assert.equal(await toolCallHook({
+        type: "tool_call",
+        toolCallId: "check-after-patch-recovery",
+        toolName: "check",
+        input: { id: "rules-validate" },
+      }, hookContext), undefined);
+      assert.equal(await toolCallHook({
+        type: "tool_call",
+        toolCallId: "result-after-patch-recovery",
+        toolName: "finish",
+        input: { status: "result" },
+      }, hookContext), undefined);
+
+      const events = (await readFile(join(store.taskDir(task.id), "events.jsonl"), "utf8"))
+        .split(/\r?\n/u)
+        .filter(Boolean)
+        .map((row) => JSON.parse(row) as { type: string; detail: Record<string, unknown> });
+      const writes = events.filter((event) => event.type === "tool.write_outcome");
+      assert.deepEqual(writes.map((event) => event.detail.outcome), [
+        "mutated_replay_failed",
+        "mutated",
+      ]);
+    } finally {
+      await repository.dispose();
+    }
+  });
+
+  it("patch 自身重放失败后，统一刷新门禁阻断 check 和 result", async () => {
+    const repository = await createTemporaryGitRepository({
+      "README.md": "baseline\n",
+    });
+    try {
+      const dataDir = join(repository.temporaryRoot, "data-patch-refresh-failure");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "task-patch-refresh-failure",
+        objective: "验证 patch 刷新失败门禁",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(store.taskDir("task-patch-refresh-failure"), "pi"),
+      });
+      const pi = new RecordingExtensionApi();
+      const driver = {} as GameDriver;
+      installDungeonMaintainerExtension(pi as unknown as ExtensionAPI, {
+        config: loadConfig({
+          LOCALAPPDATA: dataDir,
+          MAINTAINER_API_KEY: "provider-secret",
+        }),
+        store,
+        task,
+        gameRuntime: {
+          currentDriver: () => null,
+          requireDriver: () => driver,
+          ensure: async () => driver,
+          close: async () => undefined,
+        },
+      });
+      const finishTool = pi.toolDefinitions.get("finish");
+      assert.ok(finishTool?.execute);
+      await finishTool.execute(
+        "approve-patch-refresh-failure",
+        {
+          status: "proposed",
+          summary: "已定位精确补丁刷新失败路径。",
+          risk: "仅验证统一刷新门禁。",
+          plan: {
+            title: "验证 patch 重放失败",
+            steps: ["写入精确补丁并模拟 afterPatch 重放失败。"],
+            verification: "阻断后续 check 和 result。",
+            allowedPaths: ["README.md"],
+          },
+        },
+        undefined,
+        undefined,
+        { ui: { confirm: async () => true } },
+      );
+
+      const toolCallHook = requireHook(pi, "tool_call");
+      const toolResultHook = requireHook(pi, "tool_result");
+      const hookContext = { ui: { notify: () => undefined } };
+      const patchInput = {
+        edits: [{
+          path: "README.md",
+          baseHash: "baseline-hash",
+          oldText: "baseline",
+          newText: "changed",
+        }],
+      };
+      assert.equal(await toolCallHook({
+        type: "tool_call",
+        toolCallId: "patch-refresh-failure",
+        toolName: "patch",
+        input: patchInput,
+      }, hookContext), undefined);
+      await writeFile(join(task.worktreeRoot, "README.md"), "changed\n", "utf8");
+      await toolResultHook({
+        type: "tool_result",
+        toolCallId: "patch-refresh-failure",
+        toolName: "patch",
+        input: patchInput,
+        content: [{
+          type: "text",
+          text: "新代码刷新后的复现重放失败：bridge unavailable",
+        }],
+        details: undefined,
+        isError: true,
+      }, hookContext);
+
+      const blockedCheck = await toolCallHook({
+        type: "tool_call",
+        toolCallId: "check-after-patch-refresh-failure",
+        toolName: "check",
+        input: { id: "rules-validate" },
+      }, hookContext) as { block: boolean; terminate: boolean; reason: string };
+      assert.equal(blockedCheck.block, true);
+      assert.equal(blockedCheck.terminate, false);
+      assert.match(blockedCheck.reason, /精确补丁已写入/u);
+      const blockedResult = await toolCallHook({
+        type: "tool_call",
+        toolCallId: "result-after-patch-refresh-failure",
+        toolName: "finish",
+        input: { status: "result" },
+      }, hookContext) as { block: boolean; terminate: boolean; reason: string };
+      assert.equal(blockedResult.block, true);
+      assert.equal(blockedResult.terminate, false);
+      assert.match(blockedResult.reason, /bridge unavailable/u);
+
+      const events = (await readFile(join(store.taskDir(task.id), "events.jsonl"), "utf8"))
+        .split(/\r?\n/u)
+        .filter(Boolean)
+        .map((row) => JSON.parse(row) as { type: string; detail: Record<string, unknown> });
+      const write = events.find((event) => (
+        event.type === "tool.write_outcome"
+        && event.detail.toolName === "patch"
+      ));
+      assert.ok(write);
+      assert.equal(write.detail.outcome, "mutated_replay_failed");
+      assert.equal(write.detail.reasonCode, "refresh-replay-failed");
     } finally {
       await repository.dispose();
     }

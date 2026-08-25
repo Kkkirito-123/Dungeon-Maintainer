@@ -98,12 +98,12 @@ describe("Agent Eval fixture materializer", () => {
     assert.equal(testCase.expected.afterOracle, "terminal-action-available");
   });
 
-  it("内置 terminal-action-bug 复用 468 文件共享基线且只注入一个脏路径", async () => {
+  it("内置 terminal-action-bug 复用 521 文件共享基线且只注入一个脏路径", async () => {
     const temporaryRoot = await mkdtemp(join(tmpdir(), "maintainer-agent-eval-real-"));
     try {
       const fixtureRoot = resolve(process.cwd(), "test-fixtures", "agent-evals");
       const repositoryRoot = join(fixtureRoot, "_bases", "game-repair-v1", "repository");
-      assert.equal(await countFixtureFiles(repositoryRoot), 468);
+      assert.equal(await countFixtureFiles(repositoryRoot), 521);
       const result = await materializeAgentEvalFixture({
         fixtureRoot,
         id: "terminal-action-bug",

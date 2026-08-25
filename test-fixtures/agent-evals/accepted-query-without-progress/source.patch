@@ -1,7 +1,7 @@
 diff --git a/game/src/domain/session/GameSession.ts b/game/src/domain/session/GameSession.ts
 --- a/game/src/domain/session/GameSession.ts
 +++ b/game/src/domain/session/GameSession.ts
-@@ -1845,7 +1845,7 @@ export class GameSession {
+@@ -1688,6 +1688,6 @@ export class GameSession {
          target.hp = Math.max(minimumHp, target.hp - damage);
          hpUpdates.push({ id: target.id, hp: target.hp });
          events.push({ type: "player-hit", targetId: target.id, amount: damage });
@@ -9,4 +9,3 @@ diff --git a/game/src/domain/session/GameSession.ts b/game/src/domain/session/Ga
 +        this.combat.successStep = stageIndex;
          this.combat.round += 1;
          stageAdvanced = true;
-

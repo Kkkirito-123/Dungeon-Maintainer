@@ -83,11 +83,6 @@ function judgeSnapshot(snapshot: GameSnapshot): DungeonAgentJudge {
     migrationSteps: migration.completedStepIds.length,
     migrationComplete: migration.complete,
     advanced: false,
-    stageIndex: snapshot.lessonStageIndex,
-    claimableReward: snapshot.claimableReward?.id ?? null,
-    bossHp: boss?.hp ?? null,
-    victories: snapshot.profile.victories,
-    guidanceDistance: snapshot.navigationGuidance.distance,
   };
 }
 
@@ -196,11 +191,6 @@ export function installDungeonAgentBridge(
   const bridge: DungeonPlaytestBridge = {
     version: 2,
     checkpointRestored: options.checkpointRestored,
-    prepare(presetId) {
-      const prepared = options.session.adminApplyPreset(presetId).ok;
-      trace.record("prepare", `preset=${presetId} result=${String(prepared)}`);
-      return prepared;
-    },
     checkpoint() {
       const saved = Boolean(
         options.checkpointStorage

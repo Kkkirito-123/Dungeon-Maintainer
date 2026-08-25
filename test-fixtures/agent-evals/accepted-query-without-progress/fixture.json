@@ -3,6 +3,6 @@
   "id": "accepted-query-without-progress",
   "base": "game-repair-v1",
   "sourcePatch": "source.patch",
-  "patchSha256": "a2086673f3dba99d04bc55b2958083c05e7714995a9f81b9fa40613c08f1dd2d",
+  "patchSha256": "a82b1f28c52dd1614b7a55faa41e24964b65580ae25b04a5e327967e48d9c56d",
   "dirtyPaths": ["game/src/domain/session/GameSession.ts"]
 }

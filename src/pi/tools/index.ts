@@ -33,6 +33,8 @@ export interface MaintainerToolContext {
   evidence: EvidenceStore;
   architectureMap?(): ArchitectureMap | null;
   architectureRoute?(): ArchitectureRoute | null;
+  /** 由 Extension 的 tool_call 门禁提供同一次调用已计算的 worktree Hash。 */
+  inspectWorktreeHash?(toolCallId: string): string | undefined;
   currentDriver(): GameDriver | null;
   requireDriver(): GameDriver;
   ensureGame(): Promise<GameDriver>;

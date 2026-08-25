@@ -303,7 +303,6 @@ export const FLOOR_EIGHT_EXPERIENCE: FloorExperienceDefinition = {
     { id: "f8-admin-chapel", label: "F8 零行礼拜堂", completedLessonIds: ["f8-mvcc", "f8-lock", "f8-isolation", "f8-modeling"], defeatedMonsterIds: [78, 79, 80, 81], openedGateIds: ["gate:floor-8-treasure"], collectedKeyItems: [], focusLandmarkId: "f8-zero-row-chapel" },
     { id: "f8-admin-cipher", label: "F8 王令校验密文", completedLessonIds: ["f8-mvcc", "f8-lock", "f8-isolation", "f8-modeling", "f8-replication", "f8-sharding"], defeatedMonsterIds: [78, 79, 80, 81, 82, 83], openedGateIds: ["gate:floor-8-lesson-7"], collectedKeyItems: [], focusLandmarkId: "f8-sql-seal" },
     { id: "f8-admin-void-court", label: "F8 虚空王庭", completedLessonIds: ["f8-mvcc", "f8-lock", "f8-isolation", "f8-modeling", "f8-replication", "f8-sharding"], defeatedMonsterIds: [78, 79, 80, 81, 82, 83, 89], openedGateIds: [], collectedKeyItems: [], focusLandmarkId: "f8-incident-wings" },
-    { id: "f8-admin-boss", label: "F8 王座门前", completedLessonIds: ["f8-mvcc", "f8-lock", "f8-isolation", "f8-modeling", "f8-replication", "f8-sharding"], defeatedMonsterIds: [78, 79, 80, 81, 82, 83, 89], openedGateIds: [], collectedKeyItems: [], focusLandmarkId: "f8-archivist-throne" },
     { id: "f8-admin-complete", label: "F8 MIGRATE 完成态", completedLessonIds: ["f8-mvcc", "f8-lock", "f8-isolation", "f8-modeling", "f8-replication", "f8-sharding", "f8-security"], defeatedMonsterIds: [78, 79, 80, 81, 82, 83, 84, 89], openedGateIds: [], collectedKeyItems: ["floor-key:8"], focusLandmarkId: "f8-archivist-throne" },
   ],
 };

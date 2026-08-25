@@ -1,7 +1,7 @@
 diff --git a/game/src/domain/session/GameSession.ts b/game/src/domain/session/GameSession.ts
 --- a/game/src/domain/session/GameSession.ts
 +++ b/game/src/domain/session/GameSession.ts
-@@ -2288,7 +2288,7 @@ export class GameSession {
+@@ -2130,6 +2130,6 @@ export class GameSession {
        return null;
      }
      return this.monsters.some((monster) => (
@@ -9,4 +9,3 @@ diff --git a/game/src/domain/session/GameSession.ts b/game/src/domain/session/Ga
 +      monster.id === rearPortal.requiredBossId && monster.hp >= 0
      )) ? rearPortal.toRegionId : null;
    }
-

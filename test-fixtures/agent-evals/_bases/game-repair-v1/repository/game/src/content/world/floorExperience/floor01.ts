@@ -359,7 +359,6 @@ export const FLOOR_ONE_EXPERIENCE: FloorExperienceDefinition = {
     { id: "f1-admin-dormitory", label: "F1 无名宿舍", completedLessonIds: ["select", "where", "is-null"], defeatedMonsterIds: [1, 2, 3], openedGateIds: [], collectedKeyItems: [], focusLandmarkId: "f1-nameless-beds" },
     { id: "f1-admin-hidden", label: "F1 封存旧库", completedLessonIds: ["select", "where", "is-null"], defeatedMonsterIds: [1, 2, 3], openedGateIds: ["gate:floor-1-treasure"], collectedKeyItems: [], focusLandmarkId: "f1-sealed-vault" },
     { id: "f1-admin-shortcut", label: "F1 捷径回访", completedLessonIds: ["select", "where", "is-null", "group-by"], defeatedMonsterIds: [1, 2, 3, 4], openedGateIds: ["shortcut:1:return"], collectedKeyItems: ["shortcut-key:1"], focusLandmarkId: "f1-back-shortcut" },
-    { id: "f1-admin-boss", label: "F1 层主门前", completedLessonIds: ["select", "where", "is-null", "group-by"], defeatedMonsterIds: [1, 2, 3, 4], openedGateIds: ["shortcut:1:return"], collectedKeyItems: ["shortcut-key:1"], focusLandmarkId: "f1-lift" },
     { id: "f1-admin-complete", label: "F1 通关", completedLessonIds: ["select", "where", "is-null", "group-by", "having"], defeatedMonsterIds: [1, 2, 3, 4, 5], openedGateIds: ["shortcut:1:return"], collectedKeyItems: ["floor-key:1"], focusLandmarkId: "f1-lift" },
   ],
 };

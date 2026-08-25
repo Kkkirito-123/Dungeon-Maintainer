@@ -145,11 +145,6 @@ export interface DungeonAgentJudge {
   migrationSteps: number;
   migrationComplete: boolean;
   advanced: boolean;
-  stageIndex: number;
-  claimableReward: string | null;
-  bossHp: number | null;
-  victories: number;
-  guidanceDistance: number | null;
 }
 
 /** 页面内环形 Trace 对外提供的低敏语义事件。 */
@@ -168,7 +163,6 @@ export interface DungeonAgentEvent {
 export interface DungeonPlaytestBridge {
   readonly version: 2;
   readonly checkpointRestored: boolean;
-  prepare(presetId: string): boolean;
   checkpoint(): boolean;
   look(): DungeonAgentView;
   go(

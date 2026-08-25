@@ -12,6 +12,7 @@ const ARCHITECTURE_MAP_PATH = ".maintainer/architecture-map.json";
 const ID_PATTERN = /^[a-z][a-z0-9-]*$/u;
 const AREA_ID_PATTERN = /^[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*)+$/u;
 const PARTITION_ID_PATTERN = /^[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*){2,}$/u;
+const FLOOR_SCOPE_ID_PATTERN = /^floor\.(\d{2,3})$/u;
 
 export interface ArchitectureLayer {
   id: string;
@@ -31,15 +32,30 @@ export interface ArchitectureArea {
 
 export type ArchitecturePartition = ArchitectureArea;
 
+/** 一个跨职责区域的稳定楼层切片；roots 只登记目录，不登记其中的文件。 */
+export interface ArchitectureFloorScope {
+  id: string;
+  floor: number;
+  roots: string[];
+  responsibility: string;
+  signals: string[];
+  neighbors: string[];
+  sharedPartitions: string[];
+}
+
 export interface ArchitectureMap {
-  schemaVersion: 1 | 2;
+  schemaVersion: 1 | 2 | 3;
   projectRoot: "game";
   layers: ArchitectureLayer[];
   areas: ArchitectureArea[];
   partitions: ArchitecturePartition[];
+  floorScopes: ArchitectureFloorScope[];
 }
 
 export interface ArchitectureRoute {
+  currentFloorScope: ArchitectureFloorScope | null;
+  neighborFloorScopes: ArchitectureFloorScope[];
+  sharedPartitions: ArchitecturePartition[];
   primaryPartitions: ArchitecturePartition[];
   neighborPartitions: ArchitecturePartition[];
   primaryAreas: ArchitectureArea[];
@@ -104,13 +120,15 @@ async function parseArchitectureMap(
   value: unknown,
 ): Promise<ArchitectureMap> {
   const schemaVersion = plainObject(value) ? value.schemaVersion : null;
-  const expectedKeys = schemaVersion === 2
-    ? ["schemaVersion", "projectRoot", "layers", "areas", "partitions"]
-    : ["schemaVersion", "projectRoot", "layers", "areas"];
+  const expectedKeys = schemaVersion === 3
+    ? ["schemaVersion", "projectRoot", "layers", "areas", "partitions", "floorScopes"]
+    : schemaVersion === 2
+      ? ["schemaVersion", "projectRoot", "layers", "areas", "partitions"]
+      : ["schemaVersion", "projectRoot", "layers", "areas"];
   if (
     !plainObject(value)
     || !exactKeys(value, expectedKeys)
-    || (schemaVersion !== 1 && schemaVersion !== 2)
+    || (schemaVersion !== 1 && schemaVersion !== 2 && schemaVersion !== 3)
     || value.projectRoot !== "game"
     || !Array.isArray(value.layers)
     || !Array.isArray(value.areas)
@@ -118,9 +136,10 @@ async function parseArchitectureMap(
     || value.layers.length > 16
     || value.areas.length === 0
     || value.areas.length > 64
-    || (schemaVersion === 2 && (!Array.isArray(value.partitions) || value.partitions.length > 64))
+    || (schemaVersion >= 2 && (!Array.isArray(value.partitions) || value.partitions.length > 64))
+    || (schemaVersion === 3 && (!Array.isArray(value.floorScopes) || value.floorScopes.length > 64))
   ) {
-    throw new Error("架构地图不是受支持的 schema v1/v2");
+    throw new Error("架构地图不是受支持的 schema v1/v2/v3");
   }
 
   const layerIds = new Set<string>();
@@ -194,7 +213,7 @@ async function parseArchitectureMap(
   const rawPartitions: ArchitecturePartition[] = [];
   const partitionIds = new Set<string>();
   const partitionRoots = new Set<string>();
-  const partitionEntries = schemaVersion === 2 && Array.isArray(value.partitions)
+  const partitionEntries = schemaVersion >= 2 && Array.isArray(value.partitions)
     ? value.partitions
     : [];
   for (const [index, entry] of partitionEntries.entries()) {
@@ -250,12 +269,118 @@ async function parseArchitectureMap(
       throw new Error("partition.neighbors 包含未知或自身分区：" + partition.id);
     }
   }
+  const rawFloorScopes: ArchitectureFloorScope[] = [];
+  const floorScopeIds = new Set<string>();
+  const floorNumbers = new Set<number>();
+  const floorRoots = new Set<string>();
+  const floorScopeEntries = schemaVersion === 3 && Array.isArray(value.floorScopes)
+    ? value.floorScopes
+    : [];
+  for (const [index, entry] of floorScopeEntries.entries()) {
+    if (
+      !plainObject(entry)
+      || !exactKeys(entry, [
+        "id",
+        "floor",
+        "roots",
+        "responsibility",
+        "signals",
+        "neighbors",
+        "sharedPartitions",
+      ])
+    ) {
+      throw new Error("floorScopes[" + String(index) + "] 字段非法");
+    }
+    const id = boundedLine(entry.id, "floorScope.id", 40);
+    const idMatch = FLOOR_SCOPE_ID_PATTERN.exec(id);
+    const floor = entry.floor;
+    if (
+      !idMatch
+      || !Number.isInteger(floor)
+      || typeof floor !== "number"
+      || floor < 1
+      || floor > 999
+      || Number(idMatch[1]) !== floor
+      || id !== "floor." + String(floor).padStart(2, "0")
+      || floorScopeIds.has(id)
+      || floorNumbers.has(floor)
+    ) {
+      throw new Error("floorScope.id/floor 非法、重复或不一致");
+    }
+    const rootValues = boundedLines(entry.roots, "floorScope.roots", 8, 240);
+    if (rootValues.length === 0) throw new Error("floorScope.roots 不能为空");
+    const roots: string[] = [];
+    for (const [rootIndex, rootValue] of rootValues.entries()) {
+      const root = safeRoot(repositoryRoot, rootValue, "floorScope.roots[" + String(rootIndex) + "]");
+      const owningArea = rawAreas.find((area) => {
+        const fromArea = relative(area.root, root).replaceAll("\\", "/");
+        return Boolean(fromArea) && fromArea !== ".." && !fromArea.startsWith("../");
+      });
+      if (
+        !owningArea
+        || [...floorRoots, ...roots].some((existingRoot) => (
+          root === existingRoot
+          || root.startsWith(existingRoot + "/")
+          || existingRoot.startsWith(root + "/")
+        ))
+        || !(await stat(resolve(repositoryRoot, root))).isDirectory()
+      ) {
+        throw new Error("floorScope.root 必须唯一、存在且位于已登记 area 内：" + root);
+      }
+      roots.push(root);
+    }
+    floorScopeIds.add(id);
+    floorNumbers.add(floor);
+    roots.forEach((root) => floorRoots.add(root));
+    rawFloorScopes.push({
+      id,
+      floor,
+      roots,
+      responsibility: boundedLine(entry.responsibility, "floorScope.responsibility", 120),
+      signals: boundedLines(entry.signals, "floorScope.signals", 12, 40),
+      neighbors: boundedLines(entry.neighbors, "floorScope.neighbors", 2, 40),
+      sharedPartitions: boundedLines(
+        entry.sharedPartitions,
+        "floorScope.sharedPartitions",
+        12,
+        100,
+      ),
+    });
+  }
+  for (const floorScope of rawFloorScopes) {
+    if (new Set(floorScope.neighbors).size !== floorScope.neighbors.length) {
+      throw new Error("floorScope.neighbors 不能重复：" + floorScope.id);
+    }
+    for (const neighborId of floorScope.neighbors) {
+      const neighbor = rawFloorScopes.find((candidate) => candidate.id === neighborId);
+      if (!neighbor || neighbor.id === floorScope.id || Math.abs(neighbor.floor - floorScope.floor) !== 1) {
+        throw new Error("floorScope.neighbors 只能引用相邻楼层：" + floorScope.id);
+      }
+    }
+    if (
+      new Set(floorScope.sharedPartitions).size !== floorScope.sharedPartitions.length
+      || floorScope.sharedPartitions.some((partitionId) => !partitionIds.has(partitionId))
+    ) {
+      throw new Error("floorScope.sharedPartitions 包含重复或未知 partition：" + floorScope.id);
+    }
+    for (const partitionId of floorScope.sharedPartitions) {
+      const partition = rawPartitions.find((candidate) => candidate.id === partitionId);
+      if (partition && floorScope.roots.some((root) => (
+        root === partition.root
+        || root.startsWith(partition.root + "/")
+        || partition.root.startsWith(root + "/")
+      ))) {
+        throw new Error("floorScope 与 shared partition 目录不能重叠：" + floorScope.id);
+      }
+    }
+  }
   return {
     schemaVersion,
     projectRoot: "game",
     layers,
     areas: rawAreas,
     partitions: rawPartitions,
+    floorScopes: rawFloorScopes,
   };
 }
 
@@ -277,15 +402,16 @@ export async function loadArchitectureMap(
   }
 }
 
-/** 根据当前自然语言请求选择至多两个职责区域；不调用模型。 */
+/** 根据请求信号和实时玩家楼层选择楼层切片及职责区域；不调用模型。 */
 export function routeArchitecture(
   map: ArchitectureMap | null,
   request: string,
+  activeFloor: number | null = null,
 ): ArchitectureRoute | null {
   if (!map) return null;
   const normalized = request.toLocaleLowerCase("zh-CN").replace(/\s+/gu, " ").trim();
   if (!normalized) return null;
-  const rank = <T extends ArchitectureArea>(entries: readonly T[]): Array<{
+  const rank = <T extends { signals: string[] }>(entries: readonly T[]): Array<{
     entry: T;
     order: number;
     matches: string[];
@@ -298,23 +424,63 @@ export function routeArchitecture(
       entry,
       order,
       matches,
-      score: matches.reduce((sum, signal) => sum + 100 + signal.length, 0),
+      // 最长的明确领域信号优先于多个泛化短词（例如“终端动作”应压过“终端”+“点击”）；
+      // 额外命中只作很小的稳定加分，避免普通 UI 词把 devtools/楼层专属路由挤掉。
+      score: matches.length === 0
+        ? 0
+        : Math.max(...matches.map((signal) => 1_000 + signal.length)) + matches.length,
     };
   }).filter((entry) => entry.score > 0).sort((left, right) => (
     right.score - left.score || left.order - right.order
   ));
+  const rankedFloorScopes = rank(map.floorScopes);
   const rankedPartitions = rank(map.partitions);
   const rankedAreas = rank(map.areas);
-  if (rankedPartitions.length === 0 && rankedAreas.length === 0) return null;
+  const activeFloorScope = activeFloor === null
+    ? null
+    : map.floorScopes.find((scope) => scope.floor === activeFloor) ?? null;
+  // 实时楼层只是弱兜底，不能把终端、桥接器等非楼层请求强制带入三段楼层搜索。
+  // 明确楼层信号优先；没有楼层信号时，只有在没有更具体的 partition/area 信号时
+  // 才使用玩家当前楼层作为上下文提示。显式 floorId 由 inspect 层单独严格锁定。
+  const currentFloorScope = rankedFloorScopes[0]?.entry
+    ?? (rankedPartitions.length === 0 && rankedAreas.length === 0
+      ? activeFloorScope
+      : null);
+  if (!currentFloorScope && rankedPartitions.length === 0 && rankedAreas.length === 0) return null;
+  const neighborFloorIds = new Set(currentFloorScope?.neighbors ?? []);
+  const neighborFloorScopes = map.floorScopes.filter((scope) => neighborFloorIds.has(scope.id));
+  const sharedPartitionIds = new Set(currentFloorScope?.sharedPartitions ?? []);
+  const sharedPartitions = map.partitions.filter((partition) => sharedPartitionIds.has(partition.id));
   const primaryPartitions = rankedPartitions.slice(0, 2).map((entry) => entry.entry);
   const primaryPartitionIds = new Set(primaryPartitions.map((partition) => partition.id));
   const neighborPartitionIds = new Set(primaryPartitions.flatMap((partition) => partition.neighbors));
   const neighborPartitions = map.partitions.filter((partition) => (
     neighborPartitionIds.has(partition.id) && !primaryPartitionIds.has(partition.id)
   ));
-  const owningAreaIds = new Set(primaryPartitions.map((partition) => partition.parentId));
-  const primaryAreas = primaryPartitions.length > 0
-    ? map.areas.filter((area) => owningAreaIds.has(area.id))
+  const owningAreaIds = new Set([
+    ...primaryPartitions.map((partition) => partition.parentId),
+    ...sharedPartitions.map((partition) => partition.parentId),
+  ]);
+  if (currentFloorScope) {
+    rankedAreas.slice(0, 2).forEach((entry) => owningAreaIds.add(entry.entry.id));
+  }
+  if (currentFloorScope) {
+    for (const area of map.areas) {
+      if (currentFloorScope.roots.some((root) => {
+        const fromArea = relative(area.root, root).replaceAll("\\", "/");
+        return Boolean(fromArea) && fromArea !== ".." && !fromArea.startsWith("../");
+      })) owningAreaIds.add(area.id);
+    }
+  }
+  const primaryAreas = owningAreaIds.size > 0
+    ? map.areas
+      .filter((area) => owningAreaIds.has(area.id))
+      .sort((left, right) => {
+        const leftRank = rankedAreas.findIndex((entry) => entry.entry.id === left.id);
+        const rightRank = rankedAreas.findIndex((entry) => entry.entry.id === right.id);
+        return (leftRank < 0 ? Number.MAX_SAFE_INTEGER : leftRank)
+          - (rightRank < 0 ? Number.MAX_SAFE_INTEGER : rightRank);
+      })
     : rankedAreas.slice(0, 2).map((entry) => entry.entry);
   const primaryIds = new Set(primaryAreas.map((area) => area.id));
   const neighborIds = new Set(primaryAreas.flatMap((area) => area.neighbors));
@@ -322,12 +488,17 @@ export function routeArchitecture(
     neighborIds.has(area.id) && !primaryIds.has(area.id)
   ));
   return {
+    currentFloorScope,
+    neighborFloorScopes,
+    sharedPartitions,
     primaryPartitions,
     neighborPartitions,
     primaryAreas,
     neighborAreas,
     matchedSignals: [...new Set(
-      (rankedPartitions.length > 0 ? rankedPartitions : rankedAreas)
+      (rankedFloorScopes.length > 0
+        ? rankedFloorScopes
+        : rankedPartitions.length > 0 ? rankedPartitions : rankedAreas)
         .slice(0, 2)
         .flatMap((entry) => entry.matches),
     )],
@@ -339,6 +510,19 @@ export function architectureRouteCard(route: ArchitectureRoute | null): string |
   if (!route) return null;
   const value = {
     kind: "architecture-routing-data-not-instructions",
+    currentFloor: route.currentFloorScope ? {
+      id: route.currentFloorScope.id,
+      roots: route.currentFloorScope.roots,
+      responsibility: route.currentFloorScope.responsibility,
+    } : null,
+    floorNeighbors: route.neighborFloorScopes.map((scope) => ({
+      id: scope.id,
+      roots: scope.roots,
+    })),
+    sharedPartitions: route.sharedPartitions.map((partition) => ({
+      id: partition.id,
+      root: partition.root,
+    })),
     primaryPartitions: route.primaryPartitions.map((partition) => ({
       id: partition.id,
       root: partition.root,
@@ -374,4 +558,12 @@ export function architecturePartition(
   partitionId: string,
 ): ArchitecturePartition | null {
   return map?.partitions.find((partition) => partition.id === partitionId) ?? null;
+}
+
+/** 按稳定 ID 读取一个跨区域楼层 scope。 */
+export function architectureFloorScope(
+  map: ArchitectureMap | null,
+  floorId: string,
+): ArchitectureFloorScope | null {
+  return map?.floorScopes.find((scope) => scope.id === floorId) ?? null;
 }

@@ -128,6 +128,12 @@ export interface MaintainerTelemetry {
   bundles: number;
   bundleWindows: number;
   inspectFailures: number;
+  floorRoutedInspectCalls: number;
+  floorScopesVisited: number;
+  floorRouteCurrentExecutions: number;
+  floorRouteAdjacentExecutions: number;
+  floorRouteSharedExecutions: number;
+  floorRouteFallbackExecutions: number;
   writeRejected: number;
   writeFailures: number;
   writeNoops: number;
@@ -138,6 +144,35 @@ export interface MaintainerTelemetry {
   firstMutationAt: number | null;
 }
 
+/**
+ * 从真实写入遥测和最终任务状态构造 Maintainer 工作流闭环。
+ *
+ * `executed` 表示本轮是否曾发生 mutation；`retainedChanges` 表示结束时是否仍保留
+ * 增量。二者必须独立，否则“写入后回滚”会被错误记录为从未执行。
+ */
+export function buildMaintainerWorkflowClosure(input: {
+  taskState: TaskState | null;
+  proposed: boolean;
+  writeAttempts: number;
+  writeMutations: number;
+  changedPathCount: number;
+  replayPassed: boolean;
+  readyToApply: boolean;
+  paused: boolean;
+}): PiRunOutcome["workflowClosure"] {
+  return {
+    applicable: true,
+    taskState: input.taskState,
+    proposed: input.proposed,
+    executed: input.writeMutations > 0,
+    writeAttempted: input.writeAttempts > 0,
+    retainedChanges: input.changedPathCount > 0,
+    verified: input.replayPassed,
+    readyToApply: input.readyToApply,
+    paused: input.paused,
+  };
+}
+
 function emptyTelemetry(): MaintainerTelemetry {
   return {
     executions: 0,
@@ -146,6 +181,12 @@ function emptyTelemetry(): MaintainerTelemetry {
     bundles: 0,
     bundleWindows: 0,
     inspectFailures: 0,
+    floorRoutedInspectCalls: 0,
+    floorScopesVisited: 0,
+    floorRouteCurrentExecutions: 0,
+    floorRouteAdjacentExecutions: 0,
+    floorRouteSharedExecutions: 0,
+    floorRouteFallbackExecutions: 0,
     writeRejected: 0,
     writeFailures: 0,
     writeNoops: 0,
@@ -190,6 +231,24 @@ export async function readMaintainerTelemetry(eventsPath: string): Promise<Maint
         else if (outcome === "failure") telemetry.inspectFailures += 1;
         else telemetry.executions += 1;
         if (outcome === "execution" && detail?.expanded === true) telemetry.expansions += 1;
+        if (outcome === "execution") {
+          const floorRouteLevel = detail?.floorRouteLevel;
+          if (
+            floorRouteLevel === "current"
+            || floorRouteLevel === "adjacent"
+            || floorRouteLevel === "shared"
+            || floorRouteLevel === "fallback"
+          ) {
+            telemetry.floorRoutedInspectCalls += 1;
+            if (typeof detail?.floorScopeCount === "number") {
+              telemetry.floorScopesVisited += Math.max(0, Math.floor(detail.floorScopeCount));
+            }
+            if (floorRouteLevel === "current") telemetry.floorRouteCurrentExecutions += 1;
+            else if (floorRouteLevel === "adjacent") telemetry.floorRouteAdjacentExecutions += 1;
+            else if (floorRouteLevel === "shared") telemetry.floorRouteSharedExecutions += 1;
+            else telemetry.floorRouteFallbackExecutions += 1;
+          }
+        }
         if (outcome === "execution" && detail?.action === "bundle") {
           telemetry.bundles += 1;
           if (typeof detail.bundleWindows === "number") {
@@ -600,6 +659,12 @@ export async function runPiMaintainer(
     inspectBundleWindows: telemetry.bundleWindows,
     inspectFailures: telemetry.inspectFailures,
     routedSearchExpansions: telemetry.expansions,
+    floorRoutedInspectCalls: telemetry.floorRoutedInspectCalls,
+    floorScopesVisited: telemetry.floorScopesVisited,
+    floorRouteCurrentExecutions: telemetry.floorRouteCurrentExecutions,
+    floorRouteAdjacentExecutions: telemetry.floorRouteAdjacentExecutions,
+    floorRouteSharedExecutions: telemetry.floorRouteSharedExecutions,
+    floorRouteFallbackExecutions: telemetry.floorRouteFallbackExecutions,
     writeAttempts,
     writeRejected: telemetry.writeRejected,
     writeFailures: telemetry.writeFailures,
@@ -617,30 +682,28 @@ export async function runPiMaintainer(
     contextPercent: typeof contextUsage.percent === "number" ? contextUsage.percent : null,
     failureCode: runState.failureCode,
   };
-  let workflowClosure: PiRunOutcome["workflowClosure"] = {
-    applicable: true,
+  let workflowClosure = buildMaintainerWorkflowClosure({
     taskState: null,
     proposed: false,
-    executed: telemetry.writeMutations > 0,
-    writeAttempted: writeAttempts > 0,
-    retainedChanges: false,
-    verified: false,
+    writeAttempts,
+    writeMutations: telemetry.writeMutations,
+    changedPathCount: 0,
+    replayPassed: false,
     readyToApply: false,
     paused: false,
-  };
+  });
   try {
     const finalTask = await store.read(task.id);
-    workflowClosure = {
-      applicable: true,
+    workflowClosure = buildMaintainerWorkflowClosure({
       taskState: finalTask.state,
       proposed,
-      executed: finalTask.changedPaths.length > 0,
-      writeAttempted: writeAttempts > 0,
-      retainedChanges: finalTask.changedPaths.length > 0,
-      verified: finalTask.verification?.replayPassed === true,
+      writeAttempts,
+      writeMutations: telemetry.writeMutations,
+      changedPathCount: finalTask.changedPaths.length,
+      replayPassed: finalTask.verification?.replayPassed === true,
       readyToApply: finalTask.state === "ready_to_apply",
       paused: finalTask.state === "paused",
-    };
+    });
   } catch {
     runState.failureCode ??= "maintainer-state-read-failed";
   }
