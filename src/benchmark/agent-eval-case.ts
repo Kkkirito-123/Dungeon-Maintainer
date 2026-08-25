@@ -22,6 +22,9 @@ export type AgentEvalCategory =
   | "transition-death-persistence"
   | "advanced-sql-endgame";
 
+/** 真实模型游戏修复单案例允许等待的硬上限。 */
+export const GAME_REPAIR_TIMEOUT_MAX_MS = 600_000;
+
 /** 可由零模型复现器执行的固定语义动作。 */
 export type AgentEvalReproductionStep =
   | { readonly op: "go"; readonly target: "objective" | "frontier"; readonly maxSteps: number }
@@ -188,9 +191,9 @@ function parsePublicCase(value: unknown, requestedId: string): AgentEvalPublicCa
   if (
     !Number.isInteger(input.timeoutMs)
     || Number(input.timeoutMs) < 60_000
-    || Number(input.timeoutMs) > 1_800_000
+    || Number(input.timeoutMs) > GAME_REPAIR_TIMEOUT_MAX_MS
   ) {
-    throw new Error("case.json timeoutMs 必须在 1 至 30 分钟之间");
+    throw new Error("case.json timeoutMs 必须在 1 至 10 分钟之间");
   }
   const startPreset = input.startPreset === null
     ? null

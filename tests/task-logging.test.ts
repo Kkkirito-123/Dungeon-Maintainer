@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { appendEvent } from "../src/logging/events.js";
+import { EvidenceStore } from "../src/evidence/store.js";
 import {
   containsPrivateText,
   redactText,
@@ -15,7 +16,7 @@ import {
 import { TaskStore } from "../src/task/store.js";
 import { createTemporaryGitRepository } from "./testSupport.js";
 
-describe("schema v3 任务状态、迁移与审批", () => {
+describe("schema v4 任务状态、证据与审批", () => {
   it("原子持久化任务、拒绝非法迁移并只消费一次精确审批", async () => {
     const repository = await createTemporaryGitRepository({ "README.md": "test\n" });
     try {
@@ -28,8 +29,7 @@ describe("schema v3 任务状态、迁移与审批", () => {
         worktreeRoot: join(repository.temporaryRoot, "worktree"),
         piSessionDir: join(repository.temporaryRoot, "data", "tasks", "task-state", "pi"),
       });
-
-      assert.equal(task.schemaVersion, 3);
+      assert.equal(task.schemaVersion, 4);
       assert.equal(task.modelProfileId, "default");
       assert.equal(task.thinkingLevel, "off");
       assert.equal(task.writeScope.state, "unapproved");
@@ -52,7 +52,7 @@ describe("schema v3 任务状态、迁移与审批", () => {
     }
   });
 
-  it("schema v2 自动迁移并要求重新确认修改范围", async () => {
+  it("schema v2 明确拒绝恢复，不保留双写迁移分支", async () => {
     const repository = await createTemporaryGitRepository({ "README.md": "test\n" });
     try {
       const store = new TaskStore(join(repository.temporaryRoot, "data"));
@@ -72,21 +72,9 @@ describe("schema v3 任务状态、迁移与审批", () => {
       delete legacy.writeScope;
       await writeFile(taskPath, JSON.stringify(legacy, null, 2) + "\n", "utf8");
 
-      const migrated = await store.read(task.id);
-
-      assert.equal(migrated.schemaVersion, 3);
-      assert.equal(migrated.modelProfileId, "default");
-      assert.equal(migrated.thinkingLevel, "off");
-      assert.deepEqual(migrated.writeScope, {
-        state: "unapproved",
-        allowedPaths: [],
-        digest: null,
-        approvedAt: null,
-        closedAt: null,
-      });
-      assert.match(
-        await readFile(join(store.taskDir(task.id), "events.jsonl"), "utf8"),
-        /task\.migrated/u,
+      await assert.rejects(
+        store.read(task.id),
+        /请使用 start 创建 schema v4 任务/u,
       );
     } finally {
       await repository.dispose();
@@ -104,7 +92,7 @@ describe("schema v3 任务状态、迁移与审批", () => {
         JSON.stringify({ schemaVersion: 1, id: "legacy-task", state: "active" }),
         "utf8",
       );
-      await assert.rejects(store.read("legacy-task"), /旧 schema v1/u);
+      await assert.rejects(store.read("legacy-task"), /旧任务或任务记录版本|schema v4/u);
     } finally {
       await repository.dispose();
     }
@@ -155,6 +143,7 @@ describe("低敏日志与可重放语义 Trace", () => {
         worktreeRoot: join(repository.temporaryRoot, "worktree"),
         piSessionDir: join(repository.temporaryRoot, "data", "tasks", "task-reproduction", "pi"),
       });
+      const evidence = new EvidenceStore(join(repository.temporaryRoot, "data"), task);
       const trace = new SemanticTrace(2);
       trace.push({ action: "look", arguments: {}, ok: true, summary: "floor 1" });
       trace.push({
@@ -172,7 +161,7 @@ describe("低敏日志与可重放语义 Trace", () => {
       assert.deepEqual(trace.snapshot().map((entry) => entry.sequence), [2, 3]);
       assert.ok(!trace.snapshot()[0]?.summary.includes("SELECT"));
 
-      const reproduction = await saveReproduction(store, task, trace, {
+      const reproduction = await saveReproduction(store, evidence, task, trace, {
         title: "首层移动后异常",
         expected: "进入战斗",
         actual: "api_key=abcdefghijklmnop",
@@ -188,27 +177,27 @@ describe("低敏日志与可重放语义 Trace", () => {
       assert.equal(reproduction.actions.length, 2);
       assert.ok(!reproduction.actual.includes("abcdefghijklmnop"));
       assert.deepEqual(
-        (await readActiveReproduction(store, task))?.assertions,
+        (await readActiveReproduction(store, evidence, task))?.assertions,
         reproduction.assertions,
       );
 
-      const index = task.reproductions[0];
-      assert.ok(index);
-      const currentRecord = await readFile(index.path, "utf8");
+      const currentEvidence = await evidence.latest("reproduction");
+      assert.ok(currentEvidence?.artifactRef);
+      const reproductionPath = join(store.taskDir(task.id), "reproductions", reproduction.id + ".json");
+      const currentRecord = await readFile(reproductionPath, "utf8");
       await writeFile(
-        index.path,
+        reproductionPath,
         currentRecord.replace('"schemaVersion": 2', '"schemaVersion": 1'),
         "utf8",
       );
       await assert.rejects(
-        readActiveReproduction(store, task),
+        readActiveReproduction(store, evidence, task),
         /旧 schema v1 复现缺少结构化断言/u,
       );
-      await writeFile(index.path, currentRecord, "utf8");
-      index.path = join(repository.temporaryRoot, "outside.json");
-      await assert.rejects(
-        readActiveReproduction(store, task),
-        /脱离当前任务目录/u,
+      await writeFile(reproductionPath, currentRecord, "utf8");
+      assert.deepEqual(
+        (await readActiveReproduction(store, evidence, task))?.id,
+        reproduction.id,
       );
     } finally {
       await repository.dispose();

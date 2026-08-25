@@ -9,6 +9,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { GameDriver } from "../../game/driver.js";
+import type { EvidenceStore } from "../../evidence/store.js";
 import { appendEvent } from "../../logging/events.js";
 import { readActiveReproduction } from "../../repair/reproduction.js";
 import type { TaskStore } from "../../task/store.js";
@@ -18,6 +19,7 @@ import type { TaskRecord } from "../../task/types.js";
 export interface PlayCommandContext {
   task: TaskRecord;
   store: TaskStore;
+  evidence: EvidenceStore;
   ensureGame(): Promise<GameDriver>;
 }
 
@@ -41,6 +43,7 @@ export function registerPlayCommand(
       const driver = await context.ensureGame();
       const reproduction = await readActiveReproduction(
         context.store,
+        context.evidence,
         context.task,
       );
       if (reproduction) {

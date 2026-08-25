@@ -10,15 +10,18 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendEvent } from "../../logging/events.js";
+import type { EvidenceStore } from "../../evidence/store.js";
 import type { TaskStore } from "../../task/store.js";
 import type { TaskRecord } from "../../task/types.js";
 import { applyTaskPatch } from "../../workspace/apply.js";
 import { runGit } from "../../workspace/git.js";
+import { requiredApplyChecks, runCheck } from "../../workspace/check.js";
 
 /** `/apply` 所需的当前任务依赖。 */
 export interface ApplyCommandContext {
   task: TaskRecord;
   store: TaskStore;
+  evidence: EvidenceStore;
 }
 
 async function rollbackAfterSaveFailure(task: TaskRecord): Promise<void> {
@@ -82,6 +85,31 @@ export function registerApplyCommand(
         });
         commandContext.ui.notify("已取消 apply，正式仓库未变化", "info");
         return;
+      }
+
+      commandContext.ui.setWorkingMessage("正在运行应用前完整质量门…");
+      try {
+        for (const id of requiredApplyChecks(context.task.changedPaths)) {
+          const result = await runCheck(
+            context.store,
+            context.evidence,
+            context.task,
+            id,
+            commandContext.signal,
+            { preserveTaskState: true },
+          );
+          if (result.record.status !== "passed") {
+            throw new Error("应用前完整检查未通过：" + id);
+          }
+        }
+      } catch (error) {
+        commandContext.ui.notify(
+          error instanceof Error ? error.message : "应用前完整检查失败",
+          "error",
+        );
+        return;
+      } finally {
+        commandContext.ui.setWorkingMessage();
       }
 
       const previousState = context.task.state;

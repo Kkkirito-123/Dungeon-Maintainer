@@ -13,6 +13,25 @@ import type { GameDriver, ReplayResult } from "../game/driver.js";
 import type { PlayView } from "../game/protocol.js";
 import type { ReproductionRecord } from "./reproduction.js";
 
+const successfulReplayCache = new Map<string, ReplayResult>();
+
+function replayCacheKey(
+  task: TaskRecord,
+  reproduction: ReproductionRecord,
+  worktreeHash: string,
+): string {
+  return [task.id, reproduction.id, worktreeHash].join("\0");
+}
+
+/** 返回完全绑定当前任务、复现和 worktree Hash 的成功重放；失败结果永不复用。 */
+export function cachedSuccessfulReplay(
+  task: TaskRecord,
+  reproduction: ReproductionRecord,
+  worktreeHash: string,
+): ReplayResult | null {
+  return successfulReplayCache.get(replayCacheKey(task, reproduction, worktreeHash)) ?? null;
+}
+
 function visibleAssertionFailure(
   view: PlayView,
   reproduction: ReproductionRecord,
@@ -39,6 +58,18 @@ function visibleAssertionFailure(
     return "player-assertion-failed:queryAccepted";
   }
   if (
+    assertions.queryAcceptedSequence !== undefined
+    && JSON.stringify(replay.queryAcceptedSequence) !== JSON.stringify(assertions.queryAcceptedSequence)
+  ) {
+    return "player-assertion-failed:queryAcceptedSequence";
+  }
+  if (
+    assertions.queryPlanSequence !== undefined
+    && JSON.stringify(replay.queryPlanSequence) !== JSON.stringify(assertions.queryPlanSequence)
+  ) {
+    return "player-assertion-failed:queryPlanSequence";
+  }
+  if (
     assertions.terminalOpen !== undefined
     && (view.terminal !== null) !== assertions.terminalOpen
   ) {
@@ -56,6 +87,10 @@ async function reproductionAssertionFailure(
   const visibleFailure = visibleAssertionFailure(view, reproduction, replay);
   if (visibleFailure) return visibleFailure;
   const assertions = reproduction.assertions;
+  if (
+    assertions.minStageIndex !== undefined
+    && (replay.maxObservedStageIndex ?? -1) < assertions.minStageIndex
+  ) return "reproduction-assertion-failed:minStageIndex";
   if (
     assertions.advancedFromFloor === undefined
     && assertions.bossDefeated === undefined
@@ -96,6 +131,7 @@ export async function replayReproduction(
   task: TaskRecord,
   driver: GameDriver,
   reproduction: ReproductionRecord,
+  cacheWorktreeHash?: string,
 ): Promise<ReplayResult> {
   let result = await driver.reloadAndReplay(reproduction.actions);
   if (result.passed) {
@@ -113,5 +149,11 @@ export async function replayReproduction(
     actionCount: result.actionCount,
     failure: result.failure,
   });
+  if (result.passed && cacheWorktreeHash) {
+    successfulReplayCache.set(
+      replayCacheKey(task, reproduction, cacheWorktreeHash),
+      result,
+    );
+  }
   return result;
 }

@@ -59,7 +59,7 @@ pnpm benchmark -- `
 | 每个自然语言问题的输出 | ≤ 6,000 token |
 | 每个自然语言问题的工具调用 | ≤ 16 |
 | 同参数连续工具调用 | ≤ 2 |
-| 自动续跑创建 / 准入 | ≤ 4 / ≤ 4 |
+| 隐藏自动续跑创建 / 准入 | 0 / 0 |
 | 过期 continuation | 0 |
 | 终态后模型回合 / 工具调用 / token | 0 / 0 / 0 |
 | 重复 finish / 语义重复结果 | 0 / 0 |
@@ -126,6 +126,35 @@ pnpm benchmark -- game-repair `
   --timeout-ms 600000
 ```
 
+快速调试当前工作区的 Maintainer Extension 时使用通用 `maintainer-current` Profile 和
+`300000` 毫秒等待上限。它始终加载本次构建产物，后续领域工具、Prompt 和 Token
+控制更新无需新增 Profile：
+
+```powershell
+$env:MAINTAINER_MODEL='deepseek-v4-flash'
+pnpm benchmark -- game-repair `
+  --profile maintainer-current `
+  --fixture terminal-action-bug `
+  --dependency-repo "C:\path\to\select-from-dungeon" `
+  --repetition 1 `
+  --timeout-ms 300000
+```
+
+自动 Benchmark 默认使用无头 Chromium，避免每例关闭、重开可见窗口；生产 `start/resume`
+仍使用可见界面。正式矩阵使用 `600000` 毫秒硬上限，并应在同一进程显式设置
+`MAINTAINER_MODEL`。归档会保存非敏感 `modelId` 明文与模型配置哈希，不保存密钥或模型地址
+明文。若只验证当前优化版，可把矩阵 Profile 固定为 `maintainer-current`：
+
+```powershell
+$env:MAINTAINER_MODEL='deepseek-v4-flash'
+pnpm benchmark -- game-repair-matrix `
+  --profile maintainer-current `
+  --dependency-repo "C:\path\to\select-from-dungeon" `
+  --archive-root "benchmark-results\game-repair-final" `
+  --repetitions 1 `
+  --timeout-ms 600000
+```
+
 当前矩阵包含 12 个可实机复现案例：
 
 | 类别 | 案例 |
@@ -135,13 +164,19 @@ pnpm benchmark -- game-repair `
 | 传送、死亡与持久化 | `admin-floor-transition-deadlock`、`transition-lost-after-reload` |
 | 高级 SQL 与终局 | `transaction-sandbox-state-leak`、`stale-query-plan-evidence`、`duplicate-final-victory-commit` |
 
-正式比较矩阵是 `12 案例 × 原版/优化版 × 3 次 = 72 次`。先用固定的 5 案例 smoke
-验证方向，确认成功率、诊断时间、工具调用和 Token 有收益后再运行正式矩阵。Token 与工具均值
-只统计成功运行；基础设施失败单独报告，不能稀释 Agent 失败率。
+游戏修复 Benchmark 的主成功条件对两个 Profile 完全相同：初始故障 Oracle 命中、修复后 Oracle 命中、
+禁止路径未修改且 Git HEAD 未变化。`proposed/executed/verified/ready_to_apply`、暂停和超时独立报告，
+不覆盖外部功能结果；因此“功能已修复但内部闭环失败”会被明确保留，而不是误判为代码失败。案例不会在外层再次运行
+`game-test`、`game-architecture` 或 `game-build`；Maintainer 自身的 `finish(result)` 仍会按真实产品流程执行
+这些验证。三项固定检查应作为代码修改后的独立质量门禁运行一次，不计入单案例任务成功与否。
 
-真实任务报告还会输出自动续跑创建/准入/过期丢弃、终态后模型回合/工具调用/token、重复完成提交、
-语义重复结果、到方案前 inspect 次数和诊断耗时。这些指标直接对应任务编排、证据去重和诊断效率，
-不需要把提示词或工具正文写进报告。
+矩阵规模由 `--profile` 和 `--repetitions` 决定：当前优化版单次运行是 `12 × 1 = 12` 次；
+公平对比时使用 `--profile both`，每次重复是 `12 × 2 = 24` 次。正式对比可提高 repetitions，
+但 Token 与工具均值只统计成功运行；基础设施失败、超时和暂停单独报告，不能稀释 Agent 失败率。
+
+真实任务报告还会输出隐藏续跑创建/准入/过期丢弃、终态后模型回合/工具调用/token、重复完成提交、
+语义重复结果、到方案前 inspect 次数和诊断耗时。单 Agent Loop 中前三项续跑指标应恒为零；其它指标
+只用于发现重复搜索和收尾回归，不反馈控制 Agent，也不需要把提示词或工具正文写进报告。
 
 ## 推荐固定用例
 

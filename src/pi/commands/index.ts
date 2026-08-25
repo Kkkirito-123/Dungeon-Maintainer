@@ -8,6 +8,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { EvidenceStore } from "../../evidence/store.js";
 import type { GameDriver } from "../../game/driver.js";
 import type { TaskStore } from "../../task/store.js";
 import type { TaskRecord } from "../../task/types.js";
@@ -21,6 +22,7 @@ import { registerVerifyCommand } from "./verify.js";
 export interface MaintainerCommandContext {
   task: TaskRecord;
   store: TaskStore;
+  evidence: EvidenceStore;
   currentDriver(): GameDriver | null;
   ensureGame(): Promise<GameDriver>;
   closeGame(): Promise<void>;

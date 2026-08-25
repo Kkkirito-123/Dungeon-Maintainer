@@ -1,0 +1,114 @@
+{
+  "schemaVersion": 1,
+  "projectRoot": "game",
+  "layers": [
+    { "id": "contracts", "root": "game/src/contracts", "responsibility": "跨层游戏与存储契约" },
+    { "id": "application", "root": "game/src/application", "responsibility": "启动和运行时流程编排" },
+    { "id": "content", "root": "game/src/content", "responsibility": "课程、世界和物品作者内容" },
+    { "id": "domain", "root": "game/src/domain", "responsibility": "游戏规则和状态计算" },
+    { "id": "infrastructure", "root": "game/src/infrastructure", "responsibility": "SQL、存储和浏览器适配" },
+    { "id": "presentation", "root": "game/src/presentation", "responsibility": "DOM 与 Phaser 展示" },
+    { "id": "devtools", "root": "game/src/devtools", "responsibility": "仅开发态维护器桥" }
+  ],
+  "areas": [
+    {
+      "id": "content.curriculum",
+      "parentId": "content",
+      "root": "game/src/content/curriculum",
+      "responsibility": "课程、题目、提示和关卡 SQL 作者数据",
+      "notResponsibleFor": ["SQL 执行", "结果判定"],
+      "signals": ["题目", "答案", "提示", "课程", "lesson", "奖励"],
+      "neighbors": ["domain.learning", "infrastructure.sql"]
+    },
+    {
+      "id": "domain.combat",
+      "parentId": "domain",
+      "root": "game/src/domain/combat",
+      "responsibility": "战斗回合、伤害、生命、阶段和胜负规则",
+      "notResponsibleFor": ["战斗画面", "SQL 引擎"],
+      "signals": ["boss", "生命", "hp", "伤害", "战斗", "无法死亡"],
+      "neighbors": ["domain.session", "domain.learning"]
+    },
+    {
+      "id": "domain.exploration",
+      "parentId": "domain",
+      "root": "game/src/domain/exploration",
+      "responsibility": "移动、迷宫、门、区域、遭遇和导航规则",
+      "notResponsibleFor": ["地图绘制", "世界作者内容"],
+      "signals": ["移动", "门", "传送门", "区域首领", "路径", "卡住"],
+      "neighbors": ["domain.session", "domain.progression", "presentation.phaser"]
+    },
+    {
+      "id": "domain.inventory",
+      "parentId": "domain",
+      "root": "game/src/domain/inventory",
+      "responsibility": "背包、装备、掉落和战利品规则",
+      "notResponsibleFor": ["背包界面", "作者物品目录"],
+      "signals": ["奖励缺失", "掉落", "背包", "装备", "战利品"],
+      "neighbors": ["domain.session", "content.curriculum"]
+    },
+    {
+      "id": "domain.learning",
+      "parentId": "domain",
+      "root": "game/src/domain/learning",
+      "responsibility": "SQL 特征、课程锁定、结果语义和阶段推进",
+      "notResponsibleFor": ["SQLite 执行", "课程正文"],
+      "signals": ["查询通过", "判题", "课程完成", "阶段没有推进", "query"],
+      "neighbors": ["content.curriculum", "infrastructure.sql", "domain.combat"]
+    },
+    {
+      "id": "domain.progression",
+      "parentId": "domain",
+      "root": "game/src/domain/progression",
+      "responsibility": "楼层推进、Campaign、经验和通关规则",
+      "notResponsibleFor": ["楼层画面", "课程正文"],
+      "signals": ["楼层推进", "换层", "通关", "胜利提交", "transition"],
+      "neighbors": ["domain.session", "domain.exploration"]
+    },
+    {
+      "id": "domain.session",
+      "parentId": "domain",
+      "root": "game/src/domain/session",
+      "responsibility": "GameSession 状态协调、提交和快照形成",
+      "notResponsibleFor": ["DOM 渲染", "存储实现"],
+      "signals": ["状态", "刷新后", "重复提交", "commit", "reset", "快照"],
+      "neighbors": ["domain.combat", "domain.exploration", "domain.learning", "domain.progression", "infrastructure.storage"]
+    },
+    {
+      "id": "infrastructure.sql",
+      "parentId": "infrastructure",
+      "root": "game/src/infrastructure/sql",
+      "responsibility": "SQLite 查询、事务沙箱和执行计划适配",
+      "notResponsibleFor": ["课程答案", "阶段规则"],
+      "signals": ["transaction", "sandbox", "query plan", "执行计划", "sqlite", "事务"],
+      "neighbors": ["domain.learning", "content.curriculum"]
+    },
+    {
+      "id": "infrastructure.storage",
+      "parentId": "infrastructure",
+      "root": "game/src/infrastructure/storage",
+      "responsibility": "存档、迁移、IndexedDB 和刷新恢复",
+      "notResponsibleFor": ["进度规则", "存储契约"],
+      "signals": ["刷新丢失", "reload", "存档", "持久化", "迁移"],
+      "neighbors": ["domain.session"]
+    },
+    {
+      "id": "presentation.dom",
+      "parentId": "presentation",
+      "root": "game/src/presentation/dom",
+      "responsibility": "终端、按钮、面板和 DOM 交互",
+      "notResponsibleFor": ["游戏规则", "存档"],
+      "signals": ["terminal", "终端", "按钮", "界面", "action"],
+      "neighbors": ["domain.learning", "domain.session"]
+    },
+    {
+      "id": "presentation.phaser",
+      "parentId": "presentation",
+      "root": "game/src/presentation/phaser",
+      "responsibility": "Phaser 场景、世界对象和空间展示",
+      "notResponsibleFor": ["领域移动规则", "作者世界数据"],
+      "signals": ["场景", "地图显示", "世界对象", "phaser"],
+      "neighbors": ["domain.exploration", "domain.session"]
+    }
+  ]
+}

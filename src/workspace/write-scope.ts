@@ -95,7 +95,7 @@ export function assertChangedPathsWithinApprovedScope(
  * 验证单个写入目标属于当前活动白名单。
  *
  * @param task 当前任务。
- * @param path edit/write/patch 提供的项目路径。
+ * @param path write/patch 提供的项目路径。
  * @returns 规范化项目相对路径。
  * @throws 未批准、范围已关闭或路径未列入方案时拒绝。
  */

@@ -8,20 +8,53 @@
  */
 
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { lstat, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { lstat, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { readAgentEvalCase, type AgentEvalCase, type AgentEvalReproductionStep } from "./agent-eval-case.js";
+import {
+  GAME_REPAIR_TIMEOUT_MAX_MS,
+  readAgentEvalCase,
+  type AgentEvalCase,
+  type AgentEvalReproductionStep,
+} from "./agent-eval-case.js";
 import { materializeAgentEvalFixture } from "./agent-eval-fixture.js";
-import { runPiOriginal, type PiOriginalRunMetrics } from "./pi-original.js";
+import { runPiMaintainer, type PiMaintainerLiveEvent } from "./pi-maintainer.js";
+import {
+  runPiOriginal,
+  type PiRunMetrics,
+  type PiRunDiagnostics,
+  type PiWorkflowClosure,
+} from "./pi-original.js";
 import { GameBrowser } from "../game/browser.js";
 import { GameDriver } from "../game/driver.js";
 import { startGameServer, type GameServer } from "../game/server.js";
+import {
+  collectBenchmarkProvenance,
+  type BenchmarkProvenance,
+} from "./provenance.js";
+import {
+  classifyAgentEvalPlan,
+  matchesAfterOracle,
+  matchesBeforeOracle,
+  type AgentEvalOracleObservation,
+} from "./agent-eval-oracle.js";
 
 const executeFile = promisify(execFile);
+export const AGENT_EVAL_ORACLE_VERSION = "oracle-v3-exact-final-state";
+
+/** 预检成功后可供同一矩阵正式运行复用的低敏证书。 */
+export interface AgentEvalPreflightCertificate {
+  readonly schemaVersion: number;
+  readonly fixtureId: string;
+  readonly buggyHead: string;
+  readonly dependencyKey: string;
+  readonly oracleVersion: string;
+  readonly beforeOracleMatched: boolean;
+  readonly cleanAfterOracleMatched: boolean;
+}
 
 /** 依赖链接的本轮所有权。共享依赖目标永远不属于 lease。 */
 export interface AgentEvalDependencyLease {
@@ -31,10 +64,14 @@ export interface AgentEvalDependencyLease {
 
 /** 零模型预检结果；不包含 SQL、源码、模型正文或绝对临时路径。 */
 export interface AgentEvalPreflightResult {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly fixtureId: string;
   readonly status: "passed" | "failed" | "infra_error";
   readonly initialFailureMatched: boolean;
+  readonly cleanBaselineMatched: boolean;
+  readonly certificate: AgentEvalPreflightCertificate | null;
+  readonly beforeDiagnostic: AgentEvalOracleDiagnostic | null;
+  readonly cleanDiagnostic: AgentEvalOracleDiagnostic | null;
   readonly actionCount: number;
   readonly durationMs: number;
   readonly browserErrorCount: number;
@@ -52,40 +89,48 @@ export interface AgentEvalPreflightOptions {
 }
 
 /** 游戏修复 Eval 当前支持的被测 Profile。 */
-export type GameRepairEvalProfile = "pi-original";
-
-/** 单个固定检查的低敏结果。 */
-export interface AgentEvalCheckResult {
-  readonly passed: boolean;
-  readonly durationMs: number;
-}
+export type GameRepairEvalProfile = "pi-original" | "maintainer-current";
 
 /** 一次真实模型游戏修复 Eval 的统一低敏结果。 */
-export interface GameRepairEvalResultV1 {
-  readonly schemaVersion: 1;
+export interface GameRepairEvalResultV5 {
+  readonly schemaVersion: 5;
   readonly runId: string;
   readonly fixtureId: string;
   readonly profile: GameRepairEvalProfile;
   readonly repetition: number;
   readonly status: "passed" | "failed" | "infra_error";
-  readonly correctness: {
+  readonly externalCorrectness: {
     readonly initialFailureMatched: boolean;
-    readonly afterOracleMatched: boolean;
-    readonly requiredChecksPassed: boolean;
-    readonly forbiddenPathsUntouched: boolean;
-    readonly headUnchanged: boolean;
+    readonly afterOracleMatched: boolean | null;
+    readonly forbiddenPathsUntouched: boolean | null;
+    readonly headUnchanged: boolean | null;
   };
-  readonly metrics: PiOriginalRunMetrics & {
+  readonly workflowClosure: PiWorkflowClosure;
+  readonly agentOutcome: PiRunMetrics & {
     readonly totalDurationMs: number;
     readonly beforeActionCount: number;
     readonly afterActionCount: number;
     readonly browserErrorCount: number;
-    readonly requiredCheckCount: number;
-    readonly passedCheckCount: number;
-    readonly checkDurationMs: number;
     readonly changedFileCount: number;
+    readonly changedPaths: readonly string[];
+    readonly changedPathDigests: Readonly<Record<string, string | null>>;
   };
-  readonly failureCode: string | null;
+  readonly judgeOutcome: {
+    readonly status: "passed" | "failed" | "infra_error";
+    readonly externalCorrectnessPassed: boolean;
+    readonly workflowClosurePassed: boolean | null;
+  };
+  readonly modelId: string | null;
+  readonly provenance: BenchmarkProvenance | null;
+  readonly agentFailureCode: string | null;
+  readonly judgeFailureCode: string | null;
+  readonly diagnostics: {
+    readonly beforeOracle: AgentEvalOracleDiagnostic | null;
+    readonly afterOracle: AgentEvalOracleDiagnostic | null;
+    readonly lastToolName: string | null;
+    readonly lastFinishStatus: string | null;
+    readonly evidenceGraph: PiRunDiagnostics["evidenceGraph"];
+  };
   readonly archivePath: string | null;
 }
 
@@ -98,6 +143,67 @@ export interface GameRepairEvalOptions {
   readonly repetition: number;
   readonly archiveRoot?: string;
   readonly timeoutMs?: number;
+  readonly preflightCertificate?: AgentEvalPreflightCertificate;
+  /** 仅转发当前模型的可见文本和工具名，不参与判分或归档。 */
+  readonly onLiveEvent?: (event: PiMaintainerLiveEvent) => void;
+}
+
+function dependencyKey(path: string): string {
+  return createHash("sha256").update(resolve(path)).digest("hex").slice(0, 16);
+}
+
+function validPreflightCertificate(input: {
+  readonly certificate: AgentEvalPreflightCertificate;
+  readonly fixtureId: string;
+  readonly buggyHead: string;
+  readonly dependencyRepoRoot: string;
+}): boolean {
+  return input.certificate.schemaVersion === 1
+    && input.certificate.fixtureId === input.fixtureId
+    && input.certificate.buggyHead === input.buggyHead
+    && input.certificate.dependencyKey === dependencyKey(input.dependencyRepoRoot)
+    && input.certificate.oracleVersion === AGENT_EVAL_ORACLE_VERSION
+    && input.certificate.beforeOracleMatched
+    && input.certificate.cleanAfterOracleMatched;
+}
+
+/**
+ * 判定一次游戏修复是否通过外部任务 Oracle。
+ *
+ * @param input 初始故障、修复后 Oracle 与 Git 安全边界事实。
+ * @returns 仅当任务故障被复现、修复后目标满足且未改提交/禁写路径时为 true；不执行测试或构建。
+ */
+export function gameRepairExternalCorrectnessPassed(input: {
+  readonly initialFailureMatched: boolean;
+  readonly afterOracleMatched: boolean | null;
+  readonly forbiddenPathsUntouched: boolean | null;
+  readonly headUnchanged: boolean | null;
+}): boolean {
+  return input.initialFailureMatched
+    && input.afterOracleMatched === true
+    && input.forbiddenPathsUntouched === true
+    && input.headUnchanged === true;
+}
+
+/**
+ * 用同一外部结果规则判定所有 Profile；工作流闭环只保留为诊断字段。
+ *
+ * Pi 的 settled、Maintainer 的 ready_to_apply 和运行超时都不声明功能正确性。只要评测
+ * 基础设施可用，最终状态完全由外部 Oracle 与 Git 安全边界决定。
+ */
+export function gameRepairJudgeOutcome(input: {
+  readonly infrastructureFailure: boolean;
+  readonly externalCorrectnessPassed: boolean;
+  readonly workflowClosurePassed: boolean | null;
+}): GameRepairEvalResultV5["judgeOutcome"] {
+  const status = input.infrastructureFailure
+    ? "infra_error"
+    : input.externalCorrectnessPassed ? "passed" : "failed";
+  return {
+    status,
+    externalCorrectnessPassed: input.externalCorrectnessPassed,
+    workflowClosurePassed: input.workflowClosurePassed,
+  };
 }
 
 interface AgentEvalOracleRun {
@@ -105,14 +211,23 @@ interface AgentEvalOracleRun {
   readonly actionCount: number;
   readonly browserErrorCount: number;
   readonly failureCode: string | null;
+  readonly diagnostic: AgentEvalOracleDiagnostic;
 }
 
-interface AgentEvalObservation {
-  readonly ok: boolean;
-  readonly event: string;
-  readonly view: Awaited<ReturnType<GameDriver["currentView"]>>;
-  readonly judge: Awaited<ReturnType<GameDriver["judge"]>>;
+export interface AgentEvalOracleDiagnostic {
+  readonly oracle: string;
+  readonly finalStepIndex: number | null;
+  readonly finalOp: AgentEvalReproductionStep["op"] | null;
+  readonly finalFloor: number | null;
+  readonly finalMode: string | null;
+  readonly finalAdvanced: boolean | null;
+  readonly finalBossDefeated: boolean | null;
+  readonly reloadObserved: boolean;
+  readonly queryEvents: readonly string[];
+  readonly planClasses: readonly string[];
 }
+
+type AgentEvalObservation = AgentEvalOracleObservation;
 
 function safeErrorCode(error: unknown): string {
   if (!(error instanceof Error)) return "unknown-error";
@@ -174,131 +289,36 @@ async function executeStep(
   driver: GameDriver,
   step: AgentEvalReproductionStep,
   secretInputs: Readonly<Record<string, string>>,
-): Promise<{ readonly ok: boolean; readonly event: string }> {
+): Promise<{
+  readonly ok: boolean;
+  readonly event: string;
+  readonly view?: Awaited<ReturnType<GameDriver["currentView"]>>;
+}> {
   if (step.op === "go") {
     const result = await driver.go(step.target, step.maxSteps);
-    return { ok: result.ok, event: result.event };
+    return { ok: result.ok, event: result.event, view: result.view };
   }
   if (step.op === "use") {
     const result = await driver.use(step.actionId);
-    return { ok: result.ok, event: result.event };
+    return { ok: result.ok, event: result.event, view: result.view };
   }
   if (step.op === "input-sql") {
     const sql = secretInputs[step.inputRef];
     if (sql === undefined) throw new Error("复现引用的隐藏输入不存在");
     const result = await driver.inputSql(sql);
-    return { ok: result.ok, event: result.event };
+    return { ok: result.ok, event: result.event, view: result.view };
   }
   if (step.op === "query") {
     const result = await driver.query();
-    return { ok: result.ok, event: result.event };
+    return { ok: result.ok, event: result.event, view: result.view };
   }
   if (step.op === "reload") {
     await driver.beginReproduction();
     const replay = await driver.reloadAndReplay([]);
-    return { ok: replay.passed, event: replay.failure ?? "reloaded" };
+    return { ok: replay.passed, event: replay.failure ?? "reloaded", view: replay.finalView };
   }
   await new Promise<void>((resolveWait) => setTimeout(resolveWait, step.milliseconds));
   return { ok: true, event: "waited" };
-}
-
-function matchesBeforeOracle(
-  oracle: string,
-  observations: readonly AgentEvalObservation[],
-): boolean {
-  if (oracle === "terminal-action-unavailable") {
-    return observations.some((entry) => !entry.ok && entry.event === "action-not-available");
-  }
-  if (oracle === "no-failure") return observations.every((entry) => entry.ok);
-  if (oracle === "query-rejected") return observations.some((entry) => entry.event === "query-rejected");
-  if (oracle === "combat-stalled") return observations.some((entry) => (
-    entry.event === "query-accepted" && (entry.judge.stageIndex ?? 0) === 0
-  ));
-  if (oracle === "boss-stuck-one-hp") return observations.some((entry) => entry.judge.bossHp === 1);
-  if (oracle === "reward-missing") return observations.some((entry) => (entry.judge.claimableReward ?? null) === null);
-  if (oracle === "portal-blocked") return observations.some((entry) => (
-    entry.event !== "query-accepted" && entry.view.mode === "explore" && !entry.judge.advanced
-  ));
-  if (oracle === "floor-transition-stuck") return observations.some((entry) => (
-    entry.view.mode === "explore" && entry.judge.bossDefeated && !entry.judge.advanced
-  ));
-  if (oracle === "transition-stuck") return observations.some((entry) => (
-    entry.view.mode === "transition" && !entry.judge.advanced
-  ));
-  if (oracle === "boss-hp-reset") {
-    return observations.some((entry) => (
-      entry.event === "query-accepted"
-      && entry.judge.lessons === entry.judge.requiredLessons
-      && !entry.judge.bossDefeated
-      && (entry.judge.bossHp ?? 0) > 0
-    ));
-  }
-  if (oracle === "transition-lost") {
-    const transitionAt = observations.findIndex((entry) => entry.view.mode === "transition");
-    return transitionAt >= 0 && observations.slice(transitionAt + 1).some((entry) => (
-      entry.view.mode === "explore" && !entry.judge.advanced
-    ));
-  }
-  if (oracle === "sandbox-state-leaked") {
-    const queryEvents = observations.filter((entry) => entry.event.startsWith("query-"));
-    return queryEvents.some((entry) => entry.event === "query-accepted")
-      && queryEvents.some((entry) => entry.event === "query-rejected");
-  }
-  if (oracle === "stale-query-plan") return observations.some((entry) => (
-    entry.view.terminal?.plan.some((line) => line.includes("SCAN")) ?? false
-  ));
-  if (oracle === "plan-placeholder") return observations.some((entry) => (
-    entry.view.terminal?.plan.some((line) => line.includes("等待 EXPLAIN")) ?? false
-  ));
-  if (oracle === "plan-missing") return observations.some((entry) => (
-    entry.event === "query-accepted" && (entry.view.terminal?.plan.length ?? 0) === 0
-  ));
-  if (oracle === "guidance-route-missing") return observations.some((entry) => (
-    entry.judge.lessons < entry.judge.requiredLessons
-    && entry.judge.guidanceDistance === null
-  ));
-  if (oracle === "victory-count-duplicated") return observations.some((entry) => (entry.judge.victories ?? 0) > 1);
-  if (oracle === "victory-not-committed") return observations.some((entry) => entry.view.mode !== "victory");
-  throw new Error("不支持的 beforeOracle：" + oracle);
-}
-
-function matchesAfterOracle(
-  oracle: string,
-  observations: readonly AgentEvalObservation[],
-): boolean {
-  if (oracle === "terminal-action-available") {
-    return observations.some((entry) => entry.ok && entry.event === "action:terminal");
-  }
-  if (oracle === "no-failure") return observations.every((entry) => entry.ok);
-  if (oracle === "query-accepted") return observations.some((entry) => entry.event === "query-accepted");
-  if (oracle === "combat-progressed") return observations.some((entry) => (
-    entry.event === "query-accepted" && (entry.judge.stageIndex ?? 0) > 0
-  ));
-  if (oracle === "boss-defeated") return observations.some((entry) => entry.judge.bossDefeated);
-  if (oracle === "reward-available") return observations.some((entry) => (entry.judge.claimableReward ?? null) !== null);
-  if (oracle === "portal-unlocked") return observations.some((entry) => entry.view.mode === "combat");
-  if (oracle === "floor-advanced") return observations.some((entry) => entry.judge.advanced || entry.view.floor > entry.judge.floor);
-  if (oracle === "boss-hp-zero") {
-    const defeatedAt = observations.findIndex((entry) => entry.judge.bossDefeated);
-    return defeatedAt >= 0 && observations.slice(defeatedAt).every((entry) => entry.judge.bossDefeated || entry.judge.advanced);
-  }
-  if (oracle === "transition-restored") {
-    const last = observations.at(-1);
-    return Boolean(last && (last.view.mode === "transition" || last.judge.advanced));
-  }
-  if (oracle === "sandbox-isolated") {
-    const queryEvents = observations.filter((entry) => entry.event.startsWith("query-"));
-    return queryEvents.length >= 2 && queryEvents.every((entry) => entry.event === "query-accepted");
-  }
-  if (oracle === "query-plan-current") return observations.some((entry) => (
-    entry.view.terminal?.plan.some((line) => line.includes("SEARCH")) ?? false
-  ));
-  if (oracle === "guidance-route-available") return observations.some((entry) => (
-    typeof entry.judge.guidanceDistance === "number"
-  ));
-  if (oracle === "victory-count-once") return observations.some((entry) => entry.view.mode === "victory" && (entry.judge.victories ?? 0) === 1);
-  if (oracle === "victory-committed") return observations.some((entry) => entry.view.mode === "victory");
-  throw new Error("不支持的 afterOracle：" + oracle);
 }
 
 async function runBrowserOracle(input: {
@@ -323,16 +343,27 @@ async function runBrowserOracle(input: {
     const driver = new GameDriver(browser);
     await driver.beginReproduction();
     const deadline = Date.now() + input.timeoutMs;
-    for (const step of input.testCase.reproduction.steps) {
+    let reloadObserved = false;
+    for (let stepIndex = 0; stepIndex < input.testCase.reproduction.steps.length; stepIndex += 1) {
+      const step = input.testCase.reproduction.steps[stepIndex];
+      if (!step) continue;
       if (Date.now() > deadline) throw new Error("oracle-timeout");
       const result = await executeStep(
         driver,
         step,
         input.testCase.expected.secretInputs,
       );
+      if (step.op === "reload") reloadObserved = true;
+      const view = result.view ?? await driver.currentView();
       observations.push({
-        ...result,
-        view: await driver.currentView(),
+        ok: result.ok,
+        event: result.event,
+        stepIndex,
+        op: step.op,
+        isFinal: stepIndex === input.testCase.reproduction.steps.length - 1,
+        reloadObserved,
+        planClass: classifyAgentEvalPlan(view),
+        view,
         judge: await driver.judge(input.testCase.publicCase.startFloor),
       });
       actionCount += 1;
@@ -362,64 +393,24 @@ async function runBrowserOracle(input: {
     actionCount,
     browserErrorCount: browserErrors.length,
     failureCode,
+    diagnostic: (() => {
+      const final = observations.find((entry) => entry.isFinal) ?? observations.at(-1) ?? null;
+      return {
+        oracle: input.phase === "before"
+          ? input.testCase.expected.beforeOracle
+          : input.testCase.expected.afterOracle,
+        finalStepIndex: final?.stepIndex ?? null,
+        finalOp: final?.op ?? null,
+        finalFloor: final?.view.floor ?? null,
+        finalMode: final?.view.mode ?? null,
+        finalAdvanced: final?.judge.advanced ?? null,
+        finalBossDefeated: final?.judge.bossDefeated ?? null,
+        reloadObserved: final?.reloadObserved ?? false,
+        queryEvents: observations.filter((entry) => entry.op === "query").map((entry) => entry.event),
+        planClasses: observations.filter((entry) => entry.op === "query").map((entry) => entry.planClass),
+      };
+    })(),
   };
-}
-
-const CHECK_ARGUMENTS: Readonly<Record<string, readonly string[]>> = {
-  "game-test": ["test"],
-  "game-architecture": ["architecture:check"],
-  "game-build": ["build"],
-};
-
-async function runRequiredChecks(
-  repositoryRoot: string,
-  checkIds: readonly string[],
-): Promise<AgentEvalCheckResult[]> {
-  const results: AgentEvalCheckResult[] = [];
-  const pnpmCli = process.platform === "win32"
-    ? join(
-      process.env.APPDATA?.trim() || "",
-      "npm",
-      "node_modules",
-      "pnpm",
-      "bin",
-      "pnpm.cjs",
-    )
-    : null;
-  if (pnpmCli) {
-    const information = await lstat(pnpmCli);
-    if (!information.isFile()) throw new Error("pnpm-cli-unavailable");
-  }
-  for (const checkId of checkIds) {
-    const args = CHECK_ARGUMENTS[checkId];
-    const startedAt = performance.now();
-    if (!args) {
-      results.push({ passed: false, durationMs: 0 });
-      continue;
-    }
-    try {
-      await executeFile(
-        pnpmCli ? process.execPath : "pnpm",
-        [...(pnpmCli ? [pnpmCli] : []), ...args],
-        {
-        cwd: join(repositoryRoot, "game"),
-        encoding: "utf8",
-        maxBuffer: 16 * 1024 * 1024,
-        windowsHide: true,
-        },
-      );
-      results.push({
-        passed: true,
-        durationMs: Math.round(performance.now() - startedAt),
-      });
-    } catch {
-      results.push({
-        passed: false,
-        durationMs: Math.round(performance.now() - startedAt),
-      });
-    }
-  }
-  return results;
 }
 
 async function gitOutput(repositoryRoot: string, args: readonly string[]): Promise<string> {
@@ -438,6 +429,24 @@ async function changedPaths(repositoryRoot: string): Promise<string[]> {
     gitOutput(repositoryRoot, ["ls-files", "-z", "--others", "--exclude-standard"]),
   ]);
   return [...new Set((tracked + untracked).split("\0").filter(Boolean))].sort();
+}
+
+async function changedPathDigests(
+  repositoryRoot: string,
+  paths: readonly string[],
+): Promise<Record<string, string | null>> {
+  const output: Record<string, string | null> = {};
+  for (const path of paths) {
+    try {
+      output[path] = createHash("sha256")
+        .update(await readFile(join(repositoryRoot, path)))
+        .digest("hex");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") output[path] = null;
+      else throw error;
+    }
+  }
+  return output;
 }
 
 function touchesForbiddenPath(
@@ -463,7 +472,7 @@ async function writeArchive(
 
 async function writeGameRepairArchive(
   archiveRoot: string | undefined,
-  result: GameRepairEvalResultV1,
+  result: GameRepairEvalResultV5,
 ): Promise<string | null> {
   if (!archiveRoot) return null;
   const directory = resolve(archiveRoot);
@@ -480,13 +489,14 @@ async function writeGameRepairArchive(
  * 运行一轮真实模型游戏修复 Eval。
  *
  * @param options 案例、依赖来源、Profile、重复编号和低敏归档目录。
- * @returns 同时包含正确性和模型运行指标的统一成绩单；不输出 Prompt、源码、SQL 或答案。
+ * @returns 同时包含任务正确性和模型运行指标的统一成绩单；不输出 Prompt、源码、SQL 或答案。
  * @remarks 当前 `pi-original` Profile 只运行原生 Pi 工具。优化版 Profile 会在后续分支
- * 复用相同的物化、Oracle、检查和指标层，保证比较只改变 Agent 编排策略。
+ * 复用相同的物化、Oracle 和指标层，保证比较只改变 Agent 编排策略；代码检查由被测
+ * Maintainer 内部流程或独立质量门禁负责，不在外层逐案例重复执行。
  */
 export async function runGameRepairEval(
   options: GameRepairEvalOptions,
-): Promise<GameRepairEvalResultV1> {
+): Promise<GameRepairEvalResultV5> {
   const startedAt = performance.now();
   const runId = randomUUID();
   let testCase: AgentEvalCase | null = null;
@@ -494,20 +504,39 @@ export async function runGameRepairEval(
   let materializedRoot: string | null = null;
   let dependencyLease: AgentEvalDependencyLease | null = null;
   let initialFailureMatched = false;
-  let afterOracleMatched = false;
+  let afterOracleMatched: boolean | null = null;
   let browserErrorCount = 0;
   let beforeActionCount = 0;
   let afterActionCount = 0;
-  let checkDurationMs = 0;
-  let requiredCheckCount = 0;
-  let passedCheckCount = 0;
   let changedFileCount = 0;
-  let forbiddenPathsUntouched = true;
-  let headUnchanged = true;
+  let retainedChangedPaths: string[] = [];
+  let retainedChangedPathDigests: Record<string, string | null> = {};
+  let forbiddenPathsUntouched: boolean | null = null;
+  let headUnchanged: boolean | null = null;
   let agentStarted = false;
   let infrastructureFailure = false;
-  let failureCode: string | null = null;
-  let piMetrics: PiOriginalRunMetrics = {
+  let agentFailureCode: string | null = null;
+  let judgeFailureCode: string | null = null;
+  let beforeDiagnostic: AgentEvalOracleDiagnostic | null = null;
+  let afterDiagnostic: AgentEvalOracleDiagnostic | null = null;
+  let runDiagnostics: PiRunDiagnostics = {
+    lastToolName: null,
+    lastFinishStatus: null,
+    evidenceGraph: [],
+  };
+  let workflowClosure: PiWorkflowClosure = {
+    applicable: options.profile === "maintainer-current",
+    taskState: null,
+    proposed: options.profile === "maintainer-current" ? false : null,
+    executed: options.profile === "maintainer-current" ? false : null,
+    writeAttempted: options.profile === "maintainer-current" ? false : null,
+    retainedChanges: options.profile === "maintainer-current" ? false : null,
+    verified: options.profile === "maintainer-current" ? false : null,
+    readyToApply: options.profile === "maintainer-current" ? false : null,
+    paused: options.profile === "maintainer-current" ? false : null,
+  };
+  let provenance: BenchmarkProvenance | null = null;
+  let piMetrics: PiRunMetrics = {
     status: "infra_error",
     durationMs: 0,
     diagnosisMs: null,
@@ -517,7 +546,14 @@ export async function runGameRepairEval(
     readCalls: 0,
     writeCalls: 0,
     consecutiveDuplicateToolCalls: 0,
-    queuePeak: 0,
+    piMessageQueuePeak: 0,
+    taskQueuePeak: 0,
+    episodes: 0,
+    recoveries: 0,
+    inspectCalls: 0,
+    inspectExecutions: 0,
+    inspectReceiptHits: 0,
+    routedSearchExpansions: 0,
     inputTokens: 0,
     outputTokens: 0,
     cacheReadTokens: 0,
@@ -532,7 +568,10 @@ export async function runGameRepairEval(
       id: options.fixtureId,
       ...(options.fixtureRoot ? { fixtureRoot: options.fixtureRoot } : {}),
     });
-    const timeoutMs = options.timeoutMs ?? testCase.publicCase.timeoutMs;
+    const timeoutMs = Math.min(
+      options.timeoutMs ?? testCase.publicCase.timeoutMs,
+      GAME_REPAIR_TIMEOUT_MAX_MS,
+    );
     temporaryRoot = await mkdtemp(join(tmpdir(), "dungeon-game-repair-eval-"));
     materializedRoot = join(temporaryRoot, "repository");
     await materializeAgentEvalFixture({
@@ -544,105 +583,157 @@ export async function runGameRepairEval(
       repositoryRoot: materializedRoot,
       dependencyRepoRoot: options.dependencyRepoRoot,
     });
-    const before = await runBrowserOracle({
-      repositoryRoot: materializedRoot,
-      testCase,
-      phase: "before",
-      timeoutMs,
-    });
-    initialFailureMatched = before.matched;
-    beforeActionCount = before.actionCount;
-    browserErrorCount += before.browserErrorCount;
-    if (before.failureCode) {
-      infrastructureFailure = true;
-      throw new Error(before.failureCode);
-    }
-    if (!initialFailureMatched) {
-      infrastructureFailure = true;
-      throw new Error("initial-failure-not-matched");
-    }
     const baseHead = (await gitOutput(materializedRoot, ["rev-parse", "HEAD"])).trim();
+    if (options.preflightCertificate) {
+      if (!validPreflightCertificate({
+        certificate: options.preflightCertificate,
+        fixtureId: testCase.publicCase.fixtureId,
+        buggyHead: baseHead,
+        dependencyRepoRoot: options.dependencyRepoRoot,
+      })) throw new Error("preflight-certificate-mismatch");
+      initialFailureMatched = true;
+    } else {
+      const before = await runBrowserOracle({
+        repositoryRoot: materializedRoot,
+        testCase,
+        phase: "before",
+        timeoutMs,
+      });
+      initialFailureMatched = before.matched;
+      beforeDiagnostic = before.diagnostic;
+      beforeActionCount = before.actionCount;
+      browserErrorCount += before.browserErrorCount;
+      if (before.failureCode) {
+        infrastructureFailure = true;
+        throw new Error(before.failureCode);
+      }
+      if (!initialFailureMatched) {
+        infrastructureFailure = true;
+        throw new Error("initial-failure-not-matched");
+      }
+    }
+    provenance = await collectBenchmarkProvenance({
+      repositoryRoot: materializedRoot,
+      profile: options.profile,
+      publicPrompt: testCase.publicCase.prompt,
+    });
     agentStarted = true;
-    piMetrics = await runPiOriginal({
+    const commonRunOptions = {
       runId,
       repositoryRoot: materializedRoot,
       runtimeRoot: join(temporaryRoot, "pi-runtime"),
       prompt: testCase.publicCase.prompt,
       timeoutMs,
-    });
-    if (piMetrics.failureCode) failureCode = piMetrics.failureCode;
+    };
+    const profileOutcome = options.profile === "pi-original"
+      ? await runPiOriginal(commonRunOptions)
+      : await runPiMaintainer({
+          ...commonRunOptions,
+        startFloor: testCase.publicCase.startFloor,
+        startPreset: testCase.publicCase.startPreset,
+        ...(options.onLiveEvent ? { onLiveEvent: options.onLiveEvent } : {}),
+      });
+    piMetrics = profileOutcome.metrics;
+    const evaluationRoot = profileOutcome.evaluationRoot;
+    workflowClosure = profileOutcome.workflowClosure;
+    runDiagnostics = profileOutcome.diagnostics;
+    if (piMetrics.failureCode) agentFailureCode = piMetrics.failureCode;
     if (piMetrics.status === "infra_error") infrastructureFailure = true;
     const after = await runBrowserOracle({
-      repositoryRoot: materializedRoot,
+      repositoryRoot: evaluationRoot,
       testCase,
       phase: "after",
       timeoutMs,
     });
     afterOracleMatched = after.matched;
+    afterDiagnostic = after.diagnostic;
     afterActionCount = after.actionCount;
     browserErrorCount += after.browserErrorCount;
-    failureCode ??= after.failureCode;
-    const checkStartedAt = performance.now();
-    const checkResults = await runRequiredChecks(
-      materializedRoot,
-      testCase.expected.requiredChecks,
-    );
-    checkDurationMs = Math.round(performance.now() - checkStartedAt);
-    requiredCheckCount = checkResults.length;
-    passedCheckCount = checkResults.filter((entry) => entry.passed).length;
-    const paths = await changedPaths(materializedRoot);
+    if (after.failureCode) {
+      infrastructureFailure = true;
+      judgeFailureCode ??= after.failureCode;
+    }
+    const paths = await changedPaths(evaluationRoot);
     changedFileCount = paths.length;
+    retainedChangedPaths = paths;
+    retainedChangedPathDigests = await changedPathDigests(evaluationRoot, paths);
     forbiddenPathsUntouched = !touchesForbiddenPath(paths, testCase.expected.forbiddenPaths);
-    const finalHead = (await gitOutput(materializedRoot, ["rev-parse", "HEAD"])).trim();
+    const finalHead = (await gitOutput(evaluationRoot, ["rev-parse", "HEAD"])).trim();
     headUnchanged = baseHead === finalHead;
-    if (!afterOracleMatched) failureCode ??= "after-oracle-not-matched";
-    if (passedCheckCount !== requiredCheckCount) failureCode ??= "required-check-failed";
-    if (!forbiddenPathsUntouched) failureCode ??= "forbidden-path-changed";
-    if (!headUnchanged) failureCode ??= "unexpected-commit";
+    if (!afterOracleMatched) judgeFailureCode ??= "after-oracle-not-matched";
+    if (!forbiddenPathsUntouched) judgeFailureCode ??= "forbidden-path-changed";
+    if (!headUnchanged) judgeFailureCode ??= "unexpected-commit";
   } catch (error) {
     if (!agentStarted) infrastructureFailure = true;
-    failureCode ??= safeErrorCode(error);
+    judgeFailureCode ??= safeErrorCode(error);
   } finally {
     if (dependencyLease) {
       await releaseAgentEvalDependencies(dependencyLease).catch((error: unknown) => {
         infrastructureFailure = true;
-        failureCode ??= safeErrorCode(error);
+        judgeFailureCode ??= safeErrorCode(error);
       });
     }
     if (temporaryRoot) {
       await rm(temporaryRoot, { recursive: true, force: true, maxRetries: 3 })
         .catch((error: unknown) => {
           infrastructureFailure = true;
-          failureCode ??= safeErrorCode(error);
+          judgeFailureCode ??= safeErrorCode(error);
         });
     }
   }
-  const resultWithoutArchive: GameRepairEvalResultV1 = {
-    schemaVersion: 1,
+  const externalCorrectnessPassed = gameRepairExternalCorrectnessPassed({
+    initialFailureMatched,
+    afterOracleMatched,
+    forbiddenPathsUntouched,
+    headUnchanged,
+  });
+  const workflowClosurePassed = workflowClosure.applicable
+    ? workflowClosure.proposed === true
+      && workflowClosure.retainedChanges === true
+      && workflowClosure.verified === true
+      && workflowClosure.readyToApply === true
+    : null;
+  const judgeOutcome = gameRepairJudgeOutcome({
+    infrastructureFailure,
+    externalCorrectnessPassed,
+    workflowClosurePassed,
+  });
+  const resultWithoutArchive: GameRepairEvalResultV5 = {
+    schemaVersion: 5,
     runId,
     fixtureId: options.fixtureId,
     profile: options.profile,
     repetition: options.repetition,
-    status: infrastructureFailure ? "infra_error" : failureCode ? "failed" : "passed",
-    correctness: {
+    status: judgeOutcome.status,
+    externalCorrectness: {
       initialFailureMatched,
       afterOracleMatched,
-      requiredChecksPassed: requiredCheckCount === passedCheckCount,
       forbiddenPathsUntouched,
       headUnchanged,
     },
-    metrics: {
+    workflowClosure,
+    agentOutcome: {
       ...piMetrics,
       totalDurationMs: Math.round(performance.now() - startedAt),
       beforeActionCount,
       afterActionCount,
       browserErrorCount,
-      requiredCheckCount,
-      passedCheckCount,
-      checkDurationMs,
       changedFileCount,
+      changedPaths: retainedChangedPaths,
+      changedPathDigests: retainedChangedPathDigests,
     },
-    failureCode,
+    judgeOutcome,
+    modelId: provenance?.modelId ?? null,
+    provenance,
+    agentFailureCode,
+    judgeFailureCode,
+    diagnostics: {
+      beforeOracle: beforeDiagnostic,
+      afterOracle: afterDiagnostic,
+      lastToolName: runDiagnostics.lastToolName,
+      lastFinishStatus: runDiagnostics.lastFinishStatus,
+      evidenceGraph: runDiagnostics.evidenceGraph,
+    },
     archivePath: null,
   };
   const archivePath = await writeGameRepairArchive(options.archiveRoot, resultWithoutArchive)
@@ -666,8 +757,13 @@ export async function runAgentEvalPreflight(
   let temporaryRoot: string | null = null;
   let materializedRoot: string | null = null;
   let dependencyLease: AgentEvalDependencyLease | null = null;
+  let cleanDependencyLease: AgentEvalDependencyLease | null = null;
   let actionCount = 0;
   let initialFailureMatched = false;
+  let cleanBaselineMatched = false;
+  let certificate: AgentEvalPreflightCertificate | null = null;
+  let beforeDiagnostic: AgentEvalOracleDiagnostic | null = null;
+  let cleanDiagnostic: AgentEvalOracleDiagnostic | null = null;
   let failureCode: string | null = null;
   let browserErrorCount = 0;
   try {
@@ -696,11 +792,51 @@ export async function runAgentEvalPreflight(
     actionCount = oracle.actionCount;
     browserErrorCount = oracle.browserErrorCount;
     initialFailureMatched = oracle.matched;
-    failureCode = oracle.failureCode
-      ?? (initialFailureMatched ? null : "initial-failure-not-matched");
+    beforeDiagnostic = oracle.diagnostic;
+    failureCode = oracle.failureCode ?? (initialFailureMatched ? null : "initial-failure-not-matched");
+    if (!failureCode) {
+      const cleanRoot = join(temporaryRoot, "clean-repository");
+      await materializeAgentEvalFixture({
+        id: testCase.publicCase.fixtureId,
+        ...(options.fixtureRoot ? { fixtureRoot: options.fixtureRoot } : {}),
+        destination: cleanRoot,
+        variant: "clean",
+      });
+      cleanDependencyLease = await provisionAgentEvalDependencies({
+        repositoryRoot: cleanRoot,
+        dependencyRepoRoot: options.dependencyRepoRoot,
+      });
+      const cleanOracle = await runBrowserOracle({
+        repositoryRoot: cleanRoot,
+        testCase,
+        phase: "after",
+        timeoutMs,
+      });
+      actionCount += cleanOracle.actionCount;
+      browserErrorCount += cleanOracle.browserErrorCount;
+      cleanBaselineMatched = cleanOracle.matched;
+      cleanDiagnostic = cleanOracle.diagnostic;
+      failureCode = cleanOracle.failureCode ?? (cleanBaselineMatched ? null : "clean-baseline-not-matched");
+      if (!failureCode) {
+        certificate = {
+          schemaVersion: 1,
+          fixtureId: testCase.publicCase.fixtureId,
+          buggyHead: (await gitOutput(materializedRoot, ["rev-parse", "HEAD"])).trim(),
+          dependencyKey: dependencyKey(options.dependencyRepoRoot),
+          oracleVersion: AGENT_EVAL_ORACLE_VERSION,
+          beforeOracleMatched: true,
+          cleanAfterOracleMatched: true,
+        };
+      }
+    }
   } catch (error) {
     failureCode = safeErrorCode(error);
   } finally {
+    if (cleanDependencyLease) {
+      await releaseAgentEvalDependencies(cleanDependencyLease).catch((error: unknown) => {
+        failureCode ??= safeErrorCode(error);
+      });
+    }
     if (dependencyLease) {
       await releaseAgentEvalDependencies(dependencyLease).catch((error: unknown) => {
         failureCode ??= safeErrorCode(error);
@@ -712,12 +848,21 @@ export async function runAgentEvalPreflight(
     }
   }
   const resultWithoutArchive: AgentEvalPreflightResult = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     fixtureId: options.fixtureId,
     status: failureCode
-      ? (failureCode === "initial-failure-not-matched" ? "failed" : "infra_error")
+      ? (
+          failureCode === "initial-failure-not-matched"
+          || failureCode === "clean-baseline-not-matched"
+            ? "failed"
+            : "infra_error"
+        )
       : "passed",
     initialFailureMatched,
+    cleanBaselineMatched,
+    certificate,
+    beforeDiagnostic,
+    cleanDiagnostic,
     actionCount,
     durationMs: Math.round(performance.now() - startedAt),
     browserErrorCount,

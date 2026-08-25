@@ -18,6 +18,7 @@ import {
 import { TaskStore } from "../src/task/store.js";
 import {
   checkIds,
+  requiredApplyChecks,
   requiredChecks,
 } from "../src/workspace/check.js";
 import { createTaskRecordFixture } from "./testSupport.js";
@@ -59,7 +60,10 @@ class RecordingBrowser {
   goResults: PlayResult[] = [];
   transitionOnUse = false;
   terminalOpenOnUse = false;
+  failNextUseAsUnavailable = false;
+  requireOpenTerminalForInput = false;
   queryAccepted = true;
+  queryResults: PlayResult[] = [];
   inputValue = "";
   private transitionPending = false;
   private queryReady = false;
@@ -114,6 +118,10 @@ class RecordingBrowser {
 
   async use(): Promise<PlayResult> {
     this.calls.push("use");
+    if (this.failNextUseAsUnavailable) {
+      this.failNextUseAsUnavailable = false;
+      return { ...playResult("action-not-available"), ok: false };
+    }
     if (this.terminalOpenOnUse) {
       this.queryReady = true;
       return playResult("action:terminal", playView({
@@ -146,6 +154,11 @@ class RecordingBrowser {
 
   async query(): Promise<PlayResult> {
     this.calls.push("query");
+    const queued = this.queryResults.shift();
+    if (queued) {
+      this.queryReady = queued.view.mode === "combat" || queued.view.mode === "challenge";
+      return queued;
+    }
     this.queryReady = false;
     const event = this.queryAccepted ? "query-accepted" : "query-rejected";
     return {
@@ -157,6 +170,9 @@ class RecordingBrowser {
   async inputSql(sql: string): Promise<PlayResult> {
     this.calls.push("inputSql");
     this.inputValue = sql;
+    if (this.requireOpenTerminalForInput && !this.queryReady) {
+      return { ...playResult("terminal-not-open"), ok: false };
+    }
     this.queryReady = true;
     return playResult("input-accepted", playView({
       mode: "combat",
@@ -442,6 +458,59 @@ describe("浏览器检查点、刷新、恢复和语义重放", () => {
     assert.deepEqual(normalized.map((entry) => entry.ok), [true, false]);
   });
 
+  it("可重放 Trace 保留终端故障因果链，修复后会重新执行入口动作", async () => {
+    const browser = new RecordingBrowser();
+    browser.failNextUseAsUnavailable = true;
+    browser.requireOpenTerminalForInput = true;
+    const driver = new GameDriver(browser as unknown as GameBrowser);
+    await driver.beginReproduction();
+    await driver.use("interact");
+    await driver.inputSql("SELECT id FROM monsters");
+
+    const actions = replayableTraceActions(driver.trace.snapshot());
+    assert.deepEqual(actions.map((entry) => entry.action), ["use", "input-sql"]);
+    assert.deepEqual(actions.map((entry) => entry.summary.split(" ")[0]), [
+      "action-not-available",
+      "terminal-not-open",
+    ]);
+
+    browser.terminalOpenOnUse = true;
+    browser.calls.length = 0;
+    const replay = await driver.reloadAndReplay(actions);
+
+    assert.equal(replay.passed, true);
+    assert.equal(replay.actionCount, 2);
+    assert.notEqual(replay.finalView.terminal, null);
+    assert.deepEqual(browser.calls, [
+      "reload",
+      "checkpoint",
+      "look",
+      "use",
+      "look",
+      "inputSql",
+    ]);
+
+    const queryFailure = replayableTraceActions([
+      {
+        sequence: 1,
+        at: new Date(0).toISOString(),
+        action: "query",
+        arguments: {},
+        ok: false,
+        summary: "query-not-available · 终端尚未就绪",
+      },
+      {
+        sequence: 2,
+        at: new Date(1).toISOString(),
+        action: "use",
+        arguments: { actionId: "interact" },
+        ok: true,
+        summary: "action:interact · 已继续",
+      },
+    ]);
+    assert.deepEqual(queryFailure.map((entry) => entry.action), ["query", "use"]);
+  });
+
   it("终止动作进入 transition 时有限等待自动楼层切换", async () => {
     const browser = new RecordingBrowser();
     browser.transitionOnUse = true;
@@ -549,6 +618,8 @@ describe("浏览器检查点、刷新、恢复和语义重放", () => {
           floor: 1,
           mode: "combat",
           queryAccepted: true,
+          queryAcceptedSequence: [true],
+          queryPlanSequence: ["search"],
         },
         createdAt: new Date(0).toISOString(),
       };
@@ -558,10 +629,129 @@ describe("浏览器检查点、刷新、恢复和语义重放", () => {
       assert.equal(rejected.queryAccepted, false);
       assert.equal(rejected.failure, "player-assertion-failed:queryAccepted");
 
-      browser.queryAccepted = true;
+      browser.queryResults.push(playResult("query-accepted", playView({
+        mode: "combat",
+        terminal: {
+          kind: "combat",
+          title: "SELECT",
+          objective: "查询目标",
+          lessonId: "select",
+          stageId: "select-1",
+          stageIndex: 0,
+          task: null,
+          schema: ["monsters"],
+          locks: [],
+          hints: [],
+          inputSql: "",
+          status: { kind: "success", text: "答案正确" },
+          result: "",
+          plan: ["SEARCH monsters USING INDEX idx_monsters"],
+        },
+      })));
       const accepted = await replayReproduction(store, task, driver, reproduction);
       assert.equal(accepted.passed, true);
       assert.equal(accepted.queryAccepted, true);
+      assert.deepEqual(accepted.queryAcceptedSequence, [true]);
+      assert.deepEqual(accepted.queryPlanSequence, ["search"]);
+
+      browser.queryResults.push(playResult("query-accepted", playView({
+        mode: "combat",
+        terminal: {
+          kind: "combat",
+          title: "SELECT",
+          objective: "查询目标",
+          lessonId: "select",
+          stageId: "select-1",
+          stageIndex: 0,
+          task: null,
+          schema: ["monsters"],
+          locks: [],
+          hints: [],
+          inputSql: "",
+          status: { kind: "success", text: "答案正确" },
+          result: "",
+          plan: ["SCAN monsters"],
+        },
+      })));
+      const stalePlan = await replayReproduction(store, task, driver, reproduction);
+      assert.equal(stalePlan.passed, false);
+      assert.equal(stalePlan.failure, "player-assertion-failed:queryPlanSequence");
+    } finally {
+      await rm(dataRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("minStageIndex 要求战斗终端阶段至少推进到指定索引", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "maintainer-replay-stage-"));
+    try {
+      const store = new TaskStore(dataRoot);
+      const task = createTaskRecordFixture({ id: "combat-stage-stalled" });
+      const browser = new RecordingBrowser();
+      const driver = new GameDriver(browser as unknown as GameBrowser);
+      await driver.beginReproduction();
+      await driver.use("interact");
+      await driver.query();
+      await driver.query();
+      const reproduction: ReproductionRecord = {
+        schemaVersion: 2,
+        id: "combat-stage-reproduction",
+        title: "查询成功但战斗题目没有推进",
+        expected: "查询成功后战斗终端 stageIndex 至少为 1",
+        actual: "查询成功后 stageIndex 仍为 0",
+        evidence: ["玩家可见终端仍显示第一阶段"],
+        actions: driver.trace.snapshot(),
+        assertions: {
+          queryAccepted: true,
+          minStageIndex: 1,
+        },
+        createdAt: new Date(0).toISOString(),
+      };
+
+      browser.judgeResult = {
+        ...browser.judgeResult,
+        mode: "explore",
+        stageIndex: 0,
+      };
+      const stageView = (stageIndex: number): PlayView => playView({
+        mode: "combat",
+        actions: [{ id: "query", label: "提交答案" }],
+        terminal: {
+          kind: "combat",
+          title: "SELECT",
+          objective: "查询目标",
+          lessonId: "select",
+          stageId: `select-${String(stageIndex + 1)}`,
+          stageIndex,
+          task: null,
+          schema: ["monsters"],
+          locks: [],
+          hints: [],
+          inputSql: "",
+          status: { kind: "success", text: "答案正确" },
+          result: "",
+          plan: [],
+        },
+      });
+
+      browser.queryResults.push(
+        playResult("query-accepted", stageView(1)),
+        playResult("query-accepted", playView({ mode: "explore", terminal: null })),
+      );
+      const advanced = await replayReproduction(store, task, driver, reproduction);
+      assert.equal(advanced.passed, true);
+      assert.equal(advanced.maxObservedStageIndex, 1);
+      assert.equal(advanced.finalView.mode, "explore");
+      assert.ok(!browser.calls.includes("judge"));
+
+      browser.queryResults.push(
+        playResult("query-accepted", stageView(0)),
+        playResult("query-accepted", playView({ mode: "explore", terminal: null })),
+      );
+      const stalled = await replayReproduction(store, task, driver, reproduction);
+      assert.equal(stalled.passed, false);
+      assert.equal(stalled.maxObservedStageIndex, 0);
+      assert.equal(stalled.failure, "reproduction-assertion-failed:minStageIndex");
+      assert.ok(!browser.calls.includes("judge"));
     } finally {
       await rm(dataRoot, { recursive: true, force: true });
     }
@@ -604,18 +794,23 @@ describe("浏览器检查点、刷新、恢复和语义重放", () => {
 });
 
 describe("固定检查白名单", () => {
-  it("游戏源码变化固定要求测试、架构检查和生产构建", () => {
+  it("候选阶段运行相关测试，应用前再运行完整质量门", () => {
     assert.deepEqual(requiredChecks(["game/src/domain/session.ts"]), [
+      "game-related-test",
+    ]);
+    assert.deepEqual(requiredChecks(["game/tests/session.test.ts"]), ["game-related-test"]);
+    assert.deepEqual(requiredChecks([".maintainer/architecture-map.json"]), ["game-architecture"]);
+    assert.deepEqual(requiredChecks(["README.md"]), []);
+    assert.deepEqual(requiredApplyChecks(["game/src/domain/session.ts"]), [
       "game-test",
       "game-architecture",
       "game-build",
     ]);
-    assert.deepEqual(requiredChecks(["game/tests/session.test.ts"]), ["game-test"]);
-    assert.deepEqual(requiredChecks(["README.md"]), []);
     assert.deepEqual(checkIds(), [
       "rules-test",
       "rules-validate",
       "agent-test",
+      "game-related-test",
       "game-test",
       "game-architecture",
       "game-build",

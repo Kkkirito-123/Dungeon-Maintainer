@@ -10,7 +10,7 @@
  */
 
 import type { TaskRecord, TaskState } from "../task/types.js";
-import { promptTokenLimit } from "../pi/token-control.js";
+import { promptTokenLimit } from "../agent/token-control.js";
 
 /** Shell 可选择的 Pi 模型安全摘要。 */
 export interface ShellModelOption {

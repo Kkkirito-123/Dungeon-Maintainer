@@ -3,8 +3,8 @@
  *
  * 本文件只把 Pi 的严格 TypeBox 参数、方案授权和浏览器刷新顺序连接到 workspace
  * patch；真正的路径、realpath、baseHash、唯一匹配、隐私和预算校验均由安全层执行。
- * 运行时问题必须先保存复现，静态问题必须已有失败检查。写入前保留复现起点，写入后
- * 用新代码恢复检查点并重放同一语义动作。拒绝审批不会写入字节；刷新失败会保留
+ * 有活动复现时，写入前保留复现起点，写入后用新代码恢复检查点并重放同一语义动作。
+ * 静态问题无需为了取得写入资格而先制造失败检查。拒绝审批不会写入字节；刷新失败会保留
  * worktree 变化和事件证据，但正式仓库仍不受影响。模型只能在总方案已经获批后看到
  * 本工具，因此核心路径不会再弹出第二个确认框；workspace 层仍保留精确摘要与一次性
  * 消费记录，供非模型调用和安全测试使用。
@@ -16,8 +16,10 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { GameDriver, ReplayResult } from "../../game/driver.js";
+import type { EvidenceStore } from "../../evidence/store.js";
 import { appendEvent } from "../../logging/events.js";
 import { readActiveReproduction } from "../../repair/reproduction.js";
+import { replayReproduction } from "../../repair/replay.js";
 import type { TaskStore } from "../../task/store.js";
 import type { TaskRecord } from "../../task/types.js";
 import {
@@ -25,6 +27,7 @@ import {
   type PrecisePatchResult,
 } from "../../workspace/patch.js";
 import { assertWritePathAllowed } from "../../workspace/write-scope.js";
+import { hashWorktree } from "../../workspace/git.js";
 
 const PatchEditParameters = Type.Object({
   path: Type.String({ minLength: 1, maxLength: 300 }),
@@ -51,6 +54,7 @@ export interface PatchToolDetails extends PrecisePatchResult {
 export interface PatchToolContext {
   task: TaskRecord;
   store: TaskStore;
+  evidence: EvidenceStore;
   currentDriver(): GameDriver | null;
   ensureGame(): Promise<GameDriver>;
   isExecutionApproved(): boolean;
@@ -90,7 +94,7 @@ export function registerPatchTool(
     description: "在 detached worktree 中按 baseHash 做唯一文本替换或创建文本文件；最多 3 文件、累计 120 行。",
     promptSnippet: "用 patch 在隔离 worktree 做精确修改",
     promptGuidelines: [
-      "运行时问题先用 finish 保存可重放复现；静态问题先运行一次失败 check。",
+      "运行时问题优先用 finish 保存可重放复现；check 是诊断与验证证据，不是写入资格。",
       "patch 必须使用最近 inspect read 返回的 baseHash 和唯一 oldText。",
       "补丁后先观察自动刷新重放结果，再决定是否继续修改。",
     ],
@@ -102,15 +106,9 @@ export function registerPatchTool(
       }
       const reproduction = await readActiveReproduction(
         context.store,
+        context.evidence,
         context.task,
       );
-      const hasStaticFailure = context.task.checks.some(
-        (record) => record.status !== "passed",
-      );
-      if (!reproduction && !hasStaticFailure) {
-        throw new Error("patch 前必须保存运行时复现，或先取得一次失败的静态检查证据");
-      }
-
       let driver = context.currentDriver();
       if (reproduction && !driver) {
         throw new Error("活动复现的浏览器会话不可用；先执行 /play 恢复场景");
@@ -127,6 +125,7 @@ export function registerPatchTool(
       const result = await applyPrecisePatch({
         task: context.task,
         store: context.store,
+        evidence: context.evidence,
         confirmCore: async (paths, changedLines) => {
           // 总方案确认已经授权当前 Agent 运行完成其中的代码修改。patch 在诊断阶段
           // 不可见，因此这里无需为同一方案重复打断用户；未获总授权的非标准调用
@@ -144,18 +143,22 @@ export function registerPatchTool(
           await driver?.ensureReproductionCheckpoint();
         },
         afterPatch: async () => {
-          driver ??= await context.ensureGame();
           if (reproduction) {
-            replayState.current = await driver.reloadAndReplay(reproduction.actions);
+            driver ??= await context.ensureGame();
+            const replayHash = await hashWorktree(context.task.worktreeRoot);
+            replayState.current = await replayReproduction(
+              context.store,
+              context.task,
+              driver,
+              reproduction,
+              replayHash,
+            );
             if (!replayState.current.passed) {
               throw new Error(
                 "新代码刷新后的复现重放失败："
                 + (replayState.current.failure ?? "未知游戏错误"),
               );
             }
-          } else {
-            await driver.ensureReproductionCheckpoint();
-            replayState.current = await driver.reloadAndReplay([]);
           }
         },
       }, scopedInput, signal);

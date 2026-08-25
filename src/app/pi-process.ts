@@ -13,12 +13,14 @@ import { access, mkdir, open, readdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { MaintainerConfig } from "../config.js";
-import { PiRpcProcess, type PiRpcCommand } from "../pi/rpc-process.js";
+import type { AgentRpcCommand } from "../agent/rpc.js";
+import { PiRpcProcess } from "../pi/rpc-process.js";
 import { FULL_CODING_TOOLS } from "../pi/tool-policy.js";
 import { startShellServer, type ShellHandle } from "../shell/server.js";
 import type { ShellTaskSwitchRequest } from "../shell/protocol.js";
 import { TaskStore, createTaskId } from "../task/store.js";
 import type { TaskRecord } from "../task/types.js";
+import { hasTaskEvidence } from "../evidence/store.js";
 import { comparablePath } from "./path.js";
 import { pathExists } from "../workspace/git.js";
 import {
@@ -60,7 +62,7 @@ export function resolvePiCliPath(): string {
 /**
  * 构造唯一允许的 Pi CLI 参数。
  *
- * @param task 当前 schema v3 任务。
+ * @param task 当前 schema v4 任务。
  * @param config 默认 Provider 和模型配置；活动档案由 task.modelProfileId 选择。
  * @param loadedExtensionPath 编译后的维护器 Extension 路径；测试可显式注入。
  * @returns 不含 API Key 的参数数组。
@@ -86,9 +88,7 @@ export function buildPiArguments(
     "--tools",
     FULL_CODING_TOOLS.join(","),
     "--no-extensions",
-    "--no-skills",
     "--no-prompt-templates",
-    "--no-context-files",
     "-e",
     loadedExtensionPath,
     "--provider",
@@ -167,7 +167,7 @@ export class AppController {
       contextWindow: activeProfile.contextWindow,
       maxOutputTokens: activeProfile.maxOutputTokens,
       store: this.store,
-      sendPiCommand: async (command: PiRpcCommand) => await this.send(command),
+      sendPiCommand: async (command: AgentRpcCommand) => await this.send(command),
       onSwitchTask: async (request) => await this.switchTask(request),
       listModelProfiles: () => Promise.resolve(this.modelProfileSummaries()),
       saveModelProfile: async (profile, apiKey, activate) => (
@@ -320,7 +320,7 @@ export class AppController {
     return environment;
   }
 
-  private async send(command: PiRpcCommand): Promise<unknown> {
+  private async send(command: AgentRpcCommand): Promise<unknown> {
     const rpc = this.rpc;
     if (!rpc) throw new Error("Pi RPC 尚未启动");
     if (command.type === "extension_ui_response") {
@@ -429,8 +429,7 @@ export class AppController {
     const untouched = (task.state === "created" || task.state === "active")
       && task.changedPaths.length === 0
       && task.patchLines === 0
-      && task.checks.length === 0
-      && task.reproductions.length === 0
+      && !(await hasTaskEvidence(this.config.dataDir, task))
       && task.verification === null
       && task.approval === null
       && task.patchPath === null

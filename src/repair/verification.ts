@@ -1,13 +1,15 @@
 /**
  * 固定检查、浏览器重放和可应用补丁封装。
  *
- * verification 是 ready_to_apply 的唯一入口。它先确认任务存在复现用例或历史失败
- * 检查证据，再运行当前变更路径要求的固定检查；有活动复现时必须从原检查点刷新并
+ * verification 是 ready_to_apply 的唯一入口。它先运行当前变更路径要求的固定检查；
+ * 有活动复现时必须从原检查点刷新并
  * 完整重放。全部通过后才生成补丁、记录正式仓库 baseHash，并把验证绑定最终
  * worktree Hash。代码任意变化都会让 /apply 拒绝。
  */
 
 import { appendEvent } from "../logging/events.js";
+import { verificationEvidence } from "../evidence/projector.js";
+import type { EvidenceStore } from "../evidence/store.js";
 import type { TaskStore } from "../task/store.js";
 import type { TaskRecord, VerificationRecord } from "../task/types.js";
 import type { GameDriver } from "../game/driver.js";
@@ -24,7 +26,7 @@ import {
   readActiveReproduction,
   type ReproductionRecord,
 } from "./reproduction.js";
-import { replayReproduction } from "./replay.js";
+import { cachedSuccessfulReplay, replayReproduction } from "./replay.js";
 
 /** /verify 和 finish ready 的完整结果。 */
 export interface VerificationResult {
@@ -34,8 +36,7 @@ export interface VerificationResult {
 }
 
 function checksForTask(task: TaskRecord): CheckId[] {
-  const required = requiredChecks(task.changedPaths);
-  return required.length > 0 ? required : ["rules-validate"];
+  return requiredChecks(task.changedPaths);
 }
 
 /**
@@ -49,13 +50,14 @@ function checksForTask(task: TaskRecord): CheckId[] {
  */
 export async function verifyTask(
   store: TaskStore,
+  evidence: EvidenceStore,
   task: TaskRecord,
   driver: GameDriver | null,
   signal?: AbortSignal,
 ): Promise<VerificationResult> {
-  // Pi 原生 edit/write/bash 不经过 patch 工具；验证前以 Git 事实同步变化，确保固定
+  // Pi 原生 write 不经过 patch 工具；验证前以 Git 事实同步变化，确保固定
   // 检查、补丁封装和 apply 看到同一组文件，而不是依赖模型是否主动登记路径。
-  await syncWorktreeChanges(store, task, "verify");
+  await syncWorktreeChanges(store, task, "verify", evidence);
   if (task.changedPaths.length === 0) {
     throw new Error("任务 worktree 没有代码变化");
   }
@@ -69,17 +71,10 @@ export async function verifyTask(
     throw new Error("当前任务状态不能执行验证");
   }
 
-  const reproduction = await readActiveReproduction(store, task);
-  const hasStaticFailureEvidence = task.checks.some(
-    (record) => record.status !== "passed",
-  );
-  if (!reproduction && !hasStaticFailureEvidence) {
-    throw new Error("运行问题需要已保存复现；静态问题需要至少一次失败检查证据");
-  }
-
+  const reproduction = await readActiveReproduction(store, evidence, task);
   const checkIds = checksForTask(task);
   for (const id of checkIds) {
-    const result = await runCheck(store, task, id, signal);
+    const result = await runCheck(store, evidence, task, id, signal);
     if (result.record.status !== "passed") {
       throw new Error("固定检查未通过：" + id);
     }
@@ -88,14 +83,11 @@ export async function verifyTask(
   let replayPassed = true;
   const usedReproduction: ReproductionRecord | null = reproduction;
   if (usedReproduction) {
-    if (!driver) {
-      throw new Error("活动复现需要可用的游戏浏览器才能验证");
-    }
-    const replay = await replayReproduction(
-      store,
-      task,
-      driver,
-      usedReproduction,
+    const replayHash = await hashWorktree(task.worktreeRoot);
+    const cached = cachedSuccessfulReplay(task, usedReproduction, replayHash);
+    if (!cached && !driver) throw new Error("活动复现需要可用的游戏浏览器才能验证");
+    const replay = cached ?? await replayReproduction(
+      store, task, driver as GameDriver, usedReproduction, replayHash,
     );
     replayPassed = replay.passed;
     if (!replayPassed) {
@@ -126,6 +118,17 @@ export async function verifyTask(
   };
   task.verification = record;
   await store.transition(task, "ready_to_apply");
+  const activeEvidence = await evidence.active();
+  const links = activeEvidence.filter((item) => (
+    (item.kind === "change" && item.worktreeHash === worktreeHash)
+    || (item.kind === "check" && item.worktreeHash === worktreeHash)
+    || (
+      item.kind === "reproduction"
+      && usedReproduction
+      && item.metadata.reproductionId === usedReproduction.id
+    )
+  )).map((item) => item.id);
+  await evidence.capture(verificationEvidence(record, links));
   await appendEvent(store, task.id, "verification.passed", {
     worktreeHash: worktreeHash.slice(0, 12),
     checkCount: checkIds.length,

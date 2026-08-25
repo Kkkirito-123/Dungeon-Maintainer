@@ -6,12 +6,37 @@ import { describe, it } from "node:test";
 import {
   parseAgentEvalPreflightArgs,
   parseBenchmarkArgs,
+  parseBenchmarkSuiteArgs,
   parseGameRepairEvalArgs,
+  parseGameRepairMatrixArgs,
 } from "../src/benchmark/main.js";
+import {
+  GAME_REPAIR_FIXTURE_IDS,
+  gameRepairMatrixProfiles,
+  summarizeGameRepairMatrixRuns,
+} from "../src/benchmark/game-repair-matrix.js";
 import { buildPiOriginalArguments } from "../src/benchmark/pi-original.js";
+import {
+  gameRepairExternalCorrectnessPassed,
+  gameRepairJudgeOutcome,
+} from "../src/benchmark/agent-eval-runner.js";
+import {
+  benchmarkGameStartEnvironment,
+  benchmarkSettledDecision,
+  benchmarkShellEndpoint,
+  isBenchmarkExecutionApproval,
+  isBenchmarkUiRequest,
+} from "../src/benchmark/pi-maintainer.js";
+import {
+  requestWithDeadline,
+  SESSION_STATS_TIMEOUT_MS,
+} from "../src/benchmark/rpc-timeout.js";
+import { benchmarkModelFingerprint } from "../src/benchmark/provenance.js";
+import { assertFlashBenchmarkModel } from "../src/benchmark/model-policy.js";
 import { runShellBenchmark } from "../src/benchmark/shell.js";
 import { analyzeTaskBenchmark } from "../src/benchmark/task.js";
 import { metric, type BenchmarkScenario } from "../src/benchmark/types.js";
+import { resolveGameRuntimeStart } from "../src/pi/game-runtime.js";
 import { shapeModelContext } from "../src/pi/context-shaping.js";
 
 function metricValue(
@@ -22,6 +47,11 @@ function metricValue(
 }
 
 describe("Dungeon Maintainer Benchmark", () => {
+  it("真实修复评测拒绝误用 Pro，只接受 Flash modelId", () => {
+    assert.doesNotThrow(() => assertFlashBenchmarkModel("deepseek-v4-flash"));
+    assert.throws(() => assertFlashBenchmarkModel("deepseek-v4-pro"), /只允许 Flash/u);
+  });
+
   it("按方向判定机器指标并解析固定参数", () => {
     assert.equal(metric({
       name: "latency",
@@ -72,6 +102,11 @@ describe("Dungeon Maintainer Benchmark", () => {
       profile: "pi-original",
       repetition: 2,
     });
+    assert.equal(parseGameRepairEvalArgs([
+      "--profile", "maintainer-current",
+      "--fixture", "terminal-action-bug",
+      "--dependency-repo", ".",
+    ])?.profile, "maintainer-current");
     assert.throws(
       () => parseGameRepairEvalArgs([
         "--profile", "unknown",
@@ -79,6 +114,87 @@ describe("Dungeon Maintainer Benchmark", () => {
         "--dependency-repo", ".",
       ]),
       /未知 game-repair Profile/u,
+    );
+    assert.equal(parseGameRepairEvalArgs([
+      "--profile", "maintainer-current",
+      "--fixture", "terminal-action-bug",
+      "--dependency-repo", ".",
+      "--timeout-ms", "600000",
+    ])?.timeoutMs, 600_000);
+    assert.throws(
+      () => parseGameRepairEvalArgs([
+        "--profile", "maintainer-current",
+        "--fixture", "terminal-action-bug",
+        "--dependency-repo", ".",
+        "--timeout-ms", "600001",
+      ]),
+      /60000 至 600000/u,
+    );
+    assert.equal(GAME_REPAIR_FIXTURE_IDS.length, 12);
+    assert.deepEqual(parseBenchmarkSuiteArgs([
+      "--suite", "four-regressions",
+      "--dependency-repo", ".",
+      "--ui", "none",
+    ]), {
+      fixtureRoot: null,
+      dependencyRepoRoot: process.cwd(),
+      archiveRoot: resolve(process.cwd(), "benchmark-results", "flash-current"),
+      suite: "four-regressions",
+      ui: "none",
+    });
+    assert.throws(
+      () => parseBenchmarkSuiteArgs(["--suite", "custom", "--dependency-repo", "."]),
+      /未知 benchmark suite/u,
+    );
+    assert.deepEqual(parseGameRepairMatrixArgs([
+      "--dependency-repo", ".",
+      "--archive-root", "benchmark-results/final",
+      "--repetitions", "1",
+    ]), {
+      fixtureRoot: null,
+      dependencyRepoRoot: process.cwd(),
+      archiveRoot: resolve(process.cwd(), "benchmark-results", "final"),
+      timeoutMs: null,
+      repetitions: 1,
+      profile: "both",
+    });
+    assert.equal(parseGameRepairMatrixArgs([
+      "--dependency-repo", ".",
+      "--profile", "maintainer-current",
+    ])?.profile, "maintainer-current");
+    assert.equal(parseGameRepairMatrixArgs([
+      "--dependency-repo", ".",
+      "--profile", "pi-original",
+    ])?.profile, "pi-original");
+    assert.throws(
+      () => parseGameRepairMatrixArgs([
+        "--dependency-repo", ".",
+        "--profile", "unknown",
+      ]),
+      /未知 game-repair-matrix Profile/u,
+    );
+    assert.throws(
+      () => parseGameRepairMatrixArgs([
+        "--dependency-repo", ".",
+        "--timeout-ms", "600001",
+      ]),
+      /60000 至 600000/u,
+    );
+    assert.deepEqual(gameRepairMatrixProfiles("maintainer-current", 0), [
+      "maintainer-current",
+    ]);
+    assert.deepEqual(gameRepairMatrixProfiles("pi-original", 1), ["pi-original"]);
+    assert.deepEqual(gameRepairMatrixProfiles("both", 0), [
+      "maintainer-current",
+      "pi-original",
+    ]);
+    assert.deepEqual(gameRepairMatrixProfiles("both", 1), [
+      "pi-original",
+      "maintainer-current",
+    ]);
+    assert.throws(
+      () => parseGameRepairMatrixArgs(["--dependency-repo", ".", "--repetitions", "0"]),
+      /1 至 10/u,
     );
     const originalArguments = buildPiOriginalArguments({
       runId: "benchmark-run",
@@ -92,6 +208,102 @@ describe("Dungeon Maintainer Benchmark", () => {
     assert.equal(originalArguments.includes("--no-context-files"), false);
     assert.equal(originalArguments.includes("--no-skills"), false);
     assert.equal(originalArguments.includes("../src/pi/extension.js"), false);
+  });
+
+  it("矩阵以外部结果为主评分，并把暂停和超时独立诊断", () => {
+    const result = (
+      profile: "pi-original" | "maintainer-current",
+      status: "passed" | "failed" | "infra_error",
+      agentStatus: "settled" | "timeout" | "infra_error",
+      paused: boolean | null,
+    ) => ({
+      profile,
+      status,
+      agentOutcome: { status: agentStatus },
+      workflowClosure: { paused },
+    });
+    const mixed = summarizeGameRepairMatrixRuns({
+      preflightPassed: true,
+      expectedRuns: 6,
+      results: [
+        result("pi-original", "infra_error", "timeout", true),
+        result("pi-original", "failed", "timeout", true),
+        result("maintainer-current", "failed", "settled", true),
+        result("maintainer-current", "passed", "settled", false),
+        result("maintainer-current", "failed", "settled", false),
+      ],
+      runFailures: [{ profile: "pi-original" }],
+    });
+    assert.equal(mixed.status, "failed");
+    assert.deepEqual(mixed.byProfile, {
+      "pi-original": { passed: 0, failed: 1, infraError: 2 },
+      "maintainer-current": { passed: 1, failed: 2, infraError: 0 },
+    });
+    assert.deepEqual(mixed.runByProfile, {
+      "pi-original": { settled: 0, paused: 0, timeout: 1, infraError: 2 },
+      "maintainer-current": { settled: 2, paused: 1, timeout: 0, infraError: 0 },
+    });
+
+    const originalFailed = summarizeGameRepairMatrixRuns({
+      preflightPassed: true,
+      expectedRuns: 1,
+      results: [result("pi-original", "failed", "settled", null)],
+      runFailures: [],
+    });
+    assert.equal(originalFailed.status, "failed");
+
+    const allPassed = summarizeGameRepairMatrixRuns({
+      preflightPassed: true,
+      expectedRuns: 1,
+      results: [result("pi-original", "passed", "settled", null)],
+      runFailures: [],
+    });
+    assert.equal(allPassed.status, "passed");
+
+    const timeoutButFixed = summarizeGameRepairMatrixRuns({
+      preflightPassed: true,
+      expectedRuns: 1,
+      results: [result("pi-original", "passed", "timeout", null)],
+      runFailures: [],
+    });
+    assert.equal(timeoutButFixed.status, "passed");
+    assert.equal(timeoutButFixed.byProfile["pi-original"].passed, 1);
+    assert.equal(timeoutButFixed.runByProfile["pi-original"].timeout, 1);
+  });
+
+  it("游戏修复 Benchmark 只按任务 Oracle 和 Git 安全边界判定，不执行固定检查", () => {
+    const base = {
+      initialFailureMatched: true,
+      afterOracleMatched: true,
+      forbiddenPathsUntouched: true,
+      headUnchanged: true,
+    } as const;
+    assert.equal(gameRepairExternalCorrectnessPassed(base), true);
+    assert.equal(gameRepairExternalCorrectnessPassed({
+      ...base,
+      initialFailureMatched: false,
+    }), false);
+    assert.equal(gameRepairExternalCorrectnessPassed({
+      ...base,
+      afterOracleMatched: false,
+    }), false);
+    assert.equal(gameRepairExternalCorrectnessPassed({
+      ...base,
+      forbiddenPathsUntouched: false,
+    }), false);
+    assert.equal(gameRepairExternalCorrectnessPassed({
+      ...base,
+      headUnchanged: false,
+    }), false);
+    assert.deepEqual(gameRepairJudgeOutcome({
+      infrastructureFailure: false,
+      externalCorrectnessPassed: true,
+      workflowClosurePassed: false,
+    }), {
+      status: "passed",
+      externalCorrectnessPassed: true,
+      workflowClosurePassed: false,
+    });
   });
 
   it("真实 HTTP/SSE 确定性场景满足即时反馈和空答复门槛", async () => {
@@ -115,6 +327,139 @@ describe("Dungeon Maintainer Benchmark", () => {
         0,
       );
     }
+  });
+
+  it("Maintainer Benchmark 只自动响应固定审批并保留 Shell 任务令牌", () => {
+    const shellUrl = "http://127.0.0.1:43123/?taskId=benchmark-task&token=one-time-token";
+    const endpoint = new URL(benchmarkShellEndpoint(shellUrl, "/api/input"));
+    assert.equal(endpoint.pathname, "/api/input");
+    assert.equal(endpoint.searchParams.get("taskId"), "benchmark-task");
+    assert.equal(endpoint.searchParams.get("token"), "one-time-token");
+
+    const approval = {
+      type: "extension_ui_request",
+      id: "approval-1",
+      method: "confirm",
+      title: "是否执行完整修复方案",
+    };
+    assert.equal(isBenchmarkUiRequest(approval), true);
+    assert.equal(isBenchmarkExecutionApproval(approval), true);
+    assert.equal(isBenchmarkExecutionApproval({ ...approval, title: "其它确认" }), false);
+    assert.equal(isBenchmarkUiRequest({
+      type: "extension_ui_request",
+      id: "notice-1",
+      method: "notify",
+      message: "应继续转发到左侧 Shell",
+    }), false);
+    assert.equal(isBenchmarkUiRequest({ ...approval, id: null }), false);
+  });
+
+  it("Maintainer Benchmark 把 fixture 起点和无头模式严格传给游戏运行时", () => {
+    const environment = benchmarkGameStartEnvironment({
+      startFloor: 7,
+      startPreset: "f7-admin-entry",
+    });
+    assert.equal(environment.DUNGEON_MAINTAINER_BENCHMARK_HEADLESS, "1");
+    assert.deepEqual(resolveGameRuntimeStart(environment), {
+      floor: 7,
+      preset: "f7-admin-entry",
+      headless: true,
+    });
+    assert.deepEqual(resolveGameRuntimeStart({
+      DUNGEON_MAINTAINER_BENCHMARK_HEADLESS: "1",
+      DUNGEON_MAINTAINER_BENCHMARK_START_FLOOR: "8",
+      DUNGEON_MAINTAINER_BENCHMARK_START_PRESET: "f8-admin-entry",
+    }), {
+      floor: 1,
+      preset: null,
+      headless: false,
+    });
+    assert.deepEqual(resolveGameRuntimeStart({
+      DUNGEON_MAINTAINER_BENCHMARK_MODE: "1",
+      DUNGEON_MAINTAINER_BENCHMARK_HEADLESS: "0",
+      DUNGEON_MAINTAINER_BENCHMARK_START_FLOOR: "8",
+      DUNGEON_MAINTAINER_BENCHMARK_START_PRESET: "",
+    }), {
+      floor: 8,
+      preset: null,
+      headless: false,
+    });
+    assert.throws(
+      () => benchmarkGameStartEnvironment({ startFloor: 0, startPreset: null }),
+      /初始楼层/u,
+    );
+    assert.throws(
+      () => resolveGameRuntimeStart({
+        DUNGEON_MAINTAINER_BENCHMARK_MODE: "1",
+        DUNGEON_MAINTAINER_BENCHMARK_START_FLOOR: "6",
+        DUNGEON_MAINTAINER_BENCHMARK_START_PRESET: "../escape",
+      }),
+      /起点预设/u,
+    );
+    assert.throws(
+      () => resolveGameRuntimeStart({
+        DUNGEON_MAINTAINER_BENCHMARK_MODE: "1",
+        DUNGEON_MAINTAINER_BENCHMARK_HEADLESS: "yes",
+        DUNGEON_MAINTAINER_BENCHMARK_START_FLOOR: "6",
+      }),
+      /浏览器模式/u,
+    );
+  });
+
+  it("Benchmark 结果明文记录非敏感 modelId，同时保留配置哈希", () => {
+    const fingerprint = benchmarkModelFingerprint({
+      apiKey: "not-for-reporting",
+      baseUrl: "https://api.example.invalid/v1",
+      model: "deepseek-v4-flash",
+      contextWindow: 64_000,
+      maxOutputTokens: 8_192,
+      reasoning: true,
+      dataDir: resolve("benchmark-data"),
+    });
+    assert.equal(fingerprint.modelId, "deepseek-v4-flash");
+    assert.match(fingerprint.modelConfigHash, /^[0-9a-f]{64}$/u);
+    assert.deepEqual(Object.keys(fingerprint).sort(), ["modelConfigHash", "modelId"]);
+    assert.equal(JSON.stringify(fingerprint).includes("not-for-reporting"), false);
+    assert.equal(JSON.stringify(fingerprint).includes("api.example.invalid"), false);
+  });
+
+  it("Maintainer Benchmark 在首个 settled 后立即交给外部 Oracle", () => {
+    assert.deepEqual(benchmarkSettledDecision({
+      taskState: "active",
+      queueActive: 0,
+    }), { failureCode: "maintainer-agent-incomplete" });
+    assert.deepEqual(benchmarkSettledDecision({
+      taskState: "verifying",
+      queueActive: 0,
+    }), { failureCode: "maintainer-agent-incomplete" });
+    assert.deepEqual(benchmarkSettledDecision({
+      taskState: "ready_to_apply",
+      queueActive: 0,
+    }), { failureCode: null });
+    assert.deepEqual(benchmarkSettledDecision({
+      taskState: "paused",
+      queueActive: 0,
+    }), { failureCode: "maintainer-paused" });
+    assert.deepEqual(benchmarkSettledDecision({
+      taskState: "blocked",
+      queueActive: 0,
+    }), { failureCode: "maintainer-blocked" });
+  });
+
+  it("统计 RPC 超时后返回低敏 fallback，不阻塞 Benchmark 清理", async () => {
+    const startedAt = performance.now();
+    const result = await requestWithDeadline(
+      () => new Promise<string>(() => undefined),
+      10,
+      "stats-timeout",
+    );
+    assert.equal(result, "stats-timeout");
+    assert.ok(performance.now() - startedAt < SESSION_STATS_TIMEOUT_MS);
+    assert.equal(await requestWithDeadline(
+      () => { throw new Error("rpc-closed"); },
+      SESSION_STATS_TIMEOUT_MS,
+      "sync-fallback",
+    ), "sync-fallback");
   });
 
   it("只用会话元数据生成 token 与自主闭环报告", async () => {
@@ -371,7 +716,7 @@ describe("Dungeon Maintainer Benchmark", () => {
     }
   });
 
-  it("长旧工具结果之后仍保留最新游戏和源码证据", () => {
+  it("上下文整形稳定截断过长结果，并保留最新游戏和源码证据", () => {
     const oldResult = "旧诊断正文".repeat(4_000);
     const messages = [
       { role: "user", content: [{ type: "text", text: "修复默认题答案" }] },
@@ -411,6 +756,43 @@ describe("Dungeon Maintainer Benchmark", () => {
     });
     assert.ok(texts.some((text) => text.includes("最新游戏证据")));
     assert.ok(texts.some((text) => text.includes("最新源码证据")));
-    assert.ok(result.stats.omittedResults > 0 || result.stats.truncatedResults > 0);
+    assert.match(texts[1] ?? "", /工具结果稳定截断；原始字符=/u);
+    assert.equal(texts[1]?.length, 4_096);
+    assert.deepEqual(shapeModelContext(messages, {
+      perTurnCharacters: 24_576,
+      perResultCharacters: 4_096,
+    }).messages, result.messages);
+    assert.deepEqual(result.stats, {
+      omittedResults: 0,
+      truncatedResults: 1,
+      sentCharacters: 4_096
+        + "当前楼层=2；题面状态=错误；最新游戏证据".length
+        + "答案定义源码：expectedSql；最新源码证据".length,
+    });
+  });
+
+  it("工具结果总预算优先保留最新证据，旧结果只发送稳定回执", () => {
+    const messages = Array.from({ length: 6 }, (_, index) => ({
+      role: "toolResult",
+      toolCallId: "tool-" + String(index),
+      toolName: "inspect",
+      content: [{ type: "text", text: "证据" + String(index) + ":" + "x".repeat(700) }],
+    }));
+    const result = shapeModelContext(messages, {
+      perTurnCharacters: 1_500,
+      perResultCharacters: 1_000,
+    });
+    assert.ok(result.stats.omittedResults > 0);
+    assert.ok(result.stats.sentCharacters <= 1_500);
+    const oldest = result.messages[0]?.content;
+    assert.ok(Array.isArray(oldest));
+    assert.match(oldest[0]?.text ?? "", /TOOL_RESULT_RECEIPT/u);
+    const latest = result.messages.at(-1)?.content;
+    assert.ok(Array.isArray(latest));
+    assert.match(latest[0]?.text ?? "", /证据5/u);
+    assert.deepEqual(shapeModelContext(messages, {
+      perTurnCharacters: 1_500,
+      perResultCharacters: 1_000,
+    }).messages, result.messages);
   });
 });

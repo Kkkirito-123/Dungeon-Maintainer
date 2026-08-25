@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { describe, it } from "node:test";
+
+async function typescriptFiles(directory: URL): Promise<URL[]> {
+  const output: URL[] = [];
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const url = new URL(entry.name + (entry.isDirectory() ? "/" : ""), directory);
+    if (entry.isDirectory()) output.push(...await typescriptFiles(url));
+    else if (entry.isFile() && entry.name.endsWith(".ts")) output.push(url);
+  }
+  return output;
+}
 
 describe("V1 启动与 Extension 职责分区", () => {
   it("app.ts 保持兼容门面，启动副作用归属 src/app 专用模块", async () => {
@@ -42,12 +52,46 @@ describe("V1 启动与 Extension 职责分区", () => {
       new URL("../../src/pi/game-runtime.ts", import.meta.url),
       "utf8",
     );
+    const toolIndex = await readFile(
+      new URL("../../src/pi/tools/index.ts", import.meta.url),
+      "utf8",
+    );
 
     assert.match(extension, /new DungeonGameRuntime/u);
     assert.match(extension, /registerSessionPolicyHooks/u);
     assert.doesNotMatch(extension, /startGameServer\(/u);
     assert.doesNotMatch(extension, /realpath\(/u);
+    assert.doesNotMatch(extension, /task-queue|readDiagnosticEvidence|buildEvidenceCard/u);
+    assert.doesNotMatch(extension, /triggerTurn\s*:\s*true/u);
+    assert.doesNotMatch(extension, /transition\(task,\s*"paused"/u);
+    assert.doesNotMatch(toolIndex, /registerEvidenceTool/u);
     assert.match(sessionPolicy, /session_before_switch/u);
     assert.match(gameRuntime, /startGameServer\(/u);
+  });
+
+  it("领域与交互层只依赖中立能力，不反向导入 Pi Adapter", async () => {
+    const layerDirectories = [
+      "agent",
+      "evidence",
+      "game",
+      "inspection",
+      "logging",
+      "repair",
+      "settings",
+      "shell",
+      "task",
+      "workspace",
+    ];
+    for (const directory of layerDirectories) {
+      const files = await typescriptFiles(new URL("../../src/" + directory + "/", import.meta.url));
+      for (const file of files) {
+        const source = await readFile(file, "utf8");
+        assert.doesNotMatch(
+          source,
+          /(?:from\s+|import\s*\()["'][^"']*(?:^|\/)pi\/|@earendil-works\/pi-/mu,
+          "中立层不能依赖 Pi Adapter：" + file.pathname,
+        );
+      }
+    }
   });
 });

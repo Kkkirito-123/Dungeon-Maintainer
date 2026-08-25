@@ -17,6 +17,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint \"src/**/*.ts\" \"tests/**/*.ts\"",
     "test": "pnpm build && node --test \"dist/tests/*.test.js\"",
+    "test:smoke": "pnpm build && node --test dist/tests/evidence-smoke.test.js dist/tests/loop-guard.test.js",
     "check": "pnpm lint && pnpm typecheck && pnpm test",
     "benchmark": "pnpm build && node dist/src/benchmark/main.js"
   },

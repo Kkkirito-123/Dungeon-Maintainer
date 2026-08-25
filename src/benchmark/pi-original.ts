@@ -17,9 +17,12 @@ import { loadConfig, requireApiKey } from "../config.js";
 import { resolvePiCliPath } from "../app/pi-process.js";
 import { PiRpcProcess } from "../pi/rpc-process.js";
 import { PI_ORIGINAL_PROVIDER_ID } from "./pi-original-extension.js";
+import { requestWithDeadline, SESSION_STATS_TIMEOUT_MS } from "./rpc-timeout.js";
+import { assertFlashBenchmarkModel } from "./model-policy.js";
+import type { TaskState } from "../task/types.js";
 
-/** 原版 Pi 单次运行的低敏指标。 */
-export interface PiOriginalRunMetrics {
+/** 所有真实 Pi Profile 共享的低敏运行指标。 */
+export interface PiRunMetrics {
   readonly status: "settled" | "timeout" | "infra_error";
   readonly durationMs: number;
   readonly diagnosisMs: number | null;
@@ -29,7 +32,22 @@ export interface PiOriginalRunMetrics {
   readonly readCalls: number;
   readonly writeCalls: number;
   readonly consecutiveDuplicateToolCalls: number;
-  readonly queuePeak: number;
+  /** Pi 内部 steering/follow-up 消息队列峰值。 */
+  readonly piMessageQueuePeak: number;
+  /** 外层 Episode 任务队列峰值；原版没有该队列。 */
+  readonly taskQueuePeak: number;
+  /** 当前请求产生的 Episode 数。 */
+  readonly episodes: number;
+  /** 当前请求产生的 recover Episode 数。 */
+  readonly recoveries: number;
+  /** inspect 工具调用数；原版工具面没有 inspect。 */
+  readonly inspectCalls: number;
+  /** inspect 中真正执行文件系统或 rg 的次数。 */
+  readonly inspectExecutions: number;
+  /** inspect 因相同有效版本只返回短回执的次数。 */
+  readonly inspectReceiptHits: number;
+  /** 区域搜索从主区域扩展到相邻区域或仓库的次数。 */
+  readonly routedSearchExpansions: number;
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly cacheReadTokens: number;
@@ -39,6 +57,45 @@ export interface PiOriginalRunMetrics {
   readonly contextPercent: number | null;
   readonly failureCode: string | null;
 }
+
+/** Profile 自身能证明的工作流闭环；原版没有 Maintainer 结构化状态。 */
+export interface PiWorkflowClosure {
+  readonly applicable: boolean;
+  readonly taskState: TaskState | null;
+  readonly proposed: boolean | null;
+  readonly executed: boolean | null;
+  /** 是否至少尝试过模型写入；与最终是否保留变更分开。 */
+  readonly writeAttempted: boolean | null;
+  /** Agent 结束时 worktree 是否仍保留实际代码变化。 */
+  readonly retainedChanges: boolean | null;
+  readonly verified: boolean | null;
+  readonly readyToApply: boolean | null;
+  readonly paused: boolean | null;
+}
+
+/** 不含工具正文、Prompt、源码或 SQL 的运行收尾诊断。 */
+export interface PiRunDiagnostics {
+  readonly lastToolName: string | null;
+  readonly lastFinishStatus: string | null;
+  readonly evidenceGraph: readonly {
+    readonly id: string;
+    readonly kind: string;
+    readonly status: string;
+    readonly links: readonly string[];
+    readonly worktreeHash: string | null;
+  }[];
+}
+
+/** 单次 Profile 执行结果；evaluationRoot 仅供同进程判卷，不写入公开报告。 */
+export interface PiRunOutcome {
+  readonly metrics: PiRunMetrics;
+  readonly evaluationRoot: string;
+  readonly workflowClosure: PiWorkflowClosure;
+  readonly diagnostics: PiRunDiagnostics;
+}
+
+/** 兼容既有调用方的原版 Pi 指标名称。 */
+export type PiOriginalRunMetrics = PiRunMetrics;
 
 /** 原版 Pi 单次运行参数。 */
 export interface PiOriginalRunOptions {
@@ -128,7 +185,7 @@ export function buildPiOriginalArguments(options: {
  */
 export async function runPiOriginal(
   options: PiOriginalRunOptions,
-): Promise<PiOriginalRunMetrics> {
+): Promise<PiRunOutcome> {
   const startedAt = performance.now();
   const repositoryRoot = resolve(options.repositoryRoot);
   const runtimeRoot = resolve(options.runtimeRoot);
@@ -139,6 +196,7 @@ export async function runPiOriginal(
     mkdir(configDirectory, { recursive: true }),
   ]);
   const config = loadConfig();
+  assertFlashBenchmarkModel(config.model);
   const apiKey = requireApiKey(config);
   let turns = 0;
   let toolCalls = 0;
@@ -153,6 +211,7 @@ export async function runPiOriginal(
   };
   let failureCode: string | null = null;
   let previousToolSignature: string | null = null;
+  let lastToolName: string | null = null;
   let resolveSettled: () => void = () => undefined;
   const settledPromise = new Promise<void>((resolvePromise) => {
     resolveSettled = resolvePromise;
@@ -189,6 +248,7 @@ export async function runPiOriginal(
       }
       if (value.type === "tool_execution_start") {
         const toolName = typeof value.toolName === "string" ? value.toolName : "unknown";
+        lastToolName = toolName;
         const signature = toolName + ":" + canonical(value.args);
         if (signature === previousToolSignature) duplicateCalls += 1;
         previousToolSignature = signature;
@@ -226,9 +286,11 @@ export async function runPiOriginal(
       failureCode = "agent-timeout";
       await rpc.send({ type: "abort" }).catch(() => undefined);
     }
-    if (completed) {
-      stats = record(await rpc.send({ type: "get_session_stats" })) ?? {};
-    }
+    stats = record(await requestWithDeadline(
+      () => rpc.send({ type: "get_session_stats" }),
+      SESSION_STATS_TIMEOUT_MS,
+      null,
+    )) ?? {};
   } catch (error) {
     failureCode ??= safeFailureCode(error);
   } finally {
@@ -238,7 +300,7 @@ export async function runPiOriginal(
   }
   const tokens = stats.tokens ?? {};
   const contextUsage = stats.contextUsage ?? {};
-  return {
+  const metrics: PiRunMetrics = {
     status: runtimeState.settled && !failureCode
       ? "settled"
       : failureCode === "agent-timeout" ? "timeout" : "infra_error",
@@ -252,7 +314,14 @@ export async function runPiOriginal(
     readCalls,
     writeCalls,
     consecutiveDuplicateToolCalls: duplicateCalls,
-    queuePeak,
+    piMessageQueuePeak: queuePeak,
+    taskQueuePeak: 0,
+    episodes: 0,
+    recoveries: 0,
+    inspectCalls: 0,
+    inspectExecutions: 0,
+    inspectReceiptHits: 0,
+    routedSearchExpansions: 0,
     inputTokens: tokens.input ?? 0,
     outputTokens: tokens.output ?? 0,
     cacheReadTokens: tokens.cacheRead ?? 0,
@@ -261,5 +330,25 @@ export async function runPiOriginal(
     contextTokens: typeof contextUsage.tokens === "number" ? contextUsage.tokens : null,
     contextPercent: typeof contextUsage.percent === "number" ? contextUsage.percent : null,
     failureCode,
+  };
+  return {
+    metrics,
+    evaluationRoot: repositoryRoot,
+    workflowClosure: {
+      applicable: false,
+      taskState: null,
+      proposed: null,
+      executed: null,
+      writeAttempted: null,
+      retainedChanges: null,
+      verified: null,
+      readyToApply: null,
+      paused: null,
+    },
+    diagnostics: {
+      lastToolName,
+      lastFinishStatus: null,
+      evidenceGraph: [],
+    },
   };
 }

@@ -1,9 +1,9 @@
 /**
- * schema v3 任务状态和本地持久化。
+ * schema v4 任务状态和本地持久化。
  *
  * TaskStore 是任务事实的唯一写入口：task.json 使用临时文件加原子替换，
  * events.jsonl 只追加低敏元数据。它不执行 Git、浏览器或 Pi，也不读取目标仓库。
- * 旧 schema v1 明确拒绝恢复，避免在重构期引入隐藏兼容分支。
+ * 旧 schema v1-v3 明确拒绝恢复；EvidenceStore 上线后不保留双写迁移分支。
  *
  * 重要失败模式：非法任务 ID、非法状态迁移、旧 schema 或损坏 JSON 都会在产生
  * 副作用前抛错。批准记录只保存摘要，不保存补丁正文或用户确认内容。
@@ -38,9 +38,10 @@ function normalizeTaskDisplayName(value: unknown): string {
 
 const TRANSITIONS: Readonly<Record<TaskState, readonly TaskState[]>> = {
   created: ["active", "blocked", "discarded"],
-  active: ["awaiting_approval", "verifying", "blocked", "discarded"],
+  active: ["awaiting_approval", "verifying", "paused", "blocked", "discarded"],
   awaiting_approval: ["active", "blocked", "discarded"],
-  verifying: ["active", "ready_to_apply", "blocked", "discarded"],
+  verifying: ["active", "paused", "ready_to_apply", "blocked", "discarded"],
+  paused: ["active", "blocked", "discarded"],
   ready_to_apply: ["active", "applied", "blocked", "discarded"],
   applied: [],
   blocked: ["active", "discarded"],
@@ -81,7 +82,7 @@ export class TaskStore {
   }
 
   /**
-   * 创建并持久化 schema v3 任务。
+   * 创建并持久化 schema v4 任务。
    *
    * @param input 已经创建好 detached worktree 的任务基础信息。
    * @returns 状态为 created 的完整任务。
@@ -97,7 +98,7 @@ export class TaskStore {
   ): Promise<TaskRecord> {
     const now = new Date().toISOString();
     const task: TaskRecord = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       id: input.id,
       displayName: input.displayName
         ? normalizeTaskDisplayName(input.displayName)
@@ -125,15 +126,11 @@ export class TaskStore {
       changedPaths: [],
       patchLines: 0,
       baseHashes: {},
-      checks: [],
-      reproductions: [],
-      activeReproductionId: null,
       verification: null,
       approval: null,
       patchPath: null,
       reversePatchPath: null,
       appliedHashes: {},
-      conclusion: null,
     };
     await this.save(task);
     await this.append(task.id, {
@@ -148,8 +145,8 @@ export class TaskStore {
    * 读取并验证任务。
    *
    * @param taskId 要恢复的任务 ID。
-   * @returns schema v3 任务记录；v2 会在原路径原子迁移。
-   * @throws v1 任务、损坏 JSON、ID 不匹配或状态非法时拒绝。
+   * @returns schema v4 任务记录。
+   * @throws 旧任务、损坏 JSON、ID 不匹配或状态非法时拒绝。
    */
   async read(taskId: string): Promise<TaskRecord> {
     const path = join(this.taskDir(taskId), "task.json");
@@ -158,16 +155,13 @@ export class TaskStore {
       throw new Error("任务记录不是有效对象");
     }
     const record = value as Record<string, unknown>;
-    if (record.schemaVersion === 1) {
-      throw new Error("旧 schema v1 任务不能恢复；请使用 start 创建 V1 Pi 任务");
-    }
     if (
-      (record.schemaVersion !== 2 && record.schemaVersion !== 3)
+      record.schemaVersion !== 4
       || record.id !== taskId
       || typeof record.state !== "string"
       || !Object.hasOwn(TRANSITIONS, record.state)
     ) {
-      throw new Error("任务记录版本、ID 或状态非法");
+      throw new Error("旧任务或任务记录版本、ID、状态非法；请使用 start 创建 schema v4 任务");
     }
     const task = value as unknown as TaskRecord;
     let needsSave = false;
@@ -181,30 +175,7 @@ export class TaskStore {
     } else {
       task.displayName = normalizeTaskDisplayName(record.displayName);
     }
-    // 早期 schema v2 任务没有来源快照字段；保持其原有“正式仓库必须干净”语义，
-    // 不能凭空把恢复时的工作区状态认作启动基线。
-    if (typeof record.sourceBranch !== "string") task.sourceBranch = "(legacy)";
-    if (typeof record.sourceDirtyFiles !== "number") task.sourceDirtyFiles = 0;
-    if (typeof record.sourceSnapshotHash !== "string") task.sourceSnapshotHash = null;
-    if (record.schemaVersion === 2) {
-      task.schemaVersion = 3;
-      task.modelProfileId = "default";
-      task.thinkingLevel = "off";
-      task.writeScope = {
-        state: "unapproved",
-        allowedPaths: [],
-        digest: null,
-        approvedAt: null,
-        closedAt: null,
-      };
-      needsSave = true;
-      await this.save(task);
-      await this.append(task.id, {
-        at: task.updatedAt,
-        type: "task.migrated",
-        detail: { from: 2, to: 3 },
-      });
-    } else if (needsSave) {
+    if (needsSave) {
       await this.save(task);
     }
     return task;

@@ -15,6 +15,7 @@ import type { TaskRecord, TaskState } from "../task/types.js";
 import { runGitRaw } from "./git.js";
 import { classifyPath, normalizeProjectPath } from "./policy.js";
 import { hasActiveWriteScope } from "./write-scope.js";
+import { EvidenceStore } from "../evidence/store.js";
 
 /** Shell 左侧显示的合法 Git 来源工作树。 */
 export interface RepositoryWorktreeSummary {
@@ -179,6 +180,7 @@ export async function listRecoverableTasks(
  */
 export async function readWorkspaceTree(
   task: TaskRecord,
+  dataDir: string,
 ): Promise<WorkspaceFileSummary[]> {
   const raw = await runGitRaw(task.worktreeRoot, [
     "ls-files",
@@ -190,7 +192,8 @@ export async function readWorkspaceTree(
   const paths = [...new Set(raw.split("\0").filter(Boolean).map(normalizeProjectPath))]
     .sort()
     .slice(0, 4_000);
-  const lastCheck = task.checks.at(-1);
+  const evidence = new EvidenceStore(dataDir, task);
+  const lastCheck = (await evidence.checks()).at(-1);
   const validation = task.verification?.replayPassed
     ? "passed"
     : lastCheck && lastCheck.status !== "passed" ? "failed" : "not_run";

@@ -3,6 +3,8 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { loadConfig } from "../src/config.js";
+import { EvidenceStore } from "../src/evidence/store.js";
+import { checkEvidence } from "../src/evidence/projector.js";
 import { startShellServer } from "../src/shell/server.js";
 import { TaskStore } from "../src/task/store.js";
 import { INITIAL_TASK_OBJECTIVE } from "../src/task/types.js";
@@ -591,14 +593,15 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
       });
       await store.approveWriteScope(task, ["game/src/fix.ts"], "catalog-scope");
       task.changedPaths = ["game/src/fix.ts"];
-      task.checks.push({
+      const evidence = new EvidenceStore(dataDir, task);
+      await evidence.capture(checkEvidence({
         id: "game-test",
         worktreeHash: "catalog-test",
         status: "failed",
         durationMs: 1,
         logPath: join(store.taskDir(task.id), "checks", "game-test.log"),
         savedAt: new Date().toISOString(),
-      });
+      }));
       await store.save(task);
       const recoverable = await store.create({
         id: "shell-catalog-recoverable",

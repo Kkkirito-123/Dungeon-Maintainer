@@ -88,7 +88,7 @@ export async function readTestFile(path: string): Promise<string> {
 }
 
 /**
- * 创建不触发文件副作用的完整 schema v3 任务对象。
+ * 创建不触发文件副作用的完整 schema v4 任务对象。
  *
  * @param overrides 需要覆盖的精确字段。
  * @returns 适合纯函数或参数构造测试的任务记录。
@@ -98,7 +98,7 @@ export function createTaskRecordFixture(
 ): TaskRecord {
   const now = new Date(0).toISOString();
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     id: "task-fixture",
     displayName: "测试任务",
     objective: "定位并修复测试问题",
@@ -124,15 +124,11 @@ export function createTaskRecordFixture(
     changedPaths: [],
     patchLines: 0,
     baseHashes: {},
-    checks: [],
-    reproductions: [],
-    activeReproductionId: null,
     verification: null,
     approval: null,
     patchPath: null,
     reversePatchPath: null,
     appliedHashes: {},
-    conclusion: null,
     ...overrides,
   };
 }
