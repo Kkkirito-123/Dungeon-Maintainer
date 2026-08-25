@@ -1,5 +1,7 @@
 # Dungeon Maintainer Benchmark
 
+历史真实模型结果与原始归档校验值见 [BENCHMARK-HISTORY.md](./BENCHMARK-HISTORY.md)。
+
 这个基准回答三个问题：用户是否立刻收到反馈、专用游戏控制面能否自主闭环、真实 Pi
 会话是否在缓存和 token 预算内完成修复。报告只包含数值和布尔结果，不包含提示正文、
 模型回复、源码、SQL、地图、存档或密钥。
