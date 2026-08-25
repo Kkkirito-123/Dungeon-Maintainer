@@ -46,8 +46,22 @@ export interface PiRunMetrics {
   readonly inspectExecutions: number;
   /** inspect 因相同有效版本只返回短回执的次数。 */
   readonly inspectReceiptHits: number;
+  /** 真正执行的一次性源码 bundle 数。 */
+  readonly inspectBundles: number;
+  /** bundle 实际返回的源码窗口总数。 */
+  readonly inspectBundleWindows: number;
+  /** inspect 执行失败或被循环门禁阻止的次数。 */
+  readonly inspectFailures: number;
   /** 区域搜索从主区域扩展到相邻区域或仓库的次数。 */
   readonly routedSearchExpansions: number;
+  readonly writeAttempts: number;
+  readonly writeRejected: number;
+  readonly writeFailures: number;
+  readonly writeNoops: number;
+  readonly writeMutations: number;
+  readonly writeReplayFailures: number;
+  readonly loopGuardBlocks: number;
+  readonly telemetryParseErrors: number;
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly cacheReadTokens: number;
@@ -321,7 +335,18 @@ export async function runPiOriginal(
     inspectCalls: 0,
     inspectExecutions: 0,
     inspectReceiptHits: 0,
+    inspectBundles: 0,
+    inspectBundleWindows: 0,
+    inspectFailures: 0,
     routedSearchExpansions: 0,
+    writeAttempts: writeCalls,
+    writeRejected: 0,
+    writeFailures: 0,
+    writeNoops: 0,
+    writeMutations: writeCalls,
+    writeReplayFailures: 0,
+    loopGuardBlocks: 0,
+    telemetryParseErrors: 0,
     inputTokens: tokens.input ?? 0,
     outputTokens: tokens.output ?? 0,
     cacheReadTokens: tokens.cacheRead ?? 0,

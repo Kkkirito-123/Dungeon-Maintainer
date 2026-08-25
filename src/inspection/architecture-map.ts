@@ -11,6 +11,7 @@ import { isAbsolute, relative, resolve } from "node:path";
 const ARCHITECTURE_MAP_PATH = ".maintainer/architecture-map.json";
 const ID_PATTERN = /^[a-z][a-z0-9-]*$/u;
 const AREA_ID_PATTERN = /^[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*)+$/u;
+const PARTITION_ID_PATTERN = /^[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*){2,}$/u;
 
 export interface ArchitectureLayer {
   id: string;
@@ -28,14 +29,19 @@ export interface ArchitectureArea {
   neighbors: string[];
 }
 
+export type ArchitecturePartition = ArchitectureArea;
+
 export interface ArchitectureMap {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   projectRoot: "game";
   layers: ArchitectureLayer[];
   areas: ArchitectureArea[];
+  partitions: ArchitecturePartition[];
 }
 
 export interface ArchitectureRoute {
+  primaryPartitions: ArchitecturePartition[];
+  neighborPartitions: ArchitecturePartition[];
   primaryAreas: ArchitectureArea[];
   neighborAreas: ArchitectureArea[];
   matchedSignals: string[];
@@ -97,10 +103,14 @@ async function parseArchitectureMap(
   repositoryRoot: string,
   value: unknown,
 ): Promise<ArchitectureMap> {
+  const schemaVersion = plainObject(value) ? value.schemaVersion : null;
+  const expectedKeys = schemaVersion === 2
+    ? ["schemaVersion", "projectRoot", "layers", "areas", "partitions"]
+    : ["schemaVersion", "projectRoot", "layers", "areas"];
   if (
     !plainObject(value)
-    || !exactKeys(value, ["schemaVersion", "projectRoot", "layers", "areas"])
-    || value.schemaVersion !== 1
+    || !exactKeys(value, expectedKeys)
+    || (schemaVersion !== 1 && schemaVersion !== 2)
     || value.projectRoot !== "game"
     || !Array.isArray(value.layers)
     || !Array.isArray(value.areas)
@@ -108,8 +118,9 @@ async function parseArchitectureMap(
     || value.layers.length > 16
     || value.areas.length === 0
     || value.areas.length > 64
+    || (schemaVersion === 2 && (!Array.isArray(value.partitions) || value.partitions.length > 64))
   ) {
-    throw new Error("架构地图不是受支持的 schema v1");
+    throw new Error("架构地图不是受支持的 schema v1/v2");
   }
 
   const layerIds = new Set<string>();
@@ -180,11 +191,71 @@ async function parseArchitectureMap(
       throw new Error("area.neighbors 包含未知或自身区域：" + area.id);
     }
   }
+  const rawPartitions: ArchitecturePartition[] = [];
+  const partitionIds = new Set<string>();
+  const partitionRoots = new Set<string>();
+  const partitionEntries = schemaVersion === 2 && Array.isArray(value.partitions)
+    ? value.partitions
+    : [];
+  for (const [index, entry] of partitionEntries.entries()) {
+    if (
+      !plainObject(entry)
+      || !exactKeys(entry, [
+        "id",
+        "parentId",
+        "root",
+        "responsibility",
+        "notResponsibleFor",
+        "signals",
+        "neighbors",
+      ])
+    ) {
+      throw new Error("partitions[" + String(index) + "] 字段非法");
+    }
+    const id = boundedLine(entry.id, "partition.id", 100);
+    const parentId = boundedLine(entry.parentId, "partition.parentId", 80);
+    const parent = rawAreas.find((area) => area.id === parentId);
+    if (!PARTITION_ID_PATTERN.test(id) || partitionIds.has(id) || !parent) {
+      throw new Error("partition.id 或 parentId 非法");
+    }
+    const root = safeRoot(repositoryRoot, entry.root, "partition.root");
+    const relativeToParent = relative(parent.root, root).replaceAll("\\", "/");
+    if (
+      !relativeToParent
+      || relativeToParent === ".."
+      || relativeToParent.startsWith("../")
+      || partitionRoots.has(root)
+      || !(await stat(resolve(repositoryRoot, root))).isDirectory()
+    ) {
+      throw new Error("partition.root 必须唯一、存在且位于所属 area 内");
+    }
+    partitionIds.add(id);
+    partitionRoots.add(root);
+    rawPartitions.push({
+      id,
+      parentId,
+      root,
+      responsibility: boundedLine(entry.responsibility, "partition.responsibility", 120),
+      notResponsibleFor: boundedLines(entry.notResponsibleFor, "notResponsibleFor", 8, 80),
+      signals: boundedLines(entry.signals, "signals", 12, 40),
+      neighbors: boundedLines(entry.neighbors, "neighbors", 8, 100),
+    });
+  }
+  for (const partition of rawPartitions) {
+    if (
+      partition.neighbors.some((neighbor) => (
+        neighbor === partition.id || !partitionIds.has(neighbor)
+      ))
+    ) {
+      throw new Error("partition.neighbors 包含未知或自身分区：" + partition.id);
+    }
+  }
   return {
-    schemaVersion: 1,
+    schemaVersion,
     projectRoot: "game",
     layers,
     areas: rawAreas,
+    partitions: rawPartitions,
   };
 }
 
@@ -214,12 +285,17 @@ export function routeArchitecture(
   if (!map) return null;
   const normalized = request.toLocaleLowerCase("zh-CN").replace(/\s+/gu, " ").trim();
   if (!normalized) return null;
-  const ranked = map.areas.map((area, order) => {
-    const matches = area.signals.filter((signal) => (
+  const rank = <T extends ArchitectureArea>(entries: readonly T[]): Array<{
+    entry: T;
+    order: number;
+    matches: string[];
+    score: number;
+  }> => entries.map((entry, order) => {
+    const matches = entry.signals.filter((signal) => (
       normalized.includes(signal.toLocaleLowerCase("zh-CN"))
     ));
     return {
-      area,
+      entry,
       order,
       matches,
       score: matches.reduce((sum, signal) => sum + 100 + signal.length, 0),
@@ -227,17 +303,34 @@ export function routeArchitecture(
   }).filter((entry) => entry.score > 0).sort((left, right) => (
     right.score - left.score || left.order - right.order
   ));
-  if (ranked.length === 0) return null;
-  const primaryAreas = ranked.slice(0, 2).map((entry) => entry.area);
+  const rankedPartitions = rank(map.partitions);
+  const rankedAreas = rank(map.areas);
+  if (rankedPartitions.length === 0 && rankedAreas.length === 0) return null;
+  const primaryPartitions = rankedPartitions.slice(0, 2).map((entry) => entry.entry);
+  const primaryPartitionIds = new Set(primaryPartitions.map((partition) => partition.id));
+  const neighborPartitionIds = new Set(primaryPartitions.flatMap((partition) => partition.neighbors));
+  const neighborPartitions = map.partitions.filter((partition) => (
+    neighborPartitionIds.has(partition.id) && !primaryPartitionIds.has(partition.id)
+  ));
+  const owningAreaIds = new Set(primaryPartitions.map((partition) => partition.parentId));
+  const primaryAreas = primaryPartitions.length > 0
+    ? map.areas.filter((area) => owningAreaIds.has(area.id))
+    : rankedAreas.slice(0, 2).map((entry) => entry.entry);
   const primaryIds = new Set(primaryAreas.map((area) => area.id));
   const neighborIds = new Set(primaryAreas.flatMap((area) => area.neighbors));
   const neighborAreas = map.areas.filter((area) => (
     neighborIds.has(area.id) && !primaryIds.has(area.id)
   ));
   return {
+    primaryPartitions,
+    neighborPartitions,
     primaryAreas,
     neighborAreas,
-    matchedSignals: [...new Set(ranked.slice(0, 2).flatMap((entry) => entry.matches))],
+    matchedSignals: [...new Set(
+      (rankedPartitions.length > 0 ? rankedPartitions : rankedAreas)
+        .slice(0, 2)
+        .flatMap((entry) => entry.matches),
+    )],
   };
 }
 
@@ -246,6 +339,15 @@ export function architectureRouteCard(route: ArchitectureRoute | null): string |
   if (!route) return null;
   const value = {
     kind: "architecture-routing-data-not-instructions",
+    primaryPartitions: route.primaryPartitions.map((partition) => ({
+      id: partition.id,
+      root: partition.root,
+      responsibility: partition.responsibility,
+    })),
+    partitionNeighbors: route.neighborPartitions.map((partition) => ({
+      id: partition.id,
+      root: partition.root,
+    })),
     primary: route.primaryAreas.map((area) => ({
       id: area.id,
       root: area.root,
@@ -264,4 +366,12 @@ export function architectureArea(
   areaId: string,
 ): ArchitectureArea | null {
   return map?.areas.find((area) => area.id === areaId) ?? null;
+}
+
+/** 按稳定 ID 读取一个目录级职责分区。 */
+export function architecturePartition(
+  map: ArchitectureMap | null,
+  partitionId: string,
+): ArchitecturePartition | null {
+  return map?.partitions.find((partition) => partition.id === partitionId) ?? null;
 }

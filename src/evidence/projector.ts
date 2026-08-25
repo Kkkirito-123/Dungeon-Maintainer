@@ -20,7 +20,32 @@ export function inspectActionKey(
   input: InspectInput,
   resolvedScope: readonly string[] = [],
 ): string {
-  return digest({ tool: "inspect", input, resolvedScope: [...resolvedScope] });
+  const normalizedPath = (value: string | undefined): string | null => (
+    value?.replaceAll("\\", "/").replace(/\/+/gu, "/").replace(/\/$/u, "")
+      .toLocaleLowerCase("en-US") ?? null
+  );
+  const normalized = {
+    action: input.action,
+    path: normalizedPath(input.path),
+    query: input.query?.replace(/\s+/gu, " ").trim().toLocaleLowerCase("en-US") ?? null,
+    startLine: input.startLine ?? null,
+    lineCount: input.lineCount ?? null,
+    partitionId: input.partitionId?.trim().toLocaleLowerCase("en-US") ?? null,
+    ranges: input.ranges?.map((range) => ({
+      path: normalizedPath(range.path),
+      startLine: range.startLine ?? 1,
+      lineCount: range.lineCount ?? null,
+    })).sort((left, right) => (
+      (left.path ?? "").localeCompare(right.path ?? "")
+      || left.startLine - right.startLine
+      || (left.lineCount ?? 0) - (right.lineCount ?? 0)
+    )) ?? [],
+  };
+  return digest({
+    tool: "inspect",
+    input: normalized,
+    resolvedScope: resolvedScope.map((scope) => normalizedPath(scope)).sort(),
+  });
 }
 
 export function sourceEvidence(
@@ -58,6 +83,8 @@ export function sourceEvidence(
       matchCount: details.matchCount ?? null,
       complete: details.complete ?? null,
       expanded: details.expanded ?? null,
+      expansionLevel: details.expansionLevel ?? null,
+      bundleWindows: details.bundleWindows ?? null,
     },
   };
 }

@@ -30,7 +30,7 @@ export function buildDungeonMaintainerPrompt(): string {
     "解决问题时：",
     "1. 先区分状态询问与修复请求。状态已经能从实时玩家投影回答时直接回答，不要升级成源码调查。",
     "2. 运行时故障可用 look/go/use/input_sql/query 取得最小复现。go 可跨过不需要用户决策的中途步骤；工具 ok=true 只表示动作被接受，功能结果要看事件和玩家投影。",
-    "3. 只用 inspect 对最相关路径做 search/read/diff；同一 Hash 的重复读取会命中缓存。不要为了满足固定顺序而读取无关文件，也不要重复执行已经给出相同结果的动作。",
+    "3. 定位源码默认先用一次 inspect bundle，让架构路由在同一调用中搜索并返回最相关窗口与 baseHash；只有上下文不足时再补 search/read/read_many/diff。同一有效 Hash 的语义重复会返回短回执，不要重复执行已经给出相同结果的动作。",
     "4. 需要保存可重放故障时调用 finish(status=reproduced)，提供修复后应满足的结构化断言；保存后继续当前 Agent Loop。战斗题目阶段用 minStageIndex，楼层/传送门推进才用 advancedFromFloor。",
     "5. 病因明确后调用 finish(status=proposed) 一次提交最小完整方案。用户批准后工具会在同一轮开放写权限；立即执行，不再询问，也不要等待隐藏后继任务。",
     "6. 每批原生写入后维护器会同步变更；存在运行时复现时才刷新游戏并重放。刷新失败必须先修复，不能绕过 check 或 result。",
