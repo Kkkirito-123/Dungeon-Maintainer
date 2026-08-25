@@ -16,6 +16,7 @@ export interface InspectInput {
   startLine?: number;
   lineCount?: number;
   partitionId?: string;
+  floorId?: string;
   ranges?: InspectReadRange[];
 }
 
@@ -46,5 +47,7 @@ export interface InspectDetails {
   expanded?: boolean;
   expansionLevel?: string;
   bundleWindows?: number;
+  floorRouteLevel?: "current" | "adjacent" | "shared" | "fallback" | "none";
+  floorScopeCount?: number;
   items?: InspectItemDetails[];
 }

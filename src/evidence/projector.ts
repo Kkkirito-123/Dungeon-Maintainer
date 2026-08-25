@@ -21,24 +21,26 @@ export function inspectActionKey(
   resolvedScope: readonly string[] = [],
 ): string {
   const normalizedPath = (value: string | undefined): string | null => (
-    value?.replaceAll("\\", "/").replace(/\/+/gu, "/").replace(/\/$/u, "")
+    value?.replaceAll("\\", "/").replace(/^(?:\.\/)+/u, "").replace(/\/+/gu, "/")
+      .replace(/\/$/u, "")
       .toLocaleLowerCase("en-US") ?? null
   );
   const normalized = {
     action: input.action,
     path: normalizedPath(input.path),
     query: input.query?.replace(/\s+/gu, " ").trim().toLocaleLowerCase("en-US") ?? null,
-    startLine: input.startLine ?? null,
-    lineCount: input.lineCount ?? null,
+    startLine: input.action === "read" ? input.startLine ?? 1 : input.startLine ?? null,
+    lineCount: input.action === "read" ? input.lineCount ?? 80 : input.lineCount ?? null,
     partitionId: input.partitionId?.trim().toLocaleLowerCase("en-US") ?? null,
+    floorId: input.floorId?.trim().toLocaleLowerCase("en-US") ?? null,
     ranges: input.ranges?.map((range) => ({
       path: normalizedPath(range.path),
       startLine: range.startLine ?? 1,
-      lineCount: range.lineCount ?? null,
+      lineCount: range.lineCount ?? 80,
     })).sort((left, right) => (
       (left.path ?? "").localeCompare(right.path ?? "")
       || left.startLine - right.startLine
-      || (left.lineCount ?? 0) - (right.lineCount ?? 0)
+      || left.lineCount - right.lineCount
     )) ?? [],
   };
   return digest({
@@ -70,7 +72,9 @@ export function sourceEvidence(
     artifactRef: null,
     path,
     startLine: input.action === "read" ? input.startLine ?? 1 : null,
-    lineCount: input.action === "read" ? input.lineCount ?? details.lines : null,
+    // 覆盖账本必须记录实际展示的行数；文件末尾或输出截断时，不能把未展示行
+    // 标成 ALREADY_SEEN，否则后续精确 read 会错误地只返回回执。
+    lineCount: input.action === "read" ? details.lines : null,
     baseHash: details.baseHash,
     worktreeHash,
     validityKey,
@@ -85,6 +89,13 @@ export function sourceEvidence(
       expanded: details.expanded ?? null,
       expansionLevel: details.expansionLevel ?? null,
       bundleWindows: details.bundleWindows ?? null,
+      floorRouteLevel: details.floorRouteLevel ?? null,
+      floorScopeCount: details.floorScopeCount ?? null,
+      requestedLineCount: input.action === "read" ? input.lineCount ?? null : null,
+      eof: input.action === "read"
+        && !details.truncated
+        && typeof input.lineCount === "number"
+        && details.lines < input.lineCount,
     },
   };
 }

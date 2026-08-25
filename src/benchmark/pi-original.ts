@@ -54,6 +54,14 @@ export interface PiRunMetrics {
   readonly inspectFailures: number;
   /** 区域搜索从主区域扩展到相邻区域或仓库的次数。 */
   readonly routedSearchExpansions: number;
+  /** 实际使用楼层三级路由的 Inspect execution 数。 */
+  readonly floorRoutedInspectCalls: number;
+  /** 楼层路由实际访问的当前层与相邻层 scope 总数。 */
+  readonly floorScopesVisited: number;
+  readonly floorRouteCurrentExecutions: number;
+  readonly floorRouteAdjacentExecutions: number;
+  readonly floorRouteSharedExecutions: number;
+  readonly floorRouteFallbackExecutions: number;
   readonly writeAttempts: number;
   readonly writeRejected: number;
   readonly writeFailures: number;
@@ -339,6 +347,12 @@ export async function runPiOriginal(
     inspectBundleWindows: 0,
     inspectFailures: 0,
     routedSearchExpansions: 0,
+    floorRoutedInspectCalls: 0,
+    floorScopesVisited: 0,
+    floorRouteCurrentExecutions: 0,
+    floorRouteAdjacentExecutions: 0,
+    floorRouteSharedExecutions: 0,
+    floorRouteFallbackExecutions: 0,
     writeAttempts: writeCalls,
     writeRejected: 0,
     writeFailures: 0,

@@ -301,8 +301,31 @@ export function installDungeonMaintainerExtension(
   const loopGuard = new LoopGuard();
   const pendingLoopActions = new Map<string, {
     action: LoopAction;
+    actionDigest: string;
     preWorktreeHash: string;
   }>();
+  const pendingLoopActionCounts = new Map<string, number>();
+  const takePendingLoopAction = (toolCallId: string): {
+    action: LoopAction;
+    actionDigest: string;
+    preWorktreeHash: string;
+  } | null => {
+    const pending = pendingLoopActions.get(toolCallId) ?? null;
+    if (!pending) return null;
+    pendingLoopActions.delete(toolCallId);
+    const count = pendingLoopActionCounts.get(pending.actionDigest) ?? 0;
+    if (count <= 1) pendingLoopActionCounts.delete(pending.actionDigest);
+    else pendingLoopActionCounts.set(pending.actionDigest, count - 1);
+    return pending;
+  };
+  const clearPendingLoopActions = (): void => {
+    for (const toolCallId of [...pendingLoopActions.keys()]) {
+      takePendingLoopAction(toolCallId);
+    }
+  };
+  // inspect 执行阶段复用 tool_call 门禁已计算的 Hash，避免同一次外部调用再次
+  // 扫描完整 worktree。结果事件或异常回合结束时会清理对应条目。
+  const inspectWorktreeHashes = new Map<string, string>();
 
   const recordWriteOutcome = async (
     toolName: string,
@@ -359,6 +382,7 @@ export function installDungeonMaintainerExtension(
     evidence,
     architectureMap: () => architectureMap,
     architectureRoute: () => currentArchitectureRoute,
+    inspectWorktreeHash: (toolCallId: string) => inspectWorktreeHashes.get(toolCallId),
     currentDriver: () => gameRuntime.currentDriver(),
     requireDriver: () => gameRuntime.requireDriver(),
     ensureGame: () => gameRuntime.ensure(),
@@ -474,16 +498,19 @@ export function installDungeonMaintainerExtension(
     await appendEvent(store, task.id, "pi.agent_end", { state: task.state });
   });
   pi.on("turn_end", async (_event, context) => {
+    inspectWorktreeHashes.clear();
     // 正常写入在最后一个 native tool_result 中完成刷新；这里只处理取消或第三方
     // 扩展导致 tool_result 缺失的异常路径，不能再把正常刷新延迟到整轮结束。
-    if (!nativeWriteBatch) return;
+    if (!nativeWriteBatch) {
+      clearPendingLoopActions();
+      return;
+    }
     const pendingIds = [...nativeWriteBatch.pendingToolCallIds];
     nativeWriteBatch.pendingToolCallIds.clear();
     const outcome = await flushNativeWriteBatch();
     const finalHash = await hashWorktree(task.worktreeRoot);
     for (const toolCallId of pendingIds) {
-      const pending = pendingLoopActions.get(toolCallId);
-      pendingLoopActions.delete(toolCallId);
+      const pending = takePendingLoopAction(toolCallId);
       if (!pending) continue;
       const changed = finalHash !== pending.preWorktreeHash;
       await recordWriteOutcome(
@@ -503,6 +530,7 @@ export function installDungeonMaintainerExtension(
         madeProgress: changed,
       });
     }
+    clearPendingLoopActions();
     if (outcome?.changed) {
       publishRefreshOutcome(context, outcome);
     }
@@ -551,7 +579,15 @@ export function installDungeonMaintainerExtension(
     if (LOOP_GUARD_TOOLS.has(event.toolName)) {
       preWorktreeHash ??= await hashWorktree(task.worktreeRoot);
       const action = loopActionFor(event.toolName, input, preWorktreeHash);
-      const decision = loopGuard.evaluateAction(action);
+      const actionDigest = stableDigest({ input: action.input, toolName: action.toolName });
+      const pendingCount = pendingLoopActionCounts.get(actionDigest) ?? 0;
+      const decision = pendingCount >= 2
+        ? {
+          kind: "block" as const,
+          reason: "pending_action" as const,
+          noProgressCount: pendingCount,
+        }
+        : loopGuard.evaluateAction(action);
       if (decision.kind !== "allow") {
         await appendEvent(store, task.id, "tool.loop_guard", {
           toolName: event.toolName,
@@ -566,6 +602,8 @@ export function installDungeonMaintainerExtension(
             outcome: "failure",
             expanded: false,
             bundleWindows: 0,
+            floorRouteLevel: "none",
+            floorScopeCount: 0,
           });
         }
         if (WRITE_TOOLS.has(event.toolName)) {
@@ -584,7 +622,11 @@ export function installDungeonMaintainerExtension(
             : "循环门禁已阻止重复无进展动作；请使用现有证据更换路径或参数。",
         };
       }
-      pendingLoopActions.set(event.toolCallId, { action, preWorktreeHash });
+      pendingLoopActions.set(event.toolCallId, { action, actionDigest, preWorktreeHash });
+      pendingLoopActionCounts.set(actionDigest, pendingCount + 1);
+      if (event.toolName === "inspect") {
+        inspectWorktreeHashes.set(event.toolCallId, preWorktreeHash);
+      }
     }
     if (NATIVE_WRITE_TOOLS.has(event.toolName)) {
       const batch = nativeWriteBatch ?? {
@@ -610,7 +652,7 @@ export function installDungeonMaintainerExtension(
       try {
         await batch.preparation;
       } catch (error) {
-        pendingLoopActions.delete(event.toolCallId);
+        takePendingLoopAction(event.toolCallId);
         if (nativeWriteBatch === batch && batch.pendingToolCallIds.size === 0) {
           nativeWriteBatch = null;
         }
@@ -649,11 +691,11 @@ export function installDungeonMaintainerExtension(
         event: details.event,
       }));
     }
-    const pending = pendingLoopActions.get(event.toolCallId) ?? null;
-    pendingLoopActions.delete(event.toolCallId);
-    const postWorktreeHash = pending || WRITE_TOOLS.has(event.toolName)
+    const pending = takePendingLoopAction(event.toolCallId);
+    const postWorktreeHash = WRITE_TOOLS.has(event.toolName)
       ? await hashWorktree(task.worktreeRoot)
       : null;
+    inspectWorktreeHashes.delete(event.toolCallId);
     const recordGuardResult = (madeProgress = false): void => {
       if (!pending) return;
       loopGuard.recordOutcome({
@@ -664,7 +706,7 @@ export function installDungeonMaintainerExtension(
           status: typeof details?.status === "string" ? details.status : null,
           cacheHit: details?.cacheHit === true,
           receiptOnly: details?.receiptOnly === true,
-          worktreeHash: postWorktreeHash,
+          worktreeHash: postWorktreeHash ?? pending.preWorktreeHash,
         },
         evidenceRevision: evidence.revision,
         madeProgress,
@@ -673,15 +715,33 @@ export function installDungeonMaintainerExtension(
     if (!NATIVE_WRITE_TOOLS.has(event.toolName)) {
       if (event.toolName === "patch" && pending && postWorktreeHash) {
         const changed = postWorktreeHash !== pending.preWorktreeHash;
+        const replay = details?.replay && typeof details.replay === "object"
+          ? details.replay as Record<string, unknown>
+          : null;
+        const refreshFailed = event.isError || replay?.passed === false;
+        if (changed) {
+          if (refreshFailed) {
+            const failureText = event.content
+              .map((item) => item.type === "text" ? item.text : "")
+              .filter(Boolean)
+              .join(" ");
+            lastRefreshFailure = "精确补丁已写入，但右侧刷新重放未通过："
+              + safeRefreshFailure(new Error(failureText || "未知补丁刷新错误"));
+          } else if (replay?.passed === true) {
+            // patch 自身的 afterPatch 已经完成刷新/重放；它与原生 write
+            // 共享同一个门禁事实，因此成功修复必须清除上一轮刷新失败。
+            lastRefreshFailure = null;
+          }
+        }
         const outcome = changed
-          ? event.isError ? "mutated_replay_failed" : "mutated"
+          ? refreshFailed ? "mutated_replay_failed" : "mutated"
           : event.isError ? "failed" : "noop";
         await recordWriteOutcome(
           event.toolName,
           outcome,
           postWorktreeHash,
           changed
-            ? event.isError ? "refresh-replay-failed" : "worktree-mutated"
+            ? refreshFailed ? "refresh-replay-failed" : "worktree-mutated"
             : event.isError ? "tool-execution-failed" : "worktree-unchanged",
         );
         recordGuardResult(changed);
@@ -805,7 +865,7 @@ export function installDungeonMaintainerExtension(
       ? normalizedRequest(event.prompt)
       : "";
     const currentRequest = latestNaturalRequest || eventPrompt || task.objective;
-    currentArchitectureRoute = routeArchitecture(architectureMap, currentRequest);
+    currentArchitectureRoute = routeArchitecture(architectureMap, currentRequest, view?.floor ?? null);
     const routeCard = architectureRouteCard(currentArchitectureRoute);
     const dynamicContext = [
       "本轮最高优先级请求：",

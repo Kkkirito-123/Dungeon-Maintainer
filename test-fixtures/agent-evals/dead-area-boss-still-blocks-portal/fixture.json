@@ -3,6 +3,6 @@
   "id": "dead-area-boss-still-blocks-portal",
   "base": "game-repair-v1",
   "sourcePatch": "source.patch",
-  "patchSha256": "3dac8ac25c8c97a1f0e37953dedfbdf6b448b811a540cbb76bc4787f6cdd288a",
+  "patchSha256": "6655d4f91c2c89ae7c6bd0106cbc61a52b34964186b4a58d7a52451bcd572c5a",
   "dirtyPaths": ["game/src/domain/session/GameSession.ts"]
 }

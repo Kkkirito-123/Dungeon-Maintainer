@@ -30,9 +30,13 @@ Task / Workspace / Repair / Game / Logging
   拒绝、diagnosed、blocked 和最终 result 才结束请求。
 - 证据记录只能服务任务内 Hash 缓存、复现、检查和审计，不能规定模型必须读取哪些文件，
   也不能因为遥测或索引写入失败推翻已经通过的验证。
-- 游戏通过 `.maintainer/architecture-map.json` 提供稳定 area 与选定 partition 职责；schema v1
-  规范化为无 partition 的兼容形态。显式路径/partition 固定范围，自动路由依次尝试主 partition、
-  partition 邻居、所属 area、area 邻居和仓库。地图不登记文件，partition 内部修改不产生维护成本。
+- 游戏通过 `.maintainer/architecture-map.json` 提供稳定 area、partition 与跨区域 `floorScopes`；
+  schema v1/v2 分别规范化为无 partition/无 floor scope 的兼容形态。V3 正常路由依次尝试当前或
+  显式楼层 roots、上下相邻楼层 roots、楼层声明的 shared partitions，三级均零命中时才
+  failure-open 到 area 和仓库；显式路径/partition 仍固定范围。地图不登记文件，普通文件变化
+  不产生地图维护成本。
+- shared partition 是上层服务单元，楼层模块只能单向消费它；楼层之间不得通过 import 复用代码。
+  相邻楼层只作为传送、边界和联动故障的调查范围，公共规则必须上提到 shared partition。
 - 源码定位默认使用一次 `inspect bundle`：在路由范围搜索并返回最多四个互不重叠的 48 行窗口，
   总计不超过 192 行和 4 KiB；窗口直接登记读取覆盖及 baseHash。同一有效版本的语义重复只返回
   短回执，部分重叠读取只返回未覆盖行。
@@ -67,6 +71,8 @@ Benchmark 只观察和判卷：第一个真实 `agent_settled` 立即停止模�
 ## 低敏遥测
 
 一次外部 Inspect 调用只写一条 `tool.inspect` 事件；bundle 内部窗口不伪装成额外工具执行。
+事件另外记录 `floorRouteLevel` 与访问的 floor scope 数量，Benchmark 聚合 current、adjacent、
+shared、fallback 四级 execution；不保存楼层查询词、源码或文件正文。
 写入按 `rejected / failed / noop / mutated / mutated_replay_failed` 分类，事件只含工具名、分类、
 计数、工作树 Hash 摘要和稳定原因码。`mutated_replay_failed` 同时计入真实 mutation 与 replay
 failure；参数、补丁、源码、SQL 和模型正文不进入事件日志。Benchmark 必须满足 Inspect 与写入

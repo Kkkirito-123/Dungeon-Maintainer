@@ -24,6 +24,7 @@ import type {
 } from "../../inspection/types.js";
 import {
   architectureArea,
+  architectureFloorScope,
   architecturePartition,
   type ArchitectureMap,
   type ArchitectureRoute,
@@ -47,6 +48,11 @@ const DEFAULT_READ_LINES = 80;
 const MAX_READ_LINES = 160;
 const BUNDLE_WINDOW_LINES = 48;
 const MAX_BUNDLE_LINES = 192;
+// 为 bundle 外层 EVIDENCE 头和截断标记预留空间，确保最终返回仍低于 4 KiB。
+const MAX_BUNDLE_BODY_BYTES = MAX_BODY_BYTES - 256;
+// 为 bundle 索引、路径和证据元数据再预留空间；长单行源码也必须至少留下一个窗口，
+// 不能因为默认源码预算过大而把整个 bundle 变成零窗口回执。
+const MAX_BUNDLE_SOURCE_BYTES = MAX_BUNDLE_BODY_BYTES - 768;
 
 /** `inspect` 的严格参数契约。 */
 export const InspectParameters = Type.Object({
@@ -70,6 +76,11 @@ export const InspectParameters = Type.Object({
   startLine: Type.Optional(Type.Integer({ minimum: 1, maximum: 1_000_000 })),
   lineCount: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_READ_LINES })),
   partitionId: Type.Optional(Type.String({ minLength: 3, maxLength: 80 })),
+  floorId: Type.Optional(Type.String({
+    pattern: "^floor\\.\\d{2,3}$",
+    maxLength: 40,
+    description: "已知故障楼层时传稳定 floor scope ID；仍按当前层、相邻层、共享父级服务依次定位。",
+  })),
   ranges: Type.Optional(Type.Array(Type.Object({
     path: Type.String({ minLength: 1, maxLength: 300 }),
     startLine: Type.Optional(Type.Integer({ minimum: 1, maximum: 1_000_000 })),
@@ -86,9 +97,11 @@ export interface InspectToolContext {
   evidence: EvidenceStore;
   architectureMap?(): ArchitectureMap | null;
   architectureRoute?(): ArchitectureRoute | null;
+  /** 复用 Extension 循环门禁在同一次外部调用中已经计算的 worktree Hash。 */
+  inspectWorktreeHash?(toolCallId: string): string | undefined;
 }
 
-function clip(value: string): {
+function clip(value: string, maximumBytes = MAX_BODY_BYTES): {
   text: string;
   lines: number;
   truncated: boolean;
@@ -97,8 +110,8 @@ function clip(value: string): {
   let text = rows.slice(0, MAX_LINES).join("\n");
   let truncated = rows.length > MAX_LINES;
   const bytes = Buffer.from(text, "utf8");
-  if (bytes.byteLength > MAX_BODY_BYTES) {
-    text = bytes.subarray(0, MAX_BODY_BYTES).toString("utf8");
+  if (bytes.byteLength > maximumBytes) {
+    text = bytes.subarray(0, maximumBytes).toString("utf8");
     truncated = true;
   }
   return {
@@ -257,12 +270,10 @@ async function searchText(
 }
 
 async function readPage(
-  root: string,
-  projectPath: string,
+  target: { absolute: string },
   startLine = 1,
   lineCount = DEFAULT_READ_LINES,
 ): Promise<string> {
-  const target = await resolveProjectPath(root, projectPath, "read");
   const information = await stat(target.absolute);
   if (!information.isFile() || information.size > MAX_FILE_BYTES) {
     throw new Error("inspect 只读取不超过 2 MiB 的文本文件");
@@ -309,6 +320,65 @@ function uncoveredIntervals(
   return output;
 }
 
+function evidenceCoverageEnd(record: {
+  startLine: number;
+  lineCount: number;
+  metadata: Record<string, unknown>;
+}): number {
+  const requestedLineCount = record.metadata.eof === true
+    && typeof record.metadata.requestedLineCount === "number"
+    ? record.metadata.requestedLineCount
+    : record.lineCount;
+  return record.startLine + requestedLineCount;
+}
+
+function readPathCacheKey(path: string): string {
+  const normalized = path.replaceAll("\\", "/")
+    .replace(/^(?:\.\/)+/u, "")
+    .replace(/\/+/gu, "/")
+    .replace(/\/$/u, "");
+  return process.platform === "win32" ? normalized.toLocaleLowerCase("en-US") : normalized;
+}
+
+interface PreparedReadRange {
+  target: Awaited<ReturnType<typeof resolveProjectPath>>;
+  startLine: number;
+  lineCount: number;
+  baseHash: string;
+  existing: Awaited<ReturnType<EvidenceStore["active"]>>;
+  uncovered: LineInterval[];
+}
+
+async function prepareReadRange(
+  context: InspectToolContext,
+  range: InspectReadRange,
+): Promise<PreparedReadRange> {
+  const root = context.task.worktreeRoot;
+  // 先走一次 realpath 边界检查，再复用它返回的规范项目路径做 Hash、读取和缓存比较。
+  const target = await resolveProjectPath(root, range.path, "read");
+  const startLine = range.startLine ?? 1;
+  const lineCount = range.lineCount ?? DEFAULT_READ_LINES;
+  const baseHash = await hashFile(root, target.relative);
+  const pathKey = readPathCacheKey(target.relative);
+  const existing = (await context.evidence.active("source")).filter((record) => (
+    record.actionKey !== null
+      && typeof record.path === "string"
+      && readPathCacheKey(record.path) === pathKey
+      && record.baseHash === baseHash
+      && typeof record.startLine === "number"
+      && typeof record.lineCount === "number"
+  ));
+  const uncovered = uncoveredIntervals(startLine, lineCount, existing.map((record) => ({
+    start: record.startLine as number,
+    end: evidenceCoverageEnd({
+      startLine: record.startLine as number,
+      lineCount: record.lineCount as number,
+      metadata: record.metadata,
+    }),
+  })));
+  return { target, startLine, lineCount, baseHash, existing, uncovered };
+}
+
 function receiptText(details: {
   evidenceId: string;
   action: string;
@@ -316,6 +386,8 @@ function receiptText(details: {
   scope?: readonly string[];
   complete?: boolean | null;
   matchCount?: number | null;
+  floorRouteLevel?: InspectDetails["floorRouteLevel"];
+  floorScopeCount?: number | null;
 }): string {
   return [
     "[CACHE HIT ALREADY_SEEN evidence=" + details.evidenceId + " action=" + details.action + "]",
@@ -323,6 +395,10 @@ function receiptText(details: {
     details.scope && details.scope.length > 0 ? "scope=" + details.scope.join(",") : null,
     typeof details.matchCount === "number" ? "matches=" + String(details.matchCount) : null,
     typeof details.complete === "boolean" ? "complete=" + String(details.complete) : null,
+    details.floorRouteLevel && details.floorRouteLevel !== "none"
+      ? "floorRouteLevel=" + details.floorRouteLevel : null,
+    typeof details.floorScopeCount === "number"
+      ? "floorScopeCount=" + String(details.floorScopeCount) : null,
     "相同有效版本的证据已在上下文中，不重复发送正文。",
   ].filter((line): line is string => Boolean(line)).join("\n");
 }
@@ -356,6 +432,8 @@ async function captureSourceText(
     expanded?: boolean;
     expansionLevel?: string;
     bundleWindows?: number;
+    floorRouteLevel?: InspectDetails["floorRouteLevel"];
+    floorScopeCount?: number;
   },
 ): Promise<{ text: string; details: InspectDetails }> {
   const clipped = clip(redactCredentials(raw));
@@ -378,23 +456,35 @@ async function captureSourceText(
     ...(options.expanded === undefined ? {} : { expanded: options.expanded }),
     ...(options.expansionLevel === undefined ? {} : { expansionLevel: options.expansionLevel }),
     ...(options.bundleWindows === undefined ? {} : { bundleWindows: options.bundleWindows }),
+    ...(options.floorRouteLevel === undefined ? {} : { floorRouteLevel: options.floorRouteLevel }),
+    ...(options.floorScopeCount === undefined ? {} : { floorScopeCount: options.floorScopeCount }),
   };
   const projected = sourceEvidence(input, details, options.worktreeHash, resolvedScope);
   const saved = await context.evidence.captureText(projected, clipped.text);
   details.evidenceId = saved.record.id;
-  const metadata = "[EVIDENCE id="
-    + details.evidenceId
-    + " contentHash="
-    + contentHash
-    + (options.baseHash ? " baseHash=" + options.baseHash : "")
-    + "]";
   return {
-    text: metadata
-      + "\n"
-      + clipped.text
-      + (clipped.truncated ? "\n[内容已按 240 行或 4 KiB 截断]" : ""),
+    text: renderCapturedText(details.evidenceId, contentHash, options.baseHash, clipped),
     details,
   };
+}
+
+/** 生成与真实证据相同形状的有限源码正文；preview 使用固定长度 ID，不写入账本。 */
+function renderCapturedText(
+  evidenceId: string,
+  contentHash: string,
+  baseHash: string | null,
+  clipped: { text: string; truncated: boolean },
+): string {
+  const metadata = "[EVIDENCE id="
+    + evidenceId
+    + " contentHash="
+    + contentHash
+    + (baseHash ? " baseHash=" + baseHash : "")
+    + "]";
+  return metadata
+    + "\n"
+    + clipped.text
+    + (clipped.truncated ? "\n[内容已按 240 行或 4 KiB 截断]" : "");
 }
 
 async function inspectReadRange(
@@ -403,27 +493,15 @@ async function inspectReadRange(
   signal?: AbortSignal,
 ): Promise<{ text: string; details: InspectDetails; items: InspectItemDetails[] }> {
   signal?.throwIfAborted();
-  const root = context.task.worktreeRoot;
-  const startLine = range.startLine ?? 1;
-  const lineCount = range.lineCount ?? DEFAULT_READ_LINES;
-  const baseHash = await hashFile(root, range.path);
-  const existing = (await context.evidence.active("source")).filter((record) => (
-    record.actionKey !== null
-    &&
-    record.path === range.path.replaceAll("\\", "/")
-    && record.baseHash === baseHash
-    && typeof record.startLine === "number"
-    && typeof record.lineCount === "number"
-  ));
-  const uncovered = uncoveredIntervals(startLine, lineCount, existing.map((record) => ({
-    start: record.startLine as number,
-    end: (record.startLine as number) + (record.lineCount as number),
-  })));
+  const { target, startLine, lineCount, baseHash, existing, uncovered } = await prepareReadRange(
+    context,
+    range,
+  );
   if (uncovered.length === 0) {
     const evidenceId = existing[0]?.id ?? "covered";
     const actionKey = inspectActionKey({
       action: "read",
-      path: range.path,
+      path: target.relative,
       startLine,
       lineCount,
     });
@@ -440,9 +518,17 @@ async function inspectReadRange(
     };
     return {
       text: receiptText({ evidenceId, action: "read", baseHash })
-        + "\ncovered=" + range.path + ":" + String(startLine) + "-" + String(startLine + lineCount - 1),
+        + "\ncovered=" + target.relative + ":" + String(startLine) + "-"
+        + String(startLine + lineCount - 1),
       details,
-      items: [{ path: range.path, startLine, lineCount, evidenceId, baseHash, receiptOnly: true }],
+      items: [{
+        path: target.relative,
+        startLine,
+        lineCount,
+        evidenceId,
+        baseHash,
+        receiptOnly: true,
+      }],
     };
   }
 
@@ -453,11 +539,11 @@ async function inspectReadRange(
     const requestedCount = interval.end - interval.start;
     const readInput: InspectInput = {
       action: "read",
-      path: range.path,
+      path: target.relative,
       startLine: interval.start,
       lineCount: requestedCount,
     };
-    const raw = await readPage(root, range.path, interval.start, requestedCount);
+    const raw = await readPage(target, interval.start, requestedCount);
     const captured = await captureSourceText(context, readInput, raw, {
       baseHash,
       worktreeHash: null,
@@ -465,7 +551,7 @@ async function inspectReadRange(
     outputs.push(captured.text);
     capturedDetails.push(captured.details);
     items.push({
-      path: range.path,
+      path: target.relative,
       startLine: interval.start,
       lineCount: captured.details.lines,
       evidenceId: captured.details.evidenceId,
@@ -489,12 +575,14 @@ async function inspectReadRange(
 interface SearchScopeStage {
   level: string;
   roots: string[];
+  floorScopeCount: number;
 }
 
 interface SearchScopePlan {
   stages: SearchScopeStage[];
   locked: boolean;
   cacheScope: string[];
+  floorRouted: boolean;
 }
 
 function uniqueRoots(values: readonly string[], seen: Set<string>): string[] {
@@ -514,9 +602,10 @@ function searchScopePlan(
 ): SearchScopePlan {
   if (input.path) {
     return {
-      stages: [{ level: "explicit-path", roots: [input.path] }],
+      stages: [{ level: "explicit-path", roots: [input.path], floorScopeCount: 0 }],
       locked: true,
       cacheScope: ["explicit-path:" + input.path],
+      floorRouted: false,
     };
   }
   if (input.partitionId) {
@@ -526,34 +615,260 @@ function searchScopePlan(
     const root = partition?.root ?? area?.root;
     if (!root) throw new Error("未知架构分区：" + input.partitionId);
     return {
-      stages: [{ level: partition ? "explicit-partition" : "explicit-area", roots: [root] }],
+      stages: [{
+        level: partition ? "explicit-partition" : "explicit-area",
+        roots: [root],
+        floorScopeCount: 0,
+      }],
       locked: true,
       cacheScope: [(partition ? "explicit-partition:" : "explicit-area:") + root],
+      floorRouted: false,
     };
   }
+  const map = context.architectureMap?.() ?? null;
   const route = context.architectureRoute?.() ?? null;
-  if (!route || route.primaryAreas.length === 0) {
+  const explicitFloorScope = input.floorId
+    ? architectureFloorScope(map, input.floorId)
+    : null;
+  if (input.floorId && !explicitFloorScope) throw new Error("未知楼层 scope：" + input.floorId);
+  const currentFloorScope = explicitFloorScope ?? route?.currentFloorScope ?? null;
+  const neighborFloorScopes = explicitFloorScope
+    ? map?.floorScopes.filter((scope) => explicitFloorScope.neighbors.includes(scope.id)) ?? []
+    : route?.neighborFloorScopes ?? [];
+  const floorSharedPartitions = explicitFloorScope
+    ? map?.partitions.filter((partition) => (
+      explicitFloorScope.sharedPartitions.includes(partition.id)
+    )) ?? []
+    : route?.sharedPartitions ?? [];
+  if (!currentFloorScope && (!route || route.primaryAreas.length === 0)) {
     return {
-      stages: [{ level: "repository", roots: [] }],
+      stages: [{ level: "repository", roots: [], floorScopeCount: 0 }],
       locked: false,
       cacheScope: ["repository"],
+      floorRouted: false,
     };
   }
   const seen = new Set<string>();
   const stages: SearchScopeStage[] = [];
-  const push = (level: string, roots: readonly string[]): void => {
+  const push = (level: string, roots: readonly string[], floorScopeCount = 0): void => {
     const unique = uniqueRoots(roots, seen);
-    if (unique.length > 0) stages.push({ level, roots: unique });
+    if (unique.length > 0) stages.push({ level, roots: unique, floorScopeCount });
   };
-  push("primary-partition", route.primaryPartitions.map((partition) => partition.root));
-  push("partition-neighbor", route.neighborPartitions.map((partition) => partition.root));
-  push("owning-area", route.primaryAreas.map((area) => area.root));
-  push("area-neighbor", route.neighborAreas.map((area) => area.root));
-  stages.push({ level: "repository", roots: [] });
+  if (currentFloorScope) {
+    push("floor-current", currentFloorScope.roots, 1);
+    push(
+      "floor-adjacent",
+      neighborFloorScopes.flatMap((scope) => scope.roots),
+      neighborFloorScopes.length,
+    );
+    push("floor-shared", floorSharedPartitions.map((partition) => partition.root));
+  } else if (route) {
+    push("primary-partition", route.primaryPartitions.map((partition) => partition.root));
+    push("partition-neighbor", route.neighborPartitions.map((partition) => partition.root));
+  }
+  const owningAreaIds = new Set(floorSharedPartitions.map((partition) => partition.parentId));
+  if (explicitFloorScope) {
+    route?.primaryAreas.forEach((area) => owningAreaIds.add(area.id));
+  }
+  if (currentFloorScope && map) {
+    for (const area of map.areas) {
+      const areaRoot = area.root.replaceAll("\\", "/").replace(/\/$/u, "");
+      if (currentFloorScope.roots.some((root) => (
+        root === areaRoot || root.startsWith(areaRoot + "/")
+      ))) owningAreaIds.add(area.id);
+    }
+  }
+  const primaryAreas = explicitFloorScope && map
+    ? map.areas.filter((area) => owningAreaIds.has(area.id))
+    : route?.primaryAreas ?? [];
+  const primaryAreaIds = new Set(primaryAreas.map((area) => area.id));
+  const neighborAreaIds = new Set(primaryAreas.flatMap((area) => area.neighbors));
+  const neighborAreas = explicitFloorScope && map
+    ? map.areas.filter((area) => (
+      neighborAreaIds.has(area.id) && !primaryAreaIds.has(area.id)
+    ))
+    : route?.neighborAreas ?? [];
+  push("owning-area", primaryAreas.map((area) => area.root));
+  push("area-neighbor", neighborAreas.map((area) => area.root));
+  stages.push({ level: "repository", roots: [], floorScopeCount: 0 });
   return {
     stages,
     locked: false,
     cacheScope: stages.flatMap((stage) => [stage.level + ":" + (stage.roots.join(",") || ".")]),
+    floorRouted: currentFloorScope !== null,
+  };
+}
+
+/**
+ * 预览一个源码窗口但不写入 Evidence Ledger。
+ *
+ * bundle 必须先完成最终 4 KiB 预算选择，再提交真正展示的窗口；否则被预算丢弃的
+ * 代码会错误地变成 ALREADY_SEEN。preview 只复用同样的路径、Hash、覆盖判断和裁剪
+ * 规则，返回固定长度的占位 evidence ID，供预算计算使用。
+ */
+interface PendingReadCapture {
+  input: InspectInput;
+  clipped: ReturnType<typeof clip>;
+  contentHash: string;
+  baseHash: string;
+}
+
+interface ReadRangePreview {
+  text: string;
+  details: InspectDetails;
+  items: InspectItemDetails[];
+  captures: PendingReadCapture[];
+}
+
+async function previewReadRange(
+  context: InspectToolContext,
+  range: InspectReadRange,
+  signal?: AbortSignal,
+): Promise<ReadRangePreview> {
+  signal?.throwIfAborted();
+  const { target, startLine, lineCount, baseHash, existing, uncovered } = await prepareReadRange(
+    context,
+    range,
+  );
+  if (uncovered.length === 0) {
+    const evidenceId = existing[0]?.id ?? "covered";
+    const actionKey = inspectActionKey({
+      action: "read",
+      path: target.relative,
+      startLine,
+      lineCount,
+    });
+    const details: InspectDetails = {
+      action: "read",
+      evidenceId,
+      contentHash: existing[0]?.fingerprint ?? baseHash,
+      baseHash,
+      lines: 0,
+      truncated: false,
+      actionKey,
+      cacheHit: true,
+      receiptOnly: true,
+    };
+    return {
+      text: receiptText({ evidenceId, action: "read", baseHash })
+        + "\ncovered=" + target.relative + ":" + String(startLine) + "-"
+        + String(startLine + lineCount - 1),
+      details,
+      items: [{
+        path: target.relative,
+        startLine,
+        lineCount,
+        evidenceId,
+        baseHash,
+        receiptOnly: true,
+      }],
+      captures: [],
+    };
+  }
+
+  const outputs: string[] = [];
+  const items: InspectItemDetails[] = [];
+  const capturedDetails: InspectDetails[] = [];
+  const captures: PendingReadCapture[] = [];
+  for (const interval of uncovered) {
+    const requestedCount = interval.end - interval.start;
+    const readInput: InspectInput = {
+      action: "read",
+      path: target.relative,
+      startLine: interval.start,
+      lineCount: requestedCount,
+    };
+    const raw = await readPage(target, interval.start, requestedCount);
+    const clipped = clip(redactCredentials(raw), MAX_BUNDLE_SOURCE_BYTES);
+    const contentHash = hashBytes(Buffer.from(clipped.text, "utf8"));
+    const evidenceId = "0000000000000000";
+    const details: InspectDetails = {
+      action: "read",
+      evidenceId,
+      contentHash,
+      baseHash,
+      lines: clipped.lines,
+      truncated: clipped.truncated,
+      actionKey: inspectActionKey(readInput),
+      cacheHit: false,
+      receiptOnly: false,
+    };
+    outputs.push(renderCapturedText(evidenceId, contentHash, baseHash, clipped));
+    captures.push({ input: readInput, clipped, contentHash, baseHash });
+    capturedDetails.push(details);
+    items.push({
+      path: target.relative,
+      startLine: interval.start,
+      lineCount: clipped.lines,
+      evidenceId,
+      baseHash,
+      receiptOnly: false,
+    });
+  }
+  const first = capturedDetails[0];
+  if (!first) throw new Error("inspect read preview 未生成源码窗口");
+  return {
+    text: outputs.join("\n"),
+    details: {
+      ...first,
+      lines: capturedDetails.reduce((sum, details) => sum + details.lines, 0),
+      items,
+    },
+    items,
+    captures,
+  };
+}
+
+/** 把已通过 bundle 最终预算的 preview 提交到证据账本，不再次读取文件。 */
+async function capturePreviewReadRange(
+  context: InspectToolContext,
+  preview: Awaited<ReturnType<typeof previewReadRange>>,
+): Promise<{ text: string; details: InspectDetails; items: InspectItemDetails[] }> {
+  if (preview.captures.length === 0) return preview;
+  const outputs: string[] = [];
+  const items: InspectItemDetails[] = [];
+  const details: InspectDetails[] = [];
+  for (const capture of preview.captures) {
+    const projectedDetails: InspectDetails = {
+      action: "read",
+      evidenceId: "",
+      contentHash: capture.contentHash,
+      baseHash: capture.baseHash,
+      lines: capture.clipped.lines,
+      truncated: capture.clipped.truncated,
+      actionKey: inspectActionKey(capture.input),
+      cacheHit: false,
+      receiptOnly: false,
+    };
+    const projected = sourceEvidence(capture.input, projectedDetails, null);
+    const saved = await context.evidence.captureText(projected, capture.clipped.text);
+    projectedDetails.evidenceId = saved.record.id;
+    outputs.push(renderCapturedText(
+      projectedDetails.evidenceId,
+      capture.contentHash,
+      capture.baseHash,
+      capture.clipped,
+    ));
+    details.push(projectedDetails);
+    items.push({
+      path: capture.input.path ?? "",
+      startLine: capture.input.startLine ?? 1,
+      lineCount: capture.clipped.lines,
+      evidenceId: projectedDetails.evidenceId,
+      baseHash: capture.baseHash,
+      receiptOnly: false,
+    });
+  }
+  const first = details[0];
+  if (!first) throw new Error("inspect bundle 未提交源码窗口");
+  return {
+    text: outputs.join("\n"),
+    details: {
+      ...first,
+      lines: details.reduce((sum, entry) => sum + entry.lines, 0),
+      items,
+    },
+    items,
   };
 }
 
@@ -561,16 +876,71 @@ async function scopedSearch(
   root: string,
   query: string,
   plan: SearchScopePlan,
-): Promise<SearchOutput & { scope: string[]; expansionLevel: string; expanded: boolean }> {
+  followSharedImports = false,
+): Promise<SearchOutput & {
+  scope: string[];
+  expansionLevel: string;
+  expanded: boolean;
+  floorRouteLevel: NonNullable<InspectDetails["floorRouteLevel"]>;
+  floorScopeCount: number;
+}> {
   let result: SearchOutput = { text: "", matchCount: 0, complete: true };
   const scope: string[] = [];
   let expansionLevel = plan.stages[0]?.level ?? "repository";
+  let floorScopeCount = 0;
+  const floorRouteLevel = (level: string): NonNullable<InspectDetails["floorRouteLevel"]> => {
+    if (!plan.floorRouted) return "none";
+    if (level === "floor-current") return "current";
+    if (level === "floor-adjacent") return "adjacent";
+    if (level === "floor-shared") return "shared";
+    return "fallback";
+  };
+  const importOnlyMatches = (text: string): boolean => {
+    const matches = text.split(/\r?\n/u).filter(Boolean);
+    return matches.length > 0 && matches.every((row) => {
+      const parsed = /^.*:\d+:(.*)$/u.exec(row);
+      const source = parsed?.[1]?.trim() ?? "";
+      return /^(?:import\b|export\s+.*\bfrom\b)/u.test(source);
+    });
+  };
   for (const [index, stage] of plan.stages.entries()) {
     result = await searchText(root, query, stage.roots);
     scope.push(...(stage.roots.length > 0 ? stage.roots : ["."]));
+    floorScopeCount += stage.floorScopeCount;
     expansionLevel = stage.level;
+    if (
+      followSharedImports
+      && result.matchCount > 0
+      && (stage.level === "floor-current" || stage.level === "floor-adjacent")
+      && importOnlyMatches(result.text)
+    ) {
+      const sharedStage = plan.stages.find((candidate) => candidate.level === "floor-shared");
+      if (sharedStage) {
+        const provider = await searchText(root, query, sharedStage.roots);
+        if (provider.matchCount > 0) {
+          const sharedScope = sharedStage.roots.length > 0 ? sharedStage.roots : ["."];
+          return {
+            text: [result.text, provider.text].filter(Boolean).join("\n"),
+            matchCount: result.matchCount + provider.matchCount,
+            complete: result.complete && provider.complete,
+            scope: [...scope, ...sharedScope],
+            expansionLevel: sharedStage.level,
+            expanded: true,
+            floorRouteLevel: "shared",
+            floorScopeCount,
+          };
+        }
+      }
+    }
     if (result.matchCount > 0 || plan.locked) {
-      return { ...result, scope, expansionLevel, expanded: index > 0 };
+      return {
+        ...result,
+        scope,
+        expansionLevel,
+        expanded: index > 0,
+        floorRouteLevel: floorRouteLevel(expansionLevel),
+        floorScopeCount,
+      };
     }
   }
   return {
@@ -578,6 +948,8 @@ async function scopedSearch(
     scope,
     expansionLevel,
     expanded: plan.stages.length > 1,
+    floorRouteLevel: floorRouteLevel(expansionLevel),
+    floorScopeCount,
   };
 }
 
@@ -606,6 +978,52 @@ function bundleRanges(searchTextValue: string): InspectReadRange[] {
   }));
 }
 
+function bundleReceiptIndex(input: {
+  scope: readonly string[];
+  matchCount: number | undefined;
+  windows: number;
+  expansionLevel: string | undefined;
+  expanded: boolean;
+  scopeLocked: boolean;
+  floorRouteLevel: InspectDetails["floorRouteLevel"];
+  floorScopeCount: number;
+  items: readonly InspectItemDetails[];
+}): string {
+  return [
+    "[BUNDLE_RECEIPT scope=" + input.scope.join(",")
+      + " matches=" + String(input.matchCount)
+      + " windows=" + String(input.windows)
+      + " expansionLevel=" + String(input.expansionLevel)
+      + " expanded=" + String(input.expanded)
+      + " scopeLocked=" + String(input.scopeLocked)
+      + " floorRouteLevel=" + String(input.floorRouteLevel)
+      + " floorScopeCount=" + String(input.floorScopeCount)
+      + "]",
+    ...input.items.map((item) => (
+      item.path + ":" + String(item.startLine) + "+" + String(item.lineCount)
+        + " baseHash=" + item.baseHash
+        + " evidence=" + item.evidenceId
+        + " receiptOnly=" + String(item.receiptOnly)
+    )),
+  ].join("\n");
+}
+
+function sourceWindowCount(items: readonly InspectItemDetails[]): number {
+  return items.filter((item) => !item.receiptOnly).length;
+}
+
+function readManyReceiptIndex(items: readonly InspectItemDetails[]): string {
+  return [
+    "[READ_MANY_RECEIPT items=" + String(items.length) + "]",
+    ...items.map((item) => (
+      item.path + ":" + String(item.startLine) + "+" + String(item.lineCount)
+      + " baseHash=" + item.baseHash
+      + " evidence=" + item.evidenceId
+      + " receiptOnly=" + String(item.receiptOnly)
+    )),
+  ].join("\n");
+}
+
 /**
  * 执行一次受限只读检查。
  *
@@ -619,6 +1037,7 @@ export async function inspectTask(
   context: InspectToolContext,
   input: InspectInput,
   signal?: AbortSignal,
+  knownWorktreeHash?: string,
 ): Promise<{ text: string; details: InspectDetails }> {
   signal?.throwIfAborted();
   const root = context.task.worktreeRoot;
@@ -636,35 +1055,53 @@ export async function inspectTask(
       sum + (range.lineCount ?? DEFAULT_READ_LINES)
     ), 0);
     if (requestedLines > MAX_LINES) throw new Error("read_many 总请求不能超过 240 行");
-    const outputs = [];
+    const previews: ReadRangePreview[] = [];
+    for (const range of input.ranges) {
+      previews.push(await previewReadRange(context, range, signal));
+    }
+    const selected: ReadRangePreview[] = [];
+    const previewOutputs: string[] = [];
+    const previewItems: InspectItemDetails[] = [];
+    const truncatedMarker = "[批量读取结果已按 4 KiB 预算省略未展示范围]";
+    const bodyBudget = MAX_BODY_BYTES - Buffer.byteLength("\n" + truncatedMarker, "utf8");
+    for (const preview of previews) {
+      const candidateOutputs = [...previewOutputs, preview.text];
+      const candidateItems = [...previewItems, ...preview.items];
+      const candidateBody = [
+        readManyReceiptIndex(candidateItems),
+        ...candidateOutputs,
+      ].join("\n");
+      if (Buffer.byteLength(candidateBody, "utf8") > bodyBudget) continue;
+      selected.push(preview);
+      previewOutputs.push(preview.text);
+      previewItems.push(...preview.items);
+    }
+
+    const outputs: string[] = [];
     const items: InspectItemDetails[] = [];
     const details: InspectDetails[] = [];
-    for (const range of input.ranges) {
-      const output = await inspectReadRange(context, range, signal);
+    for (const preview of selected) {
+      const output = await capturePreviewReadRange(context, preview);
       outputs.push(output.text);
       items.push(...output.items);
       details.push(output.details);
     }
-    const batchIndex = [
-      "[READ_MANY_RECEIPT items=" + String(items.length) + "]",
-      ...items.map((item) => (
-        item.path + ":" + String(item.startLine) + "+" + String(item.lineCount)
-        + " baseHash=" + item.baseHash
-        + " evidence=" + item.evidenceId
-        + " receiptOnly=" + String(item.receiptOnly)
-      )),
+    const omitted = selected.length < previews.length;
+    const body = [
+      readManyReceiptIndex(items),
+      ...outputs,
+      ...(omitted ? [truncatedMarker] : []),
     ].join("\n");
-    const combined = clip(batchIndex + "\n" + outputs.join("\n"));
     const first = details[0];
     if (!first) throw new Error("read_many 未生成源码证据");
     return {
-      text: combined.text + (combined.truncated ? "\n[批量读取结果已按 240 行或 4 KiB 截断]" : ""),
+      text: body,
       details: {
         ...first,
         action: "read_many",
         actionKey: inspectActionKey(input),
         lines: details.reduce((sum, entry) => sum + entry.lines, 0),
-        truncated: combined.truncated,
+        truncated: omitted || details.some((entry) => entry.truncated),
         cacheHit: details.every((entry) => entry.cacheHit),
         receiptOnly: details.every((entry) => entry.receiptOnly === true),
         items,
@@ -678,10 +1115,12 @@ export async function inspectTask(
   let complete: boolean | undefined;
   let expanded = false;
   let expansionLevel: string | undefined;
-  const worktreeHash = await hashWorktree(root);
+  let floorRouteLevel: InspectDetails["floorRouteLevel"] = "none";
+  let floorScopeCount = 0;
+  const worktreeHash = knownWorktreeHash ?? await hashWorktree(root);
   const scopePlan = input.action === "search" || input.action === "bundle"
     ? searchScopePlan(context, input)
-    : { stages: [], locked: false, cacheScope: [] };
+    : { stages: [], locked: false, cacheScope: [], floorRouted: false };
   const actionKey = inspectActionKey(input, scopePlan.cacheScope);
   const validityKey = worktreeHash;
   const cached = await context.evidence.findReusable(actionKey, validityKey);
@@ -703,6 +1142,12 @@ export async function inspectTask(
         scope: cachedScope,
         matchCount: cachedMatches,
         complete: cachedComplete,
+        floorRouteLevel: typeof cached.metadata.floorRouteLevel === "string"
+          ? cached.metadata.floorRouteLevel as InspectDetails["floorRouteLevel"]
+          : "none",
+        floorScopeCount: typeof cached.metadata.floorScopeCount === "number"
+          ? cached.metadata.floorScopeCount
+          : 0,
       }),
       details: {
         action: input.action,
@@ -724,6 +1169,12 @@ export async function inspectTask(
         ...(typeof cached.metadata.bundleWindows === "number"
           ? { bundleWindows: cached.metadata.bundleWindows }
           : {}),
+        floorRouteLevel: typeof cached.metadata.floorRouteLevel === "string"
+          ? cached.metadata.floorRouteLevel as NonNullable<InspectDetails["floorRouteLevel"]>
+          : "none",
+        floorScopeCount: typeof cached.metadata.floorScopeCount === "number"
+          ? cached.metadata.floorScopeCount
+          : 0,
       },
     };
   }
@@ -738,40 +1189,72 @@ export async function inspectTask(
     raw = await readTree(root, input.path ?? ".");
   } else if (input.action === "search" || input.action === "bundle") {
     if (!input.query) throw new Error("search 必须提供 query");
-    const result = await scopedSearch(root, input.query, scopePlan);
+    const result = await scopedSearch(root, input.query, scopePlan, input.action === "bundle");
     scope = result.scope;
     expanded = result.expanded;
     expansionLevel = result.expansionLevel;
+    floorRouteLevel = result.floorRouteLevel;
+    floorScopeCount = result.floorScopeCount;
     matchCount = result.matchCount;
     complete = result.complete;
     if (input.action === "bundle") {
       const ranges = bundleRanges(result.text);
+      // 先读取未持久化 preview，按最终正文和索引预算选择窗口；被预算淘汰的窗口
+      // 不会进入 Evidence Ledger，后续精确 read 仍会返回真实源码。
+      const previews: Array<{
+        range: InspectReadRange;
+        preview: Awaited<ReturnType<typeof previewReadRange>>;
+      }> = [];
+      for (const range of ranges) {
+        previews.push({
+          range,
+          preview: await previewReadRange(context, range, signal),
+        });
+      }
       const outputs: string[] = [];
       const items: InspectItemDetails[] = [];
-      for (const range of ranges) {
-        const output = await inspectReadRange(context, range, signal);
-        const candidate = outputs.length === 0
-          ? output.text
-          : outputs.join("\n") + "\n" + output.text;
-        if (outputs.length > 0 && Buffer.byteLength(candidate, "utf8") > MAX_BODY_BYTES) break;
+      const selected: typeof previews = [];
+      for (const candidate of previews) {
+        const candidateOutputs = [...outputs, candidate.preview.text];
+        const candidateItems = [...items, ...candidate.preview.items];
+        const index = bundleReceiptIndex({
+          scope,
+          matchCount,
+          windows: sourceWindowCount(candidateItems),
+          expansionLevel: result.expansionLevel,
+          expanded,
+          scopeLocked: scopePlan.locked,
+          floorRouteLevel: result.floorRouteLevel,
+          floorScopeCount: result.floorScopeCount,
+          items: candidateItems,
+        });
+        const candidateBody = [index, ...candidateOutputs].join("\n");
+        if (Buffer.byteLength(candidateBody, "utf8") > MAX_BUNDLE_BODY_BYTES) continue;
+        selected.push(candidate);
+        outputs.push(candidate.preview.text);
+        items.push(...candidate.preview.items);
+      }
+
+      // 预算确定后才执行真正的读取/证据写入；preview 的占位 ID 与真实 ID 等长，
+      // 因而最终正文仍满足同一预算。已有覆盖窗口只生成回执，不重复保存正文。
+      outputs.length = 0;
+      items.length = 0;
+      for (const candidate of selected) {
+        const output = await capturePreviewReadRange(context, candidate.preview);
         outputs.push(output.text);
         items.push(...output.items);
       }
-      const index = [
-        "[BUNDLE_RECEIPT scope=" + scope.join(",")
-          + " matches=" + String(matchCount)
-          + " windows=" + String(outputs.length)
-          + " expansionLevel=" + result.expansionLevel
-          + " expanded=" + String(expanded)
-          + " scopeLocked=" + String(scopePlan.locked)
-          + "]",
-        ...items.map((item) => (
-          item.path + ":" + String(item.startLine) + "+" + String(item.lineCount)
-          + " baseHash=" + item.baseHash
-          + " evidence=" + item.evidenceId
-          + " receiptOnly=" + String(item.receiptOnly)
-        )),
-      ].join("\n");
+      const index = bundleReceiptIndex({
+        scope,
+        matchCount,
+        windows: sourceWindowCount(items),
+        expansionLevel: result.expansionLevel,
+        expanded,
+        scopeLocked: scopePlan.locked,
+        floorRouteLevel: result.floorRouteLevel,
+        floorScopeCount: result.floorScopeCount,
+        items,
+      });
       const captured = await captureSourceText(context, input, [index, ...outputs].join("\n"), {
         baseHash: null,
         worktreeHash,
@@ -780,7 +1263,9 @@ export async function inspectTask(
         complete,
         expanded,
         expansionLevel: result.expansionLevel,
-        bundleWindows: outputs.length,
+        bundleWindows: sourceWindowCount(items),
+        floorRouteLevel: result.floorRouteLevel,
+        floorScopeCount: result.floorScopeCount,
       });
       captured.details.items = items;
       return captured;
@@ -793,6 +1278,8 @@ export async function inspectTask(
         + " expanded=" + String(expanded)
         + " scopeLocked=" + String(scopePlan.locked)
         + " expansionLevel=" + result.expansionLevel
+        + " floorRouteLevel=" + result.floorRouteLevel
+        + " floorScopeCount=" + String(result.floorScopeCount)
         + "]",
       suggestions.length > 0 ? "suggestedRanges=" + suggestions.join(",") : "suggestedRanges=(none)",
       result.text || "(no matches)",
@@ -809,6 +1296,8 @@ export async function inspectTask(
     ...(complete === undefined ? {} : { complete }),
     expanded,
     ...(expansionLevel === undefined ? {} : { expansionLevel }),
+    floorRouteLevel,
+    floorScopeCount,
   });
 }
 
@@ -825,24 +1314,32 @@ export function registerInspectTool(
   pi.registerTool({
     name: "inspect",
     label: "检查代码",
-    description: "按游戏职责区域查看 Git 状态、浅目录、一次性源码 bundle、文本搜索、分页文件或当前 Diff。",
+    description: "按游戏楼层 scope 与职责区域查看 Git 状态、浅目录、一次性源码 bundle、文本搜索、分页文件或当前 Diff。",
     promptSnippet: "用 inspect 获取代码与 Git 证据",
     promptGuidelines: [
       "定位源码时默认先用 inspect bundle；只有上下文不足时再补 read/read_many。",
       "修改前必须取得目标文件的 baseHash；bundle 窗口已包含可用于 patch 的 baseHash。",
       "search 默认使用本轮游戏区域路由；给出 path 或 partitionId 时固定该范围，不要无理由全仓搜索。",
+      "已知故障楼层可给 floorId；顺序固定为当前层、相邻层、共享父级 partition，再按需回退 area/仓库。相邻层不是复用依赖。",
       "bundle 最多返回 4 个 48 行窗口且总计不超过 192 行；ALREADY_SEEN 不需要再次读取。",
     ],
     executionMode: "sequential",
     parameters: InspectParameters,
-    async execute(_toolCallId, input, signal) {
+    async execute(toolCallId, input, signal) {
       try {
-        const output = await inspectTask(context, input, signal);
+        const output = await inspectTask(
+          context,
+          input,
+          signal,
+          context.inspectWorktreeHash?.(toolCallId),
+        );
         await appendEvent(context.store, context.task.id, "tool.inspect", {
           action: input.action,
           outcome: output.details.receiptOnly === true ? "receipt" : "execution",
           expanded: output.details.expanded ?? false,
           bundleWindows: output.details.bundleWindows ?? 0,
+          floorRouteLevel: output.details.floorRouteLevel ?? "none",
+          floorScopeCount: output.details.floorScopeCount ?? 0,
         });
         return {
           content: [{ type: "text", text: output.text }],
@@ -854,6 +1351,8 @@ export function registerInspectTool(
           outcome: "failure",
           expanded: false,
           bundleWindows: 0,
+          floorRouteLevel: "none",
+          floorScopeCount: 0,
         });
         throw error;
       }

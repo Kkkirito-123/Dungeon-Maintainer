@@ -86,7 +86,7 @@ test-fixtures/
 └─ smoke-tasks/       # 已脱敏的 task/events/Pi JSONL 回归样本
 ```
 
-`agent-evals/_bases/game-repair-v1/` 保存一份 467 文件共享正常基线；
+`agent-evals/_bases/game-repair-v1/` 保存一份 521 文件共享正常基线；
 `agent-evals/terminal-action-bug/` 只保存一行 Bug Patch，并在 `fixture.json` 中记录共享基线 ID、
 唯一脏路径和补丁 SHA-256。这样既能复现真实 Git 修复语义，又不会为每道题复制整个游戏，
 也不会把个人绝对路径、`.git` 目录或外部 `node_modules` Junction 带进仓库。需要物化时由
@@ -191,6 +191,18 @@ writeAttempts = writeRejected + writeFailures + writeNoops + writeMutations
 `writeReplayFailures` 是 `writeMutations` 中刷新/重放失败的子集；`diagnosisMs` 截止第一次真实
 mutation，而不是第一次被拒绝、失败或无变化的写入尝试。`workflowClosure.executed` 同样只由
 真实 mutation 决定。
+
+V3 另外输出 `floorRoutedInspectCalls / floorScopesVisited` 和
+`floorRouteCurrentExecutions / floorRouteAdjacentExecutions / floorRouteSharedExecutions /
+floorRouteFallbackExecutions`。它们只聚合顶层 Inspect execution 的路由级别和访问 scope 数量，
+用于发现不必要的跨层或 area/repository 扩展；不改变上述 Inspect/写入分类等式，也不记录 query、
+源码或模型正文。
+
+```text
+floorRoutedInspectCalls
+= floorRouteCurrentExecutions + floorRouteAdjacentExecutions
++ floorRouteSharedExecutions + floorRouteFallbackExecutions
+```
 
 ## 推荐固定用例
 

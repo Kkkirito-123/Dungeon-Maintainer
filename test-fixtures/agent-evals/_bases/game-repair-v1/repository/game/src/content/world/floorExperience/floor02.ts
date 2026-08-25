@@ -406,7 +406,6 @@ export const FLOOR_TWO_EXPERIENCE: FloorExperienceDefinition = {
     { id: "f2-admin-village", label: "F2 沉水村落", completedLessonIds: ["order-by", "distinct"], defeatedMonsterIds: [10, 11], openedGateIds: [], collectedKeyItems: [], focusLandmarkId: "f2-drowned-village" },
     { id: "f2-admin-hidden", label: "F2 沉船记录舱", completedLessonIds: ["order-by", "distinct"], defeatedMonsterIds: [10, 11], openedGateIds: ["gate:floor-2-treasure"], collectedKeyItems: [], focusLandmarkId: "f2-wreck-ledger" },
     { id: "f2-admin-low-tide", label: "F2 退潮与船闸", completedLessonIds: ["order-by", "distinct", "inner-join"], defeatedMonsterIds: [10, 11, 12, 21], openedGateIds: ["shortcut:2:return"], collectedKeyItems: ["shortcut-key:2"], focusLandmarkId: "f2-ship-lock" },
-    { id: "f2-admin-after-frog", label: "F2 区域门前", completedLessonIds: ["order-by", "distinct", "inner-join", "left-join"], defeatedMonsterIds: [10, 11, 12, 13, 22], openedGateIds: [], collectedKeyItems: [], focusLandmarkId: "f2-ship-lock" },
     { id: "f2-admin-frog-court", label: "F2 泥冠硬门", completedLessonIds: ["order-by", "distinct", "inner-join", "left-join"], defeatedMonsterIds: [10, 11, 12, 13, 22], openedGateIds: [], collectedKeyItems: [], focusLandmarkId: "f2-frog-court" },
     { id: "f2-admin-complete", label: "F2 通关", completedLessonIds: ["order-by", "distinct", "inner-join", "left-join", "join-boss"], defeatedMonsterIds: [10, 11, 12, 13, 14, 21, 22], openedGateIds: ["shortcut:2:return"], collectedKeyItems: ["floor-key:2"], focusLandmarkId: "f2-north-ferry" },
   ],

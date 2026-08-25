@@ -24,6 +24,7 @@ import {
   benchmarkGameStartEnvironment,
   benchmarkSettledDecision,
   benchmarkShellEndpoint,
+  buildMaintainerWorkflowClosure,
   isBenchmarkExecutionApproval,
   isBenchmarkUiRequest,
   readMaintainerTelemetry,
@@ -48,6 +49,34 @@ function metricValue(
 }
 
 describe("Dungeon Maintainer Benchmark", () => {
+  it("真实 mutation 与结束时保留变更分别记录", () => {
+    const reverted = buildMaintainerWorkflowClosure({
+      taskState: "active",
+      proposed: true,
+      writeAttempts: 2,
+      writeMutations: 1,
+      changedPathCount: 0,
+      replayPassed: false,
+      readyToApply: false,
+      paused: false,
+    });
+    assert.equal(reverted.executed, true);
+    assert.equal(reverted.retainedChanges, false);
+
+    const retainedWithoutObservedMutation = buildMaintainerWorkflowClosure({
+      taskState: "active",
+      proposed: false,
+      writeAttempts: 0,
+      writeMutations: 0,
+      changedPathCount: 1,
+      replayPassed: false,
+      readyToApply: false,
+      paused: false,
+    });
+    assert.equal(retainedWithoutObservedMutation.executed, false);
+    assert.equal(retainedWithoutObservedMutation.retainedChanges, true);
+  });
+
   it("Inspect 与写入遥测逐行容错并满足分类闭合", async () => {
     const root = await mkdtemp(join(tmpdir(), "maintainer-telemetry-v2-"));
     try {
@@ -56,8 +85,29 @@ describe("Dungeon Maintainer Benchmark", () => {
         JSON.stringify({
           at: "2026-08-25T00:00:01.000Z",
           type: "tool.inspect",
-          detail: { action: "bundle", outcome: "execution", bundleWindows: 3, expanded: false },
+          detail: {
+            action: "bundle",
+            outcome: "execution",
+            bundleWindows: 3,
+            expanded: false,
+            floorRouteLevel: "current",
+            floorScopeCount: 1,
+          },
         }),
+        ...(["adjacent", "shared", "fallback"] as const).map((floorRouteLevel, index) => (
+          JSON.stringify({
+            at: "2026-08-25T00:00:01." + String(index + 1).padStart(3, "0") + "Z",
+            type: "tool.inspect",
+            detail: {
+              action: "search",
+              outcome: "execution",
+              bundleWindows: 0,
+              expanded: true,
+              floorRouteLevel,
+              floorScopeCount: 3,
+            },
+          })
+        )),
         "{broken",
         JSON.stringify({
           at: "2026-08-25T00:00:02.000Z",
@@ -91,9 +141,22 @@ describe("Dungeon Maintainer Benchmark", () => {
         }),
       ].join("\n") + "\n", "utf8");
       const telemetry = await readMaintainerTelemetry(path);
-      assert.equal(telemetry.executions + telemetry.receiptHits + telemetry.inspectFailures, 3);
+      assert.equal(telemetry.executions + telemetry.receiptHits + telemetry.inspectFailures, 6);
       assert.equal(telemetry.bundles, 1);
       assert.equal(telemetry.bundleWindows, 3);
+      assert.equal(telemetry.floorRoutedInspectCalls, 4);
+      assert.equal(telemetry.floorScopesVisited, 10);
+      assert.equal(telemetry.floorRouteCurrentExecutions, 1);
+      assert.equal(telemetry.floorRouteAdjacentExecutions, 1);
+      assert.equal(telemetry.floorRouteSharedExecutions, 1);
+      assert.equal(telemetry.floorRouteFallbackExecutions, 1);
+      assert.equal(
+        telemetry.floorRouteCurrentExecutions
+          + telemetry.floorRouteAdjacentExecutions
+          + telemetry.floorRouteSharedExecutions
+          + telemetry.floorRouteFallbackExecutions,
+        telemetry.floorRoutedInspectCalls,
+      );
       assert.equal(
         telemetry.writeRejected
           + telemetry.writeFailures
