@@ -121,28 +121,106 @@ function safeFailureCode(error: unknown): string {
   return "maintainer-current-error";
 }
 
-async function readInspectTelemetry(eventsPath: string): Promise<{
+export interface MaintainerTelemetry {
   executions: number;
   receiptHits: number;
   expansions: number;
-}> {
+  bundles: number;
+  bundleWindows: number;
+  inspectFailures: number;
+  writeRejected: number;
+  writeFailures: number;
+  writeNoops: number;
+  writeMutations: number;
+  writeReplayFailures: number;
+  loopGuardBlocks: number;
+  parseErrors: number;
+  firstMutationAt: number | null;
+}
+
+function emptyTelemetry(): MaintainerTelemetry {
+  return {
+    executions: 0,
+    receiptHits: 0,
+    expansions: 0,
+    bundles: 0,
+    bundleWindows: 0,
+    inspectFailures: 0,
+    writeRejected: 0,
+    writeFailures: 0,
+    writeNoops: 0,
+    writeMutations: 0,
+    writeReplayFailures: 0,
+    loopGuardBlocks: 0,
+    parseErrors: 0,
+    firstMutationAt: null,
+  };
+}
+
+export async function readMaintainerTelemetry(eventsPath: string): Promise<MaintainerTelemetry> {
+  const telemetry = emptyTelemetry();
+  let rows: string[];
   try {
-    const rows = (await readFile(eventsPath, "utf8")).split(/\r?\n/u).filter(Boolean);
-    let executions = 0;
-    let receiptHits = 0;
-    let expansions = 0;
-    for (const row of rows) {
-      const event = record(JSON.parse(row));
-      if (event?.type !== "tool.inspect") continue;
-      const detail = record(event.detail);
-      if (detail?.cacheHit === true || detail?.receiptOnly === true) receiptHits += 1;
-      else executions += 1;
-      if (detail?.expanded === true) expansions += 1;
-    }
-    return { executions, receiptHits, expansions };
-  } catch {
-    return { executions: 0, receiptHits: 0, expansions: 0 };
+    rows = (await readFile(eventsPath, "utf8")).split(/\r?\n/u).filter(Boolean);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") telemetry.parseErrors += 1;
+    return telemetry;
   }
+  for (const row of rows) {
+    try {
+      const event = record(JSON.parse(row));
+      if (!event || typeof event.type !== "string") {
+        telemetry.parseErrors += 1;
+        continue;
+      }
+      const detail = record(event.detail);
+      if (event.type === "tool.patch" || event.type === "worktree.native_change") {
+        const at = typeof event.at === "string" ? Date.parse(event.at) : Number.NaN;
+        if (Number.isFinite(at)) {
+          telemetry.firstMutationAt = telemetry.firstMutationAt === null
+            ? at
+            : Math.min(telemetry.firstMutationAt, at);
+        }
+      }
+      if (event.type === "tool.inspect") {
+        const outcome = typeof detail?.outcome === "string"
+          ? detail.outcome
+          : detail?.cacheHit === true || detail?.receiptOnly === true ? "receipt" : "execution";
+        if (outcome === "receipt") telemetry.receiptHits += 1;
+        else if (outcome === "failure") telemetry.inspectFailures += 1;
+        else telemetry.executions += 1;
+        if (outcome === "execution" && detail?.expanded === true) telemetry.expansions += 1;
+        if (outcome === "execution" && detail?.action === "bundle") {
+          telemetry.bundles += 1;
+          if (typeof detail.bundleWindows === "number") {
+            telemetry.bundleWindows += Math.max(0, Math.floor(detail.bundleWindows));
+          }
+        }
+      } else if (event.type === "tool.write_outcome") {
+        const outcome = detail?.outcome;
+        if (outcome === "rejected") telemetry.writeRejected += 1;
+        else if (outcome === "failed") telemetry.writeFailures += 1;
+        else if (outcome === "noop") telemetry.writeNoops += 1;
+        else if (outcome === "mutated" || outcome === "mutated_replay_failed") {
+          telemetry.writeMutations += 1;
+          if (outcome === "mutated_replay_failed") telemetry.writeReplayFailures += 1;
+          const at = typeof event.at === "string" ? Date.parse(event.at) : Number.NaN;
+          if (Number.isFinite(at)) {
+            telemetry.firstMutationAt = telemetry.firstMutationAt === null
+              ? at
+              : Math.min(telemetry.firstMutationAt, at);
+          }
+        } else {
+          telemetry.parseErrors += 1;
+        }
+      } else if (event.type === "tool.loop_guard" && detail?.outcome === "blocked") {
+        telemetry.loopGuardBlocks += 1;
+      }
+    } catch {
+      telemetry.parseErrors += 1;
+    }
+  }
+  return telemetry;
 }
 
 function requireBenchmarkRpc(value: PiRpcProcess | null): PiRpcProcess {
@@ -222,6 +300,7 @@ export async function runPiMaintainer(
   options: PiMaintainerRunOptions,
 ): Promise<PiRunOutcome> {
   const startedAt = performance.now();
+  const startedEpoch = Date.now();
   let visibleAssistantText = "";
   const repositoryRoot = resolve(options.repositoryRoot);
   const runtimeRoot = resolve(options.runtimeRoot);
@@ -476,9 +555,20 @@ export async function runPiMaintainer(
   }
   const tokens = stats.tokens ?? {};
   const contextUsage = stats.contextUsage ?? {};
-  const inspectTelemetry = await readInspectTelemetry(
+  const telemetry = await readMaintainerTelemetry(
     join(store.taskDir(task.id), "events.jsonl"),
   );
+  const classifiedInspectCalls = telemetry.executions
+    + telemetry.receiptHits
+    + telemetry.inspectFailures;
+  if (inspectCalls > classifiedInspectCalls) {
+    telemetry.inspectFailures += inspectCalls - classifiedInspectCalls;
+  }
+  const inspectTotal = telemetry.executions + telemetry.receiptHits + telemetry.inspectFailures;
+  const writeAttempts = telemetry.writeRejected
+    + telemetry.writeFailures
+    + telemetry.writeNoops
+    + telemetry.writeMutations;
   const metrics: PiRunMetrics = {
     status: runState.failureCode === "agent-timeout"
       ? "timeout"
@@ -490,9 +580,9 @@ export async function runPiMaintainer(
         ? "settled"
         : "infra_error",
     durationMs: Math.round(performance.now() - startedAt),
-    diagnosisMs: runState.firstWriteAt === null
+    diagnosisMs: telemetry.firstMutationAt === null
       ? null
-      : Math.round(runState.firstWriteAt - startedAt),
+      : Math.max(0, telemetry.firstMutationAt - startedEpoch),
     turns,
     toolCalls,
     diagnosticToolCalls,
@@ -503,10 +593,21 @@ export async function runPiMaintainer(
     taskQueuePeak,
     episodes,
     recoveries,
-    inspectCalls,
-    inspectExecutions: inspectTelemetry.executions,
-    inspectReceiptHits: inspectTelemetry.receiptHits,
-    routedSearchExpansions: inspectTelemetry.expansions,
+    inspectCalls: inspectTotal,
+    inspectExecutions: telemetry.executions,
+    inspectReceiptHits: telemetry.receiptHits,
+    inspectBundles: telemetry.bundles,
+    inspectBundleWindows: telemetry.bundleWindows,
+    inspectFailures: telemetry.inspectFailures,
+    routedSearchExpansions: telemetry.expansions,
+    writeAttempts,
+    writeRejected: telemetry.writeRejected,
+    writeFailures: telemetry.writeFailures,
+    writeNoops: telemetry.writeNoops,
+    writeMutations: telemetry.writeMutations,
+    writeReplayFailures: telemetry.writeReplayFailures,
+    loopGuardBlocks: telemetry.loopGuardBlocks,
+    telemetryParseErrors: telemetry.parseErrors,
     inputTokens: tokens.input ?? 0,
     outputTokens: tokens.output ?? 0,
     cacheReadTokens: tokens.cacheRead ?? 0,
@@ -520,8 +621,8 @@ export async function runPiMaintainer(
     applicable: true,
     taskState: null,
     proposed: false,
-    executed: writeCalls > 0,
-    writeAttempted: writeCalls > 0,
+    executed: telemetry.writeMutations > 0,
+    writeAttempted: writeAttempts > 0,
     retainedChanges: false,
     verified: false,
     readyToApply: false,
@@ -533,8 +634,8 @@ export async function runPiMaintainer(
       applicable: true,
       taskState: finalTask.state,
       proposed,
-      executed: finalTask.changedPaths.length > 0 || writeCalls > 0,
-      writeAttempted: writeCalls > 0,
+      executed: finalTask.changedPaths.length > 0,
+      writeAttempted: writeAttempts > 0,
       retainedChanges: finalTask.changedPaths.length > 0,
       verified: finalTask.verification?.replayPassed === true,
       readyToApply: finalTask.state === "ready_to_apply",

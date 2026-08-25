@@ -26,6 +26,7 @@ import {
   benchmarkShellEndpoint,
   isBenchmarkExecutionApproval,
   isBenchmarkUiRequest,
+  readMaintainerTelemetry,
 } from "../src/benchmark/pi-maintainer.js";
 import {
   requestWithDeadline,
@@ -47,6 +48,68 @@ function metricValue(
 }
 
 describe("Dungeon Maintainer Benchmark", () => {
+  it("Inspect 与写入遥测逐行容错并满足分类闭合", async () => {
+    const root = await mkdtemp(join(tmpdir(), "maintainer-telemetry-v2-"));
+    try {
+      const path = join(root, "events.jsonl");
+      await writeFile(path, [
+        JSON.stringify({
+          at: "2026-08-25T00:00:01.000Z",
+          type: "tool.inspect",
+          detail: { action: "bundle", outcome: "execution", bundleWindows: 3, expanded: false },
+        }),
+        "{broken",
+        JSON.stringify({
+          at: "2026-08-25T00:00:02.000Z",
+          type: "tool.inspect",
+          detail: { action: "bundle", outcome: "receipt", bundleWindows: 0, expanded: false },
+        }),
+        JSON.stringify({
+          at: "2026-08-25T00:00:03.000Z",
+          type: "tool.inspect",
+          detail: { action: "read", outcome: "failure", bundleWindows: 0, expanded: false },
+        }),
+        JSON.stringify({
+          at: "2026-08-25T00:00:04.000Z",
+          type: "tool.write_outcome",
+          detail: { toolName: "write", outcome: "rejected", reasonCode: "path-rejected" },
+        }),
+        JSON.stringify({
+          at: "2026-08-25T00:00:05.000Z",
+          type: "tool.write_outcome",
+          detail: { toolName: "patch", outcome: "noop", reasonCode: "worktree-unchanged" },
+        }),
+        JSON.stringify({
+          at: "2026-08-25T00:00:06.000Z",
+          type: "tool.write_outcome",
+          detail: { toolName: "patch", outcome: "mutated_replay_failed", reasonCode: "refresh-replay-failed" },
+        }),
+        JSON.stringify({
+          at: "2026-08-25T00:00:07.000Z",
+          type: "tool.loop_guard",
+          detail: { toolName: "patch", outcome: "blocked", reasonCode: "block-exact_action_result" },
+        }),
+      ].join("\n") + "\n", "utf8");
+      const telemetry = await readMaintainerTelemetry(path);
+      assert.equal(telemetry.executions + telemetry.receiptHits + telemetry.inspectFailures, 3);
+      assert.equal(telemetry.bundles, 1);
+      assert.equal(telemetry.bundleWindows, 3);
+      assert.equal(
+        telemetry.writeRejected
+          + telemetry.writeFailures
+          + telemetry.writeNoops
+          + telemetry.writeMutations,
+        3,
+      );
+      assert.equal(telemetry.writeReplayFailures, 1);
+      assert.equal(telemetry.loopGuardBlocks, 1);
+      assert.equal(telemetry.parseErrors, 1);
+      assert.equal(telemetry.firstMutationAt, Date.parse("2026-08-25T00:00:06.000Z"));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("真实修复评测拒绝误用 Pro，只接受 Flash modelId", () => {
     assert.doesNotThrow(() => assertFlashBenchmarkModel("deepseek-v4-flash"));
     assert.throws(() => assertFlashBenchmarkModel("deepseek-v4-pro"), /只允许 Flash/u);

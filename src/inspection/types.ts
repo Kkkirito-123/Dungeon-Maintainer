@@ -1,5 +1,5 @@
 /** 与具体 Agent 工具框架无关的受限源码检查契约。 */
-export type InspectAction = "status" | "tree" | "search" | "read" | "read_many" | "diff";
+export type InspectAction = "status" | "tree" | "search" | "bundle" | "read" | "read_many" | "diff";
 
 /** `read_many` 中一个受限源码范围。 */
 export interface InspectReadRange {
@@ -44,5 +44,7 @@ export interface InspectDetails {
   matchCount?: number;
   complete?: boolean;
   expanded?: boolean;
+  expansionLevel?: string;
+  bundleWindows?: number;
   items?: InspectItemDetails[];
 }

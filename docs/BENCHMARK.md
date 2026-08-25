@@ -178,6 +178,18 @@ pnpm benchmark -- game-repair-matrix `
 语义重复结果、到方案前 inspect 次数和诊断耗时。单 Agent Loop 中前三项续跑指标应恒为零；其它指标
 只用于发现重复搜索和收尾回归，不反馈控制 Agent，也不需要把提示词或工具正文写进报告。
 
+V2 结果另外输出 `inspectBundles / inspectBundleWindows / inspectFailures`、写入尝试五类结果、
+`loopGuardBlocks` 和 `telemetryParseErrors`。每次结果必须满足：
+
+```text
+inspectCalls = inspectExecutions + inspectReceiptHits + inspectFailures
+writeAttempts = writeRejected + writeFailures + writeNoops + writeMutations
+```
+
+`writeReplayFailures` 是 `writeMutations` 中刷新/重放失败的子集；`diagnosisMs` 截止第一次真实
+mutation，而不是第一次被拒绝、失败或无变化的写入尝试。`workflowClosure.executed` 同样只由
+真实 mutation 决定。
+
 ## 推荐固定用例
 
 每次比较模型、提示词或上下文策略时都从干净任务运行以下三项，不能复用旧 Pi session：

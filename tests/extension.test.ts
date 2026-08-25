@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import type {
@@ -86,6 +86,108 @@ function requireHook(
 }
 
 describe("Pi Extension 单循环工具、命令和会话阻断", () => {
+  it("相同失败写入只执行两次，第三次由真实 Extension 门禁阻止", async () => {
+    const repository = await createTemporaryGitRepository({ "README.md": "baseline\n" });
+    try {
+      const dataDir = join(repository.temporaryRoot, "data-loop-v2");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "task-loop-v2",
+        objective: "修复重复写入",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(store.taskDir("task-loop-v2"), "pi"),
+      });
+      const pi = new RecordingExtensionApi();
+      const driver = {} as GameDriver;
+      installDungeonMaintainerExtension(pi as unknown as ExtensionAPI, {
+        config: loadConfig({ LOCALAPPDATA: dataDir, MAINTAINER_API_KEY: "provider-secret" }),
+        store,
+        task,
+        gameRuntime: {
+          currentDriver: () => null,
+          requireDriver: () => driver,
+          ensure: async () => driver,
+          close: async () => undefined,
+        },
+      });
+      const finish = pi.toolDefinitions.get("finish");
+      assert.ok(finish?.execute);
+      await finish.execute(
+        "approve-loop-v2",
+        {
+          status: "proposed",
+          summary: "定位到 README 测试问题。",
+          risk: "仅测试门禁。",
+          plan: {
+            title: "验证失败写入门禁",
+            steps: ["尝试同一精确补丁。"],
+            verification: "确认第三次执行前阻止。",
+            allowedPaths: ["README.md"],
+          },
+        },
+        undefined,
+        undefined,
+        { ui: { confirm: async () => true } },
+      );
+      const call = requireHook(pi, "tool_call");
+      const result = requireHook(pi, "tool_result");
+      const input = {
+        edits: [{
+          path: "README.md",
+          baseHash: "deadbeef",
+          oldText: "baseline",
+          newText: "changed",
+        }],
+      };
+      for (const id of ["failed-patch-1", "failed-patch-2"]) {
+        assert.equal(await call({
+          type: "tool_call",
+          toolCallId: id,
+          toolName: "patch",
+          input,
+        }, { ui: { notify: () => undefined } }), undefined);
+        await result({
+          type: "tool_result",
+          toolCallId: id,
+          toolName: "patch",
+          input,
+          content: [{ type: "text", text: "baseHash conflict" }],
+          details: undefined,
+          isError: true,
+        }, { ui: { notify: () => undefined } });
+      }
+      const blocked = await call({
+        type: "tool_call",
+        toolCallId: "failed-patch-3",
+        toolName: "patch",
+        input,
+      }, { ui: { notify: () => undefined } }) as {
+        block: boolean;
+        terminate: boolean;
+        reason: string;
+      };
+      assert.equal(blocked.block, true);
+      assert.match(blocked.reason, /循环门禁/u);
+
+      const events = (await readFile(join(store.taskDir(task.id), "events.jsonl"), "utf8"))
+        .split(/\r?\n/u)
+        .filter(Boolean)
+        .map((row) => JSON.parse(row) as { type: string; detail: Record<string, unknown> });
+      const writes = events.filter((event) => event.type === "tool.write_outcome");
+      assert.deepEqual(writes.map((event) => event.detail.outcome), [
+        "failed",
+        "failed",
+        "rejected",
+      ]);
+      assert.equal(events.filter((event) => event.type === "tool.loop_guard").length, 1);
+      assert.doesNotMatch(JSON.stringify(events), /baseline|changed|deadbeef/u);
+    } finally {
+      await repository.dispose();
+    }
+  });
+
   it("注册十个领域工具，并用执行门禁保护固定 Coding 工具面", async () => {
     const repository = await createTemporaryGitRepository({
       ".maintainer/project.json": JSON.stringify({

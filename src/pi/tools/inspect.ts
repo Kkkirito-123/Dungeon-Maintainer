@@ -24,6 +24,7 @@ import type {
 } from "../../inspection/types.js";
 import {
   architectureArea,
+  architecturePartition,
   type ArchitectureMap,
   type ArchitectureRoute,
 } from "../../inspection/architecture-map.js";
@@ -40,22 +41,32 @@ import {
 const exec = promisify(execFile);
 const MAX_LINES = 240;
 const MAX_BYTES = 4 * 1024;
+const MAX_BODY_BYTES = MAX_BYTES - 256;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_READ_LINES = 80;
 const MAX_READ_LINES = 160;
+const BUNDLE_WINDOW_LINES = 48;
+const MAX_BUNDLE_LINES = 192;
 
 /** `inspect` 的严格参数契约。 */
 export const InspectParameters = Type.Object({
   action: Type.Union([
     Type.Literal("status"),
     Type.Literal("tree"),
+    Type.Literal("bundle"),
     Type.Literal("search"),
     Type.Literal("read"),
     Type.Literal("read_many"),
     Type.Literal("diff"),
-  ]),
+  ], {
+    description: "定位源码默认选择 bundle；它会一次搜索并返回带 baseHash 的相关源码窗口。只有 bundle 上下文不足时才选择 search/read/read_many。",
+  }),
   path: Type.Optional(Type.String({ maxLength: 300 })),
-  query: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
+  query: Type.Optional(Type.String({
+    minLength: 1,
+    maxLength: 160,
+    description: "bundle/search 的搜索词；首次源码定位应与 action=bundle 一起使用。",
+  })),
   startLine: Type.Optional(Type.Integer({ minimum: 1, maximum: 1_000_000 })),
   lineCount: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_READ_LINES })),
   partitionId: Type.Optional(Type.String({ minLength: 3, maxLength: 80 })),
@@ -86,8 +97,8 @@ function clip(value: string): {
   let text = rows.slice(0, MAX_LINES).join("\n");
   let truncated = rows.length > MAX_LINES;
   const bytes = Buffer.from(text, "utf8");
-  if (bytes.byteLength > MAX_BYTES) {
-    text = bytes.subarray(0, MAX_BYTES).toString("utf8");
+  if (bytes.byteLength > MAX_BODY_BYTES) {
+    text = bytes.subarray(0, MAX_BODY_BYTES).toString("utf8");
     truncated = true;
   }
   return {
@@ -343,6 +354,8 @@ async function captureSourceText(
     matchCount?: number;
     complete?: boolean;
     expanded?: boolean;
+    expansionLevel?: string;
+    bundleWindows?: number;
   },
 ): Promise<{ text: string; details: InspectDetails }> {
   const clipped = clip(redactCredentials(raw));
@@ -363,20 +376,12 @@ async function captureSourceText(
     ...(options.matchCount === undefined ? {} : { matchCount: options.matchCount }),
     ...(options.complete === undefined ? {} : { complete: options.complete }),
     ...(options.expanded === undefined ? {} : { expanded: options.expanded }),
+    ...(options.expansionLevel === undefined ? {} : { expansionLevel: options.expansionLevel }),
+    ...(options.bundleWindows === undefined ? {} : { bundleWindows: options.bundleWindows }),
   };
   const projected = sourceEvidence(input, details, options.worktreeHash, resolvedScope);
   const saved = await context.evidence.captureText(projected, clipped.text);
   details.evidenceId = saved.record.id;
-  await appendEvent(context.store, context.task.id, "tool.inspect", {
-    action: input.action,
-    evidenceId: details.evidenceId,
-    lines: clipped.lines,
-    truncated: clipped.truncated,
-    cacheHit: false,
-    receiptOnly: false,
-    scopeCount: resolvedScope.length,
-    expanded: options.expanded ?? false,
-  });
   const metadata = "[EVIDENCE id="
     + details.evidenceId
     + " contentHash="
@@ -433,14 +438,6 @@ async function inspectReadRange(
       cacheHit: true,
       receiptOnly: true,
     };
-    await appendEvent(context.store, context.task.id, "tool.inspect", {
-      action: "read",
-      evidenceId,
-      lines: 0,
-      truncated: false,
-      cacheHit: true,
-      receiptOnly: true,
-    });
     return {
       text: receiptText({ evidenceId, action: "read", baseHash })
         + "\ncovered=" + range.path + ":" + String(startLine) + "-" + String(startLine + lineCount - 1),
@@ -489,30 +486,124 @@ async function inspectReadRange(
   };
 }
 
+interface SearchScopeStage {
+  level: string;
+  roots: string[];
+}
+
+interface SearchScopePlan {
+  stages: SearchScopeStage[];
+  locked: boolean;
+  cacheScope: string[];
+}
+
+function uniqueRoots(values: readonly string[], seen: Set<string>): string[] {
+  const output: string[] = [];
+  for (const value of values) {
+    const normalized = value.replaceAll("\\", "/").replace(/\/$/u, "");
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    output.push(normalized);
+  }
+  return output;
+}
+
 function searchScopePlan(
   context: InspectToolContext,
   input: InspectInput,
-): { primary: string[]; neighbors: string[]; locked: boolean; cacheScope: string[] } {
+): SearchScopePlan {
   if (input.path) {
-    return { primary: [input.path], neighbors: [], locked: true, cacheScope: [input.path] };
+    return {
+      stages: [{ level: "explicit-path", roots: [input.path] }],
+      locked: true,
+      cacheScope: ["explicit-path:" + input.path],
+    };
   }
   if (input.partitionId) {
-    const area = architectureArea(context.architectureMap?.() ?? null, input.partitionId);
-    if (!area) throw new Error("未知架构区域：" + input.partitionId);
-    return { primary: [area.root], neighbors: [], locked: true, cacheScope: [area.root] };
+    const map = context.architectureMap?.() ?? null;
+    const partition = architecturePartition(map, input.partitionId);
+    const area = architectureArea(map, input.partitionId);
+    const root = partition?.root ?? area?.root;
+    if (!root) throw new Error("未知架构分区：" + input.partitionId);
+    return {
+      stages: [{ level: partition ? "explicit-partition" : "explicit-area", roots: [root] }],
+      locked: true,
+      cacheScope: [(partition ? "explicit-partition:" : "explicit-area:") + root],
+    };
   }
   const route = context.architectureRoute?.() ?? null;
   if (!route || route.primaryAreas.length === 0) {
-    return { primary: [], neighbors: [], locked: false, cacheScope: ["<repository>"] };
+    return {
+      stages: [{ level: "repository", roots: [] }],
+      locked: false,
+      cacheScope: ["repository"],
+    };
   }
-  const primary = route.primaryAreas.map((area) => area.root);
-  const neighbors = route.neighborAreas.map((area) => area.root);
-  return {
-    primary,
-    neighbors,
-    locked: false,
-    cacheScope: [...primary, ...neighbors, "<repository-fallback>"],
+  const seen = new Set<string>();
+  const stages: SearchScopeStage[] = [];
+  const push = (level: string, roots: readonly string[]): void => {
+    const unique = uniqueRoots(roots, seen);
+    if (unique.length > 0) stages.push({ level, roots: unique });
   };
+  push("primary-partition", route.primaryPartitions.map((partition) => partition.root));
+  push("partition-neighbor", route.neighborPartitions.map((partition) => partition.root));
+  push("owning-area", route.primaryAreas.map((area) => area.root));
+  push("area-neighbor", route.neighborAreas.map((area) => area.root));
+  stages.push({ level: "repository", roots: [] });
+  return {
+    stages,
+    locked: false,
+    cacheScope: stages.flatMap((stage) => [stage.level + ":" + (stage.roots.join(",") || ".")]),
+  };
+}
+
+async function scopedSearch(
+  root: string,
+  query: string,
+  plan: SearchScopePlan,
+): Promise<SearchOutput & { scope: string[]; expansionLevel: string; expanded: boolean }> {
+  let result: SearchOutput = { text: "", matchCount: 0, complete: true };
+  const scope: string[] = [];
+  let expansionLevel = plan.stages[0]?.level ?? "repository";
+  for (const [index, stage] of plan.stages.entries()) {
+    result = await searchText(root, query, stage.roots);
+    scope.push(...(stage.roots.length > 0 ? stage.roots : ["."]));
+    expansionLevel = stage.level;
+    if (result.matchCount > 0 || plan.locked) {
+      return { ...result, scope, expansionLevel, expanded: index > 0 };
+    }
+  }
+  return {
+    ...result,
+    scope,
+    expansionLevel,
+    expanded: plan.stages.length > 1,
+  };
+}
+
+function bundleRanges(searchTextValue: string): InspectReadRange[] {
+  const selected: Array<InspectReadRange & { end: number }> = [];
+  for (const row of searchTextValue.split(/\r?\n/u)) {
+    const match = /^(.*):(\d+):/u.exec(row);
+    if (!match?.[1] || !match[2]) continue;
+    const line = Number(match[2]);
+    if (!Number.isSafeInteger(line)) continue;
+    const startLine = Math.max(1, line - 16);
+    const end = startLine + BUNDLE_WINDOW_LINES;
+    if (selected.some((range) => (
+      range.path === match[1]
+      && startLine < range.end
+      && range.startLine !== undefined
+      && range.startLine < end
+    ))) continue;
+    selected.push({ path: match[1], startLine, lineCount: BUNDLE_WINDOW_LINES, end });
+    if (selected.length * BUNDLE_WINDOW_LINES >= MAX_BUNDLE_LINES) break;
+  }
+  return selected.map((range) => ({
+    path: range.path,
+    startLine: range.startLine ?? 1,
+    lineCount: range.lineCount ?? BUNDLE_WINDOW_LINES,
+  }));
 }
 
 /**
@@ -586,10 +677,11 @@ export async function inspectTask(
   let matchCount: number | undefined;
   let complete: boolean | undefined;
   let expanded = false;
+  let expansionLevel: string | undefined;
   const worktreeHash = await hashWorktree(root);
-  const scopePlan = input.action === "search"
+  const scopePlan = input.action === "search" || input.action === "bundle"
     ? searchScopePlan(context, input)
-    : { primary: [] as string[], neighbors: [] as string[], locked: false, cacheScope: [] as string[] };
+    : { stages: [], locked: false, cacheScope: [] };
   const actionKey = inspectActionKey(input, scopePlan.cacheScope);
   const validityKey = worktreeHash;
   const cached = await context.evidence.findReusable(actionKey, validityKey);
@@ -603,15 +695,6 @@ export async function inspectTask(
     const cachedComplete = typeof cached.metadata.complete === "boolean"
       ? cached.metadata.complete
       : null;
-    await appendEvent(context.store, context.task.id, "tool.inspect", {
-      action: input.action,
-      evidenceId: cached.id,
-      lines: 0,
-      truncated: false,
-      cacheHit: true,
-      receiptOnly: true,
-      expanded: cached.metadata.expanded === true,
-    });
     return {
       text: receiptText({
         evidenceId: cached.id,
@@ -635,6 +718,12 @@ export async function inspectTask(
         ...(cachedMatches === null ? {} : { matchCount: cachedMatches }),
         ...(cachedComplete === null ? {} : { complete: cachedComplete }),
         expanded: cached.metadata.expanded === true,
+        ...(typeof cached.metadata.expansionLevel === "string"
+          ? { expansionLevel: cached.metadata.expansionLevel }
+          : {}),
+        ...(typeof cached.metadata.bundleWindows === "number"
+          ? { bundleWindows: cached.metadata.bundleWindows }
+          : {}),
       },
     };
   }
@@ -647,22 +736,55 @@ export async function inspectTask(
     ].join("\n");
   } else if (input.action === "tree") {
     raw = await readTree(root, input.path ?? ".");
-  } else if (input.action === "search") {
+  } else if (input.action === "search" || input.action === "bundle") {
     if (!input.query) throw new Error("search 必须提供 query");
-    let result = await searchText(root, input.query, scopePlan.primary);
-    scope = scopePlan.primary.length > 0 ? [...scopePlan.primary] : ["."];
-    if (result.matchCount === 0 && !scopePlan.locked && scopePlan.neighbors.length > 0) {
-      result = await searchText(root, input.query, scopePlan.neighbors);
-      scope.push(...scopePlan.neighbors);
-      expanded = true;
-    }
-    if (result.matchCount === 0 && !scopePlan.locked && scopePlan.primary.length > 0) {
-      result = await searchText(root, input.query, []);
-      scope.push(".");
-      expanded = true;
-    }
+    const result = await scopedSearch(root, input.query, scopePlan);
+    scope = result.scope;
+    expanded = result.expanded;
+    expansionLevel = result.expansionLevel;
     matchCount = result.matchCount;
     complete = result.complete;
+    if (input.action === "bundle") {
+      const ranges = bundleRanges(result.text);
+      const outputs: string[] = [];
+      const items: InspectItemDetails[] = [];
+      for (const range of ranges) {
+        const output = await inspectReadRange(context, range, signal);
+        const candidate = outputs.length === 0
+          ? output.text
+          : outputs.join("\n") + "\n" + output.text;
+        if (outputs.length > 0 && Buffer.byteLength(candidate, "utf8") > MAX_BODY_BYTES) break;
+        outputs.push(output.text);
+        items.push(...output.items);
+      }
+      const index = [
+        "[BUNDLE_RECEIPT scope=" + scope.join(",")
+          + " matches=" + String(matchCount)
+          + " windows=" + String(outputs.length)
+          + " expansionLevel=" + result.expansionLevel
+          + " expanded=" + String(expanded)
+          + " scopeLocked=" + String(scopePlan.locked)
+          + "]",
+        ...items.map((item) => (
+          item.path + ":" + String(item.startLine) + "+" + String(item.lineCount)
+          + " baseHash=" + item.baseHash
+          + " evidence=" + item.evidenceId
+          + " receiptOnly=" + String(item.receiptOnly)
+        )),
+      ].join("\n");
+      const captured = await captureSourceText(context, input, [index, ...outputs].join("\n"), {
+        baseHash: null,
+        worktreeHash,
+        scope: scopePlan.cacheScope,
+        matchCount,
+        complete,
+        expanded,
+        expansionLevel: result.expansionLevel,
+        bundleWindows: outputs.length,
+      });
+      captured.details.items = items;
+      return captured;
+    }
     const suggestions = suggestedRanges(result.text);
     raw = [
       "[SEARCH_RECEIPT scope=" + scope.join(",")
@@ -670,6 +792,7 @@ export async function inspectTask(
         + " complete=" + String(complete)
         + " expanded=" + String(expanded)
         + " scopeLocked=" + String(scopePlan.locked)
+        + " expansionLevel=" + result.expansionLevel
         + "]",
       suggestions.length > 0 ? "suggestedRanges=" + suggestions.join(",") : "suggestedRanges=(none)",
       result.text || "(no matches)",
@@ -685,6 +808,7 @@ export async function inspectTask(
     ...(matchCount === undefined ? {} : { matchCount }),
     ...(complete === undefined ? {} : { complete }),
     expanded,
+    ...(expansionLevel === undefined ? {} : { expansionLevel }),
   });
 }
 
@@ -701,21 +825,38 @@ export function registerInspectTool(
   pi.registerTool({
     name: "inspect",
     label: "检查代码",
-    description: "按游戏职责区域查看 Git 状态、浅目录、文本搜索、单个/批量分页文件或当前 Diff。",
+    description: "按游戏职责区域查看 Git 状态、浅目录、一次性源码 bundle、文本搜索、分页文件或当前 Diff。",
     promptSnippet: "用 inspect 获取代码与 Git 证据",
     promptGuidelines: [
-      "修改前必须用 inspect read 获取目标文件的 baseHash。",
+      "定位源码时默认先用 inspect bundle；只有上下文不足时再补 read/read_many。",
+      "修改前必须取得目标文件的 baseHash；bundle 窗口已包含可用于 patch 的 baseHash。",
       "search 默认使用本轮游戏区域路由；给出 path 或 partitionId 时固定该范围，不要无理由全仓搜索。",
-      "搜索回执给出 suggestedRanges 后优先用 read_many 一次读取，最多 4 段、合计 240 行；ALREADY_SEEN 不需要再次读取。",
+      "bundle 最多返回 4 个 48 行窗口且总计不超过 192 行；ALREADY_SEEN 不需要再次读取。",
     ],
     executionMode: "sequential",
     parameters: InspectParameters,
     async execute(_toolCallId, input, signal) {
-      const output = await inspectTask(context, input, signal);
-      return {
-        content: [{ type: "text", text: output.text }],
-        details: output.details,
-      };
+      try {
+        const output = await inspectTask(context, input, signal);
+        await appendEvent(context.store, context.task.id, "tool.inspect", {
+          action: input.action,
+          outcome: output.details.receiptOnly === true ? "receipt" : "execution",
+          expanded: output.details.expanded ?? false,
+          bundleWindows: output.details.bundleWindows ?? 0,
+        });
+        return {
+          content: [{ type: "text", text: output.text }],
+          details: output.details,
+        };
+      } catch (error) {
+        await appendEvent(context.store, context.task.id, "tool.inspect", {
+          action: input.action,
+          outcome: "failure",
+          expanded: false,
+          bundleWindows: 0,
+        });
+        throw error;
+      }
     },
   });
 }
