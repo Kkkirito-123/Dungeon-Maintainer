@@ -53,14 +53,20 @@ export const InspectParameters = Type.Object({
   action: Type.Union([
     Type.Literal("status"),
     Type.Literal("tree"),
-    Type.Literal("search"),
     Type.Literal("bundle"),
+    Type.Literal("search"),
     Type.Literal("read"),
     Type.Literal("read_many"),
     Type.Literal("diff"),
-  ]),
+  ], {
+    description: "定位源码默认选择 bundle；它会一次搜索并返回带 baseHash 的相关源码窗口。只有 bundle 上下文不足时才选择 search/read/read_many。",
+  }),
   path: Type.Optional(Type.String({ maxLength: 300 })),
-  query: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
+  query: Type.Optional(Type.String({
+    minLength: 1,
+    maxLength: 160,
+    description: "bundle/search 的搜索词；首次源码定位应与 action=bundle 一起使用。",
+  })),
   startLine: Type.Optional(Type.Integer({ minimum: 1, maximum: 1_000_000 })),
   lineCount: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_READ_LINES })),
   partitionId: Type.Optional(Type.String({ minLength: 3, maxLength: 80 })),
