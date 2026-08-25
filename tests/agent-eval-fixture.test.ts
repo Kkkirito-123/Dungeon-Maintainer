@@ -14,11 +14,13 @@ import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { materializeAgentEvalFixture } from "../src/benchmark/agent-eval-fixture.js";
 import { readAgentEvalCase } from "../src/benchmark/agent-eval-case.js";
+import { collectProjectContextFingerprint } from "../src/benchmark/provenance.js";
 import {
   provisionAgentEvalDependencies,
   releaseAgentEvalDependencies,
 } from "../src/benchmark/agent-eval-runner.js";
 import { runTestGit } from "./testSupport.js";
+import { createTaskWorktreeSnapshot } from "../src/workspace/worktree.js";
 
 const SOURCE = "export const value = 1;\n";
 const PATCH = [
@@ -96,12 +98,12 @@ describe("Agent Eval fixture materializer", () => {
     assert.equal(testCase.expected.afterOracle, "terminal-action-available");
   });
 
-  it("内置 terminal-action-bug 复用 467 文件共享基线且只注入一个脏路径", async () => {
+  it("内置 terminal-action-bug 复用 468 文件共享基线且只注入一个脏路径", async () => {
     const temporaryRoot = await mkdtemp(join(tmpdir(), "maintainer-agent-eval-real-"));
     try {
       const fixtureRoot = resolve(process.cwd(), "test-fixtures", "agent-evals");
       const repositoryRoot = join(fixtureRoot, "_bases", "game-repair-v1", "repository");
-      assert.equal(await countFixtureFiles(repositoryRoot), 467);
+      assert.equal(await countFixtureFiles(repositoryRoot), 468);
       const result = await materializeAgentEvalFixture({
         fixtureRoot,
         id: "terminal-action-bug",
@@ -116,6 +118,29 @@ describe("Agent Eval fixture materializer", () => {
           "utf8",
         ),
         /terminal: "#open-sql-broken"/u,
+      );
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true, maxRetries: 3 });
+    }
+  });
+
+  it("Bug source repo 与 Maintainer detached worktree 的 AGENTS/Skills 指纹一致", async () => {
+    const temporaryRoot = await mkdtemp(join(tmpdir(), "maintainer-agent-eval-context-"));
+    try {
+      const source = await materializeAgentEvalFixture({
+        fixtureRoot: resolve(process.cwd(), "test-fixtures", "agent-evals"),
+        id: "terminal-action-bug",
+        destination: join(temporaryRoot, "source"),
+      });
+      const snapshot = await createTaskWorktreeSnapshot(
+        "context-fairness",
+        source.destination,
+        source.baseCommit,
+        join(temporaryRoot, "worktrees"),
+      );
+      assert.deepEqual(
+        await collectProjectContextFingerprint(snapshot.root),
+        await collectProjectContextFingerprint(source.destination),
       );
     } finally {
       await rm(temporaryRoot, { recursive: true, force: true, maxRetries: 3 });
@@ -146,7 +171,7 @@ describe("Agent Eval fixture materializer", () => {
     }
   });
 
-  it("复制内置基线、创建固定 Git 提交并应用补丁", async () => {
+  it("把 Bug 版本建立为唯一干净 root commit，不暴露正确版本父提交", async () => {
     const temporaryRoot = await mkdtemp(join(tmpdir(), "maintainer-agent-eval-"));
     try {
       const fixtureRoot = join(temporaryRoot, "test-fixtures", "agent-evals");
@@ -168,8 +193,11 @@ describe("Agent Eval fixture materializer", () => {
       );
       assert.equal(
         await runTestGit(destination, ["show", "HEAD:src/example.ts"]),
-        SOURCE.trim(),
+        "export const value = 2;",
       );
+      assert.equal(await runTestGit(destination, ["status", "--porcelain"]), "");
+      assert.equal(await runTestGit(destination, ["rev-list", "--count", "HEAD"]), "1");
+      await assert.rejects(runTestGit(destination, ["rev-parse", "HEAD^"]));
       assert.equal(await runTestGit(destination, ["config", "core.autocrlf"]), "false");
       assert.equal(
         await runTestGit(destination, ["config", "user.name"]),

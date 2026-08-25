@@ -12,12 +12,10 @@
 import { createInterface, type Interface } from "node:readline";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import type { AgentRpcCommand } from "../agent/rpc.js";
 
-/** RPC 发送命令的最小 JSON 结构。 */
-export interface PiRpcCommand extends Record<string, unknown> {
-  type: string;
-  id?: string;
-}
+/** @deprecated 应用层使用中立名称；旧名称只保留类型兼容。 */
+export type PiRpcCommand = AgentRpcCommand;
 
 /** RPC 进程事件回调。 */
 export type PiRpcEventListener = (event: unknown) => void;
@@ -76,7 +74,7 @@ export class PiRpcProcess {
   }
 
   /** 向 Pi 发送 JSONL 命令，并等待对应 response。 */
-  async send(command: PiRpcCommand): Promise<unknown> {
+  async send(command: AgentRpcCommand): Promise<unknown> {
     const child = this.child;
     if (!child || !child.stdin.writable) throw new Error("Pi RPC 进程尚未就绪");
     const id = typeof command.id === "string" ? command.id : randomUUID();

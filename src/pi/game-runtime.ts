@@ -22,6 +22,41 @@ interface ActiveGameRuntime {
   driver: GameDriver;
 }
 
+/** 游戏运行时的确定性启动参数。生产会话固定为一层、没有预设且保留可见界面。 */
+export interface GameRuntimeStart {
+  floor: number;
+  preset: string | null;
+  headless: boolean;
+}
+
+/**
+ * 读取 Benchmark 子进程注入的起点。
+ *
+ * 只有显式 benchmark mode 才接受楼层、预设和无头模式，避免用户正式 start/resume 被
+ * 外部环境意外改变。fixture 在父进程已经校验一次，这里仍做第二道严格边界检查。
+ */
+export function resolveGameRuntimeStart(
+  environment: NodeJS.ProcessEnv = process.env,
+): GameRuntimeStart {
+  if (environment.DUNGEON_MAINTAINER_BENCHMARK_MODE?.trim() !== "1") {
+    return { floor: 1, preset: null, headless: false };
+  }
+  const floorText = environment.DUNGEON_MAINTAINER_BENCHMARK_START_FLOOR?.trim() ?? "";
+  const floor = Number(floorText);
+  if (!Number.isInteger(floor) || floor < 1 || floor > 8) {
+    throw new Error("Benchmark 游戏起点楼层非法");
+  }
+  const presetText = environment.DUNGEON_MAINTAINER_BENCHMARK_START_PRESET?.trim() ?? "";
+  if (presetText && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(presetText)) {
+    throw new Error("Benchmark 游戏起点预设非法");
+  }
+  const headlessText = environment.DUNGEON_MAINTAINER_BENCHMARK_HEADLESS?.trim() ?? "1";
+  if (headlessText !== "0" && headlessText !== "1") {
+    throw new Error("Benchmark 浏览器模式非法");
+  }
+  return { floor, preset: presetText || null, headless: headlessText === "1" };
+}
+
 async function notifyShellRuntime(
   shellUrl: string | undefined,
   state: "starting" | "ready" | "error" | "stopped",
@@ -90,8 +125,9 @@ export class DungeonGameRuntime {
       let server: GameServer | null = null;
       let browser: GameBrowser | null = null;
       try {
+        const start = resolveGameRuntimeStart();
         server = await startGameServer(this.task.worktreeRoot);
-        const gameUrl = server.url + "/?playtest=agent&floor=1";
+        const gameUrl = server.url + "/?playtest=agent&floor=" + String(start.floor);
         const shellUrl = process.env.DUNGEON_MAINTAINER_SHELL_URL?.trim();
         await notifyShellRuntime(shellUrl, "starting", gameUrl);
         browser = new GameBrowser(server.url, (kind) => {
@@ -99,12 +135,15 @@ export class DungeonGameRuntime {
             () => undefined,
           );
         }, shellUrl);
-        await browser.open();
+        await browser.open(start.floor, start.headless);
+        if (start.preset) await browser.prepare(start.preset);
         await notifyShellRuntime(shellUrl, "ready", gameUrl);
         const driver = new GameDriver(browser);
         this.active = { server, browser, driver };
         await appendEvent(this.store, this.task.id, "game.started", {
           protocolVersion: 2,
+          floor: start.floor,
+          presetApplied: start.preset !== null,
         });
         return driver;
       } catch (error) {

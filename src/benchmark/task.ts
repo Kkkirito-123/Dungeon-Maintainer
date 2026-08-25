@@ -66,6 +66,12 @@ interface EventSummary {
   anonymousStaleContinuations: number;
 }
 
+interface EvidenceSummaryRecord {
+  kind?: unknown;
+  status?: unknown;
+  metadata?: unknown;
+}
+
 interface ToolCallObservation {
   sequence: number;
   timestamp: number | null;
@@ -382,14 +388,49 @@ async function aggregateSessions(
   return aggregate;
 }
 
+async function readEvidenceSummary(taskDirectory: string): Promise<EvidenceSummaryRecord[]> {
+  try {
+    const text = await readFile(join(taskDirectory, "evidence.jsonl"), "utf8");
+    return text.split(/\r?\n/u).filter(Boolean).flatMap((line) => {
+      try {
+        const value: unknown = JSON.parse(line);
+        return isRecord(value) ? [value] : [];
+      } catch {
+        // 只读分析器忽略最后一条中断半行；不要因日志尾部损坏丢失整份报告。
+        return [];
+      }
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+}
+
 async function readTaskSummary(taskDirectory: string): Promise<TaskSummary> {
   const value: unknown = JSON.parse(await readFile(join(taskDirectory, "task.json"), "utf8"));
   if (!isRecord(value)) throw new Error("benchmark task.json 不是对象");
+  const evidence = await readEvidenceSummary(taskDirectory);
+  const active = evidence.filter((record) => record.status === "active");
+  const checks = active
+    .filter((record) => record.kind === "check")
+    .map((record) => ({
+      status: isRecord(record.metadata) ? record.metadata.status : undefined,
+    }));
+  const reproductions = active.filter((record) => record.kind === "reproduction");
+  const claims = active.filter((record) => (
+    record.kind === "claim"
+    && isRecord(record.metadata)
+    && record.metadata.finishStatus === "result"
+  ));
   return {
     changedPaths: Array.isArray(value.changedPaths) ? value.changedPaths : [],
-    checks: Array.isArray(value.checks) ? value.checks.filter(isRecord) : [],
-    reproductions: Array.isArray(value.reproductions) ? value.reproductions : [],
-    conclusion: value.conclusion,
+    checks: checks.length > 0
+      ? checks
+      : Array.isArray(value.checks) ? value.checks.filter(isRecord) : [],
+    reproductions: reproductions.length > 0
+      ? reproductions
+      : Array.isArray(value.reproductions) ? value.reproductions : [],
+    conclusion: claims.length > 0 ? "result" : value.conclusion,
     state: value.state,
   };
 }

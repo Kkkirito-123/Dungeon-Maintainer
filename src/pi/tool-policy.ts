@@ -7,13 +7,12 @@
  * 放行写入门禁。这样既保留 Pi 原生 Coding 能力，又不会把“继续看看”之类普通
  * 回复误当成源码写入授权。
  *
- * 原生 edit/write 使用 Pi 进程的本机权限，Pi 本身没有沙箱，因此 Extension 还必须
+ * 原生 write 使用 Pi 进程的本机权限，Pi 本身没有沙箱，因此 Extension 还必须
  * 对目标 realpath 做 detached worktree 边界校验。任意 bash 无法可靠限定路径，本版不加载。
  */
 
 /** 只加载可在方案批准后做路径门禁的原生写入工具。 */
 export const PI_BUILTIN_TOOLS = [
-  "edit",
   "write",
 ] as const;
 

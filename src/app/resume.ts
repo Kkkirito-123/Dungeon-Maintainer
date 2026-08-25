@@ -1,7 +1,7 @@
 /**
  * `dungeon-maintain resume` 的安全恢复流程。
  *
- * 本模块只恢复已校验的 schema v3 任务（兼容读取旧 schema v2）：验证状态、任务路径、正式仓库根和 baseHead、运行依赖、
+ * 本模块只恢复已校验的 schema v4 任务：验证状态、任务路径、正式仓库根和 baseHead、运行依赖、
  * detached worktree 及唯一 Pi session 文件后，使用原 taskId/cwd/session-dir 重新启动 Pi。
  * 它绝不从正式仓库静默重建丢失的 worktree 或新建会话。
  *
@@ -9,6 +9,7 @@
  */
 
 import type { MaintainerConfig } from "../config.js";
+import { hasTaskEvidence } from "../evidence/store.js";
 import { TaskStore } from "../task/store.js";
 import { inspectDungeonRepository, verifyRuntimeDependencies } from "./repository.js";
 import {
@@ -23,7 +24,7 @@ import { comparablePath } from "./path.js";
 /**
  * 恢复同一个任务、Pi 会话与 detached worktree。
  *
- * @param taskId 已存在的 schema v3 任务 ID。
+ * @param taskId 已存在的 schema v4 任务 ID。
  * @param config 维护器运行配置。
  * @returns Pi 子进程退出码。
  * @throws 任务、仓库、worktree、会话或依赖任一事实漂移时安全阻断。
@@ -50,8 +51,7 @@ export async function resumeMaintainer(
   const untouched = (task.state === "created" || task.state === "active")
     && task.changedPaths.length === 0
     && task.patchLines === 0
-    && task.checks.length === 0
-    && task.reproductions.length === 0
+    && !(await hasTaskEvidence(config.dataDir, task))
     && task.verification === null
     && task.approval === null
     && task.patchPath === null

@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { checkEvidence, claimEvidence } from "../src/evidence/projector.js";
+import { EvidenceStore } from "../src/evidence/store.js";
 import { TaskStore } from "../src/task/store.js";
 import { syncWorktreeChanges } from "../src/workspace/changes.js";
 import {
@@ -28,6 +30,84 @@ import {
 } from "./testSupport.js";
 
 describe("detached worktree 与显式 apply", () => {
+  it("同一 worktree Hash 重复同步保留检查缓存，Hash 变化后才使其失效", async () => {
+    const path = "game/src/presentation/idempotent-sync.ts";
+    const repository = await createTemporaryGitRepository({
+      [path]: "export const value = 'before';\n",
+    });
+    const dataDir = join(repository.temporaryRoot, "data");
+    const worktreesDir = join(dataDir, "worktrees");
+    let worktreeRoot: string | null = null;
+    try {
+      worktreeRoot = await createTaskWorktree(
+        "task-idempotent-sync",
+        repository.repoRoot,
+        repository.baseHead,
+        worktreesDir,
+      );
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "task-idempotent-sync",
+        objective: "验证重复变化同步不会重跑固定检查",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot,
+        piSessionDir: join(store.taskDir("task-idempotent-sync"), "pi"),
+      });
+      await store.transition(task, "active");
+      const evidence = new EvidenceStore(dataDir, task);
+
+      await writeFile(join(worktreeRoot, path), "export const value = 'first';\n", "utf8");
+      await syncWorktreeChanges(store, task, "edit", evidence);
+      const firstHash = await hashWorktree(worktreeRoot);
+      const check = checkEvidence({
+        id: "game-test",
+        worktreeHash: firstHash,
+        status: "passed",
+        durationMs: 1,
+        logPath: join(store.taskDir(task.id), "checks", "game-test.log"),
+        savedAt: new Date().toISOString(),
+      });
+      const savedCheck = await evidence.capture(check);
+      const revisionAfterCheck = evidence.revision;
+
+      await syncWorktreeChanges(store, task, "verify", evidence);
+      assert.equal(evidence.revision, revisionAfterCheck);
+      assert.equal((await evidence.get(savedCheck.record.id))?.status, "active");
+      assert.ok(check.actionKey);
+      assert.ok(await evidence.findReusable(check.actionKey, firstHash));
+
+      const proposal = await evidence.capture(claimEvidence({
+        status: "proposed",
+        summary: "修改同步方案",
+        risk: "无",
+        links: [savedCheck.record.id],
+      }));
+
+      // 路径集合没有变化，但文件内容和完整 worktree Hash 已改变；旧检查必须失效。
+      await writeFile(join(worktreeRoot, path), "export const value = 'second';\n", "utf8");
+      const secondHash = await hashWorktree(worktreeRoot);
+      assert.notEqual(secondHash, firstHash);
+      await syncWorktreeChanges(store, task, "write", evidence);
+      assert.equal((await evidence.get(savedCheck.record.id))?.status, "stale");
+      assert.equal(await evidence.findReusable(check.actionKey, firstHash), null);
+      const secondChange = (await evidence.active("change")).find(
+        (record) => record.worktreeHash === secondHash,
+      );
+      assert.ok(secondChange);
+      assert.deepEqual(secondChange.links, [proposal.record.id]);
+    } finally {
+      if (worktreeRoot) {
+        await removeTaskWorktree(
+          repository.repoRoot,
+          worktreeRoot,
+          worktreesDir,
+        ).catch(() => undefined);
+      }
+      await repository.dispose();
+    }
+  });
+
   it("Pi 原生编辑会登记真实 worktree 增量并使旧验证失效", async () => {
     const path = "game/src/presentation/native-edit.ts";
     const repository = await createTemporaryGitRepository({
@@ -265,7 +345,7 @@ describe("detached worktree 与显式 apply", () => {
       const taskDir = join(dataDir, "tasks", "task-discard");
       await writeFile(join(worktreeRoot, path), "export const status = 'discarded';\n", "utf8");
       const patchPath = await snapshotWorktreePatch({
-        schemaVersion: 3,
+        schemaVersion: 4,
         id: "task-discard",
         displayName: "丢弃测试",
         objective: "discard",
@@ -291,15 +371,11 @@ describe("detached worktree 与显式 apply", () => {
         changedPaths: [path],
         patchLines: 2,
         baseHashes: {},
-        checks: [],
-        reproductions: [],
-        activeReproductionId: null,
         verification: null,
         approval: null,
         patchPath: null,
         reversePatchPath: null,
         appliedHashes: {},
-        conclusion: null,
       }, taskDir);
       assert.ok(patchPath);
       assert.match(await readFile(patchPath, "utf8"), /discarded/u);

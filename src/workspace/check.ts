@@ -12,8 +12,11 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { delimiter, dirname, join } from "node:path";
 import { appendEvent } from "../logging/events.js";
 import { redactText } from "../logging/redact.js";
+import { checkEvidence } from "../evidence/projector.js";
+import type { EvidenceStore } from "../evidence/store.js";
+import type { CheckRecord } from "../evidence/types.js";
 import type { TaskStore } from "../task/store.js";
-import type { CheckRecord, TaskRecord } from "../task/types.js";
+import type { TaskRecord } from "../task/types.js";
 import { hashWorktree } from "./git.js";
 
 /** 模型可以选择的固定检查 ID。 */
@@ -21,6 +24,7 @@ export type CheckId =
   | "rules-test"
   | "rules-validate"
   | "agent-test"
+  | "game-related-test"
   | "game-test"
   | "game-architecture"
   | "game-build";
@@ -48,6 +52,11 @@ const CHECKS: Readonly<Record<CheckId, CheckSpec>> = {
     file: "python",
     args: ["-m", "unittest", "discover", "-s", "agent/tests"],
   },
+  "game-related-test": {
+    id: "game-related-test",
+    file: "pnpm",
+    args: [],
+  },
   "game-test": {
     id: "game-test",
     file: "pnpm",
@@ -72,12 +81,27 @@ const CHECKS: Readonly<Record<CheckId, CheckSpec>> = {
  * @returns 去重后的固定检查 ID。
  */
 export function requiredChecks(paths: readonly string[]): CheckId[] {
-  if (paths.some((path) => path.startsWith("game/src/"))) {
+  const checks: CheckId[] = [];
+  if (paths.some((path) => (
+    (path.startsWith("game/src/") || path.startsWith("game/tests/"))
+    && path.endsWith(".ts")
+  ))) checks.push("game-related-test");
+  if (paths.some((path) => (
+    path === ".maintainer/architecture-map.json"
+    || path === "game/scripts/check-architecture.mjs"
+  ))) checks.push("game-architecture");
+  return checks;
+}
+
+/** `/apply` 写回正式仓库前必须通过的完整质量门。 */
+export function requiredApplyChecks(paths: readonly string[]): CheckId[] {
+  if (paths.some((path) => path.startsWith("game/src/") || path.startsWith("game/tests/"))) {
     return ["game-test", "game-architecture", "game-build"];
   }
-  if (paths.some((path) => path.startsWith("game/tests/"))) {
-    return ["game-test"];
-  }
+  if (paths.some((path) => (
+    path === ".maintainer/architecture-map.json"
+    || path === "game/scripts/check-architecture.mjs"
+  ))) return ["game-architecture"];
   return [];
 }
 
@@ -165,6 +189,35 @@ async function runFixedCommand(
   });
 }
 
+async function runRelatedGameTests(
+  task: TaskRecord,
+  signal?: AbortSignal,
+): Promise<{ code: number | null; output: string; durationMs: number }> {
+  const related = task.changedPaths.filter((path) => (
+    (path.startsWith("game/src/") || path.startsWith("game/tests/"))
+    && path.endsWith(".ts")
+    && !path.split("/").includes("..")
+  )).map((path) => path.slice("game/".length));
+  if (related.length === 0) {
+    return { code: 0, output: "没有需要运行相关测试的 TypeScript 变更。", durationMs: 0 };
+  }
+  return await runFixedCommand({
+    id: "game-related-test",
+    file: "pnpm",
+    args: [
+      "--dir",
+      "game",
+      "exec",
+      "vitest",
+      "related",
+      ...related,
+      "--run",
+      "--passWithNoTests",
+      "--no-file-parallelism",
+    ],
+  }, task.worktreeRoot, signal);
+}
+
 /** 固定检查执行结果及模型可见尾迹。 */
 export interface CheckExecutionResult {
   record: CheckRecord;
@@ -176,23 +229,28 @@ export interface CheckExecutionResult {
  * 执行或复用一个固定检查。
  *
  * @param store 当前任务存储。
+ * @param evidence 当前任务证据存储。
  * @param task 当前任务。
  * @param id 维护器源码登记的检查 ID。
  * @param signal 取消时终止子进程。
  */
 export async function runCheck(
   store: TaskStore,
+  evidence: EvidenceStore,
   task: TaskRecord,
   id: CheckId,
   signal?: AbortSignal,
+  options: { preserveTaskState?: boolean } = {},
 ): Promise<CheckExecutionResult> {
   signal?.throwIfAborted();
   const worktreeHash = await hashWorktree(task.worktreeRoot);
-  const cached = task.checks.find(
+  const checksDir = join(store.taskDir(task.id), "checks");
+  const cached = (await evidence.checks()).find(
     (record) => record.id === id && record.worktreeHash === worktreeHash,
   );
   if (cached) {
-    const log = await readFile(cached.logPath, "utf8");
+    const expectedLogPath = join(checksDir, id + "-" + worktreeHash.slice(0, 12) + ".log");
+    const log = await readFile(expectedLogPath, "utf8");
     await appendEvent(store, task.id, "tool.check", {
       id,
       status: cached.status,
@@ -204,9 +262,10 @@ export async function runCheck(
       tail: log.split(/\r?\n/u).slice(-80).join("\n"),
     };
   }
-  if (task.state === "ready_to_apply") await store.transition(task, "active");
-  if (task.state === "active") await store.transition(task, "verifying");
-  const checksDir = join(store.taskDir(task.id), "checks");
+  if (!options.preserveTaskState) {
+    if (task.state === "ready_to_apply") await store.transition(task, "active");
+    if (task.state === "active") await store.transition(task, "verifying");
+  }
   await mkdir(checksDir, { recursive: true });
   let status: CheckRecord["status"] = "blocked";
   let command: {
@@ -215,7 +274,9 @@ export async function runCheck(
     durationMs: number;
   };
   try {
-    command = await runFixedCommand(CHECKS[id], task.worktreeRoot, signal);
+    command = id === "game-related-test"
+      ? await runRelatedGameTests(task, signal)
+      : await runFixedCommand(CHECKS[id], task.worktreeRoot, signal);
     status = command.code === 0 ? "passed" : "failed";
   } catch (error) {
     command = {
@@ -240,11 +301,7 @@ export async function runCheck(
     logPath,
     savedAt: new Date().toISOString(),
   };
-  task.checks = task.checks.filter(
-    (entry) => !(entry.id === id && entry.worktreeHash === worktreeHash),
-  );
-  task.checks.push(record);
-  await store.save(task);
+  await evidence.capture(checkEvidence(record));
   await appendEvent(store, task.id, "tool.check", {
     id,
     status,

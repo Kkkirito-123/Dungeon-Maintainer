@@ -9,6 +9,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import type { EvidenceStore } from "../../evidence/store.js";
 import type { TaskStore } from "../../task/store.js";
 import type { TaskRecord } from "../../task/types.js";
 import { runCheck } from "../../workspace/check.js";
@@ -24,6 +25,7 @@ export const CheckParameters = Type.Object({
     Type.Literal("rules-test"),
     Type.Literal("rules-validate"),
     Type.Literal("agent-test"),
+    Type.Literal("game-related-test"),
     Type.Literal("game-test"),
     Type.Literal("game-architecture"),
     Type.Literal("game-build"),
@@ -34,6 +36,7 @@ export const CheckParameters = Type.Object({
 export interface CheckToolContext {
   task: TaskRecord;
   store: TaskStore;
+  evidence: EvidenceStore;
 }
 
 /**
@@ -52,7 +55,7 @@ export function registerCheckTool(
     description: "运行维护器源码登记的 SQL Dungeon 测试、规则、架构或生产构建检查。",
     promptSnippet: "用 check 运行固定质量门",
     promptGuidelines: [
-      "先运行最窄的相关检查；修改 game/src 后最终必须通过 game-test、game-architecture 和 game-build。",
+      "诊断时优先 game-related-test；finish(result) 会运行候选聚焦验证，完整质量门只在 /apply 前运行一次。",
       "不得把失败检查描述为通过；根据日志尾部继续定位。",
     ],
     executionMode: "sequential",
@@ -60,6 +63,7 @@ export function registerCheckTool(
     async execute(_toolCallId, input, signal) {
       const result = await runCheck(
         context.store,
+        context.evidence,
         context.task,
         input.id,
         signal,

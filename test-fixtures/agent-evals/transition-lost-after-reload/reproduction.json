@@ -10,6 +10,7 @@
     { "op": "query" },
     { "op": "go", "target": "objective", "maxSteps": 64 },
     { "op": "use", "actionId": "interact" },
+    { "op": "reload" },
     { "op": "wait", "milliseconds": 2500 }
   ]
 }

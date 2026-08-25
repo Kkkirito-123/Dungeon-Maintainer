@@ -76,6 +76,8 @@ export interface AgentEvalFixtureMaterializeOptions {
   readonly destination: string;
   /** fixture 根目录；省略时为当前工作目录下的 `test-fixtures/agent-evals`。 */
   readonly fixtureRoot?: string;
+  /** `clean` 仅供零模型预检验证 after Oracle；正式 Agent Eval 始终省略并使用 broken。 */
+  readonly variant?: "broken" | "clean";
 }
 
 /** 已建立且完成 manifest 一致性校验的 Agent Eval 仓库事实。 */
@@ -356,13 +358,16 @@ async function runGit(
   return result.stdout;
 }
 
-async function initializeBaseline(destination: string): Promise<string> {
+async function initializeRepository(destination: string): Promise<void> {
   await runGit(destination, ["init", "--quiet"]);
   await runGit(destination, ["config", "core.autocrlf", "false"]);
   await runGit(destination, ["config", "user.name", FIXED_GIT_NAME]);
   await runGit(destination, ["config", "user.email", FIXED_GIT_EMAIL]);
   await runGit(destination, ["config", "commit.gpgSign", "false"]);
   await runGit(destination, ["config", "core.hooksPath", ".git/no-hooks"]);
+}
+
+async function commitBaseline(destination: string): Promise<string> {
   await runGit(destination, ["add", "--all", "--force", "--"]);
   await runGit(destination, [
     "commit",
@@ -370,7 +375,7 @@ async function initializeBaseline(destination: string): Promise<string> {
     "--no-gpg-sign",
     "--no-verify",
     "--message",
-    "agent-eval baseline",
+    "agent-eval buggy root",
   ], {
     GIT_AUTHOR_NAME: FIXED_GIT_NAME,
     GIT_AUTHOR_EMAIL: FIXED_GIT_EMAIL,
@@ -401,7 +406,7 @@ async function readDirtyPaths(destination: string): Promise<string[]> {
  *
  * @param options fixture ID、目标目录与可选的测试根目录。目标父目录必须已存在，
  * 目标本身必须不存在。
- * @returns 规范目标路径、新建的实际基线提交和补丁后的已校验脏路径。
+ * @returns 规范目标路径、唯一 Bug root commit 和补丁涉及的已校验路径。
  * @throws ID/路径穿越、符号链接或特殊文件、已有目标、manifest 不一致、
  * Git 失败或补丁后脏路径不一致时拒绝；创建后失败会回收本次目标。
  * @remarks 调用方只授权创建 `destination`；函数不改动 fixture、其他目录或用户
@@ -477,7 +482,8 @@ export async function materializeAgentEvalFixture(
     throw new Error("fixture repository 文件数与 manifest 不一致");
   }
   const patchBytes = await readFile(patchPath);
-  const patchSha256 = createHash("sha256").update(patchBytes).digest("hex");
+  const canonicalPatch = patchBytes.toString("utf8").replace(/\r\n/gu, "\n");
+  const patchSha256 = createHash("sha256").update(canonicalPatch).digest("hex");
   if (patchSha256 !== manifest.patchSha256) {
     throw new Error("source.patch SHA-256 与 manifest 不一致");
   }
@@ -487,27 +493,43 @@ export async function materializeAgentEvalFixture(
     await mkdir(destination);
     created = true;
     await copyRepositoryTree(repositoryPath, destination);
-    const baseCommit = await initializeBaseline(destination);
+    // 临时 index 只用于验证 source.patch 的精确脏路径；正确版本永远不会形成提交。
+    await initializeRepository(destination);
+    await runGit(destination, ["add", "--all", "--force", "--"]);
+    // 固定 core.autocrlf=false 只保证物化仓库后续不再自动转换换行；已打包的 fixture 可能在
+    // Windows 检出时已保存为 CRLF，而 source.patch 依然使用 Git 标准 LF。只忽略上下文换行空白，
+    // 不忽略字符内容，可使同一 fixture 在不同检出环境中稳定应用。
+    let dirtyPaths: string[] = [];
+    if ((options.variant ?? "broken") === "broken") {
+      await runGit(destination, [
+        "apply",
+        "--ignore-space-change",
+        "--whitespace=nowarn",
+        "--",
+        patchPath,
+      ]);
+      dirtyPaths = await readDirtyPaths(destination);
+      if (dirtyPaths.join("\n") !== manifest.dirtyPaths.join("\n")) {
+        throw new Error("应用 source.patch 后的 dirtyPaths 与 manifest 不一致");
+      }
+    }
+    // 删除包含正确版本 index 的临时 Git 元数据，再把 Bug 代码建成唯一 root commit。
+    // 这样 Agent 不能通过 HEAD^、git diff 或 index 找到注入补丁的反向答案。
+    await rm(join(destination, ".git"), { recursive: true, force: true, maxRetries: 3 });
+    await initializeRepository(destination);
+    const baseCommit = await commitBaseline(destination);
     const trackedFileCount = (await runGit(destination, ["ls-files", "-z"]))
       .split("\0")
       .filter(Boolean)
       .length;
     if (trackedFileCount !== baselineFileCount) {
-      throw new Error("本地基线提交文件数与 manifest 不一致");
+      throw new Error("Bug root commit 文件数与 manifest 不一致");
     }
-    // 固定 core.autocrlf=false 只保证物化仓库后续不再自动转换换行；已打包的 fixture 可能在
-    // Windows 检出时已保存为 CRLF，而 source.patch 依然使用 Git 标准 LF。只忽略上下文换行空白，
-    // 不忽略字符内容，可使同一 fixture 在不同检出环境中稳定应用。
-    await runGit(destination, [
-      "apply",
-      "--ignore-space-change",
-      "--whitespace=nowarn",
-      "--",
-      patchPath,
-    ]);
-    const dirtyPaths = await readDirtyPaths(destination);
-    if (dirtyPaths.join("\n") !== manifest.dirtyPaths.join("\n")) {
-      throw new Error("应用 source.patch 后的 dirtyPaths 与 manifest 不一致");
+    if ((await runGit(destination, ["status", "--porcelain"])).trim()) {
+      throw new Error("Bug root commit 后工作区不干净");
+    }
+    if ((await runGit(destination, ["rev-list", "--count", "HEAD"])).trim() !== "1") {
+      throw new Error("Agent Eval 必须只有一个 Bug root commit");
     }
     return { destination, baseCommit, dirtyPaths };
   } catch (error) {

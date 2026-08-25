@@ -27,6 +27,24 @@ export interface ReplayResult {
   finalView: PlayView;
   failure: string | null;
   queryAccepted: boolean | null;
+  queryAcceptedSequence: boolean[];
+  queryPlanSequence: Array<"scan" | "search" | "none">;
+  /** 整个重放窗口中玩家可见终端曾达到的最大 stageIndex；终端从未出现时为 null。 */
+  maxObservedStageIndex: number | null;
+}
+
+function visibleStageIndex(view: PlayView): number | null {
+  const stageIndex = view.terminal?.stageIndex;
+  return typeof stageIndex === "number" && Number.isInteger(stageIndex) && stageIndex >= 0
+    ? stageIndex
+    : null;
+}
+
+function visibleQueryPlan(view: PlayView): "scan" | "search" | "none" {
+  const plan = view.terminal?.plan.join("\n").toUpperCase() ?? "";
+  if (plan.includes("SEARCH")) return "search";
+  if (plan.includes("SCAN")) return "scan";
+  return "none";
 }
 
 /** 当前 Pi 任务的游戏驱动。 */
@@ -223,6 +241,9 @@ export class GameDriver {
           finalView: currentView,
           failure: "replay-input-unavailable",
           queryAccepted: null,
+          queryAcceptedSequence: [],
+          queryPlanSequence: [],
+          maxObservedStageIndex: visibleStageIndex(currentView),
         };
       }
     }
@@ -236,6 +257,16 @@ export class GameDriver {
     let failure: string | null = null;
     let actionCount = 0;
     let queryAccepted: boolean | null = null;
+    const queryAcceptedSequence: boolean[] = [];
+    const queryPlanSequence: Array<"scan" | "search" | "none"> = [];
+    let maxObservedStageIndex = visibleStageIndex(restored);
+    const observeStageIndex = (view: PlayView): void => {
+      const stageIndex = visibleStageIndex(view);
+      if (stageIndex === null) return;
+      maxObservedStageIndex = maxObservedStageIndex === null
+        ? stageIndex
+        : Math.max(maxObservedStageIndex, stageIndex);
+    };
     for (const action of actions) {
       if (action.action === "look") continue;
       try {
@@ -243,6 +274,7 @@ export class GameDriver {
         // 保留这个固定同步点，否则 DOM 展示与 Session 状态的短暂时序会让
         // 后续 query/use 在旧投影上紧接执行。
         this.lastView = await this.browser.look();
+        observeStageIndex(this.lastView);
         let result: PlayResult;
         if (action.action === "input-sql") {
           const inputLength = action.arguments.inputLength;
@@ -291,7 +323,10 @@ export class GameDriver {
           }
           result = await this.query();
           queryAccepted = result.ok;
+          queryAcceptedSequence.push(result.ok);
+          queryPlanSequence.push(visibleQueryPlan(result.view));
         }
+        observeStageIndex(result.view);
         actionCount += 1;
         // 原复现中已失败的探测动作可以继续重放，最终是否修复由
         // 结构化断言判定。但原本成功的链路动作若变为失败，属于回归必须立即阻断。
@@ -306,12 +341,16 @@ export class GameDriver {
     }
     if (failure === null) await this.settleAutomaticTransition();
     const finalView = this.lastView;
+    observeStageIndex(finalView);
     return {
       passed: failure === null,
       actionCount,
       finalView,
       failure,
       queryAccepted,
+      queryAcceptedSequence,
+      queryPlanSequence,
+      maxObservedStageIndex,
     };
   }
 

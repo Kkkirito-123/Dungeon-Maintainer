@@ -53,10 +53,12 @@ describe("外部 CLI 与固定 Pi 启动参数", () => {
     for (const flag of [
       "--approve",
       "--no-extensions",
-      "--no-skills",
       "--no-prompt-templates",
-      "--no-context-files",
     ]) assert.ok(args.includes(flag));
+    // 项目级 AGENTS.md 与 .agents/skills 必须由 Pi 正常加载，才能让原版和维护器
+    // 使用相同项目上下文；全局 Extension 仍由启动参数明确关闭。
+    assert.ok(!args.includes("--no-skills"));
+    assert.ok(!args.includes("--no-context-files"));
     const toolsIndex = args.indexOf("--tools");
     assert.ok(toolsIndex >= 0);
     assert.equal(args[toolsIndex + 1], FULL_CODING_TOOLS.join(","));

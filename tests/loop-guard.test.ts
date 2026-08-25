@@ -12,7 +12,11 @@ function recordWithoutEvidence(
   result: unknown = { matches: ["src/game.ts:10"] },
 ): void {
   assert.equal(guard.evaluateAction(nextAction).kind, "allow");
-  assert.equal(guard.recordOutcome({ action: nextAction, result }), false);
+  assert.equal(guard.recordOutcome({
+    action: nextAction,
+    result,
+    evidenceRevision: 0,
+  }), false);
 }
 
 describe("领域化循环门禁", () => {
@@ -91,30 +95,38 @@ describe("领域化循环门禁", () => {
     assert.equal(guard.recentOutcomes.length, 8);
   });
 
-  it("新证据与显式进展会清零次数并解除冻结", () => {
+  it("EvidenceStore revision 与显式进展会清零次数并解除冻结", () => {
     const guard = new LoopGuard();
     const repeated = action("repeated");
     recordWithoutEvidence(guard, repeated);
     recordWithoutEvidence(guard, repeated);
     assert.equal(guard.evaluateAction(repeated).kind, "block");
 
-    guard.noteProgress();
+    const progressAction = action("progress", { query: "new-fact" });
+    assert.equal(guard.evaluateAction(progressAction).kind, "allow");
+    assert.equal(guard.recordOutcome({
+      action: progressAction,
+      result: { matches: ["src/game.ts:20"] },
+      evidenceRevision: 1,
+    }), true);
     assert.equal(guard.progressRevision, 1);
     assert.equal(guard.noProgressCount, 0);
     assert.equal(guard.evaluateAction(repeated).kind, "allow");
     assert.equal(guard.recordOutcome({
       action: repeated,
       result: { matches: ["src/game.ts:20"] },
-      evidence: [{ path: "src/game.ts", line: 20, fact: "状态迁移缺少终态判断" }],
-    }), true);
-    assert.equal(guard.progressRevision, 2);
-    assert.equal(guard.noProgressCount, 0);
+      evidenceRevision: 1,
+    }), false);
+    assert.equal(guard.progressRevision, 1);
+    assert.equal(guard.noProgressCount, 1);
     assert.equal(guard.recordOutcome({
       action: action("same-evidence", { query: "terminal state" }),
       result: { matches: ["src/game.ts:20"] },
-      evidence: [{ fact: "状态迁移缺少终态判断", line: 20, path: "src/game.ts" }],
-    }), false);
-    assert.equal(guard.noProgressCount, 1);
+      evidenceRevision: 1,
+      madeProgress: true,
+    }), true);
+    assert.equal(guard.progressRevision, 2);
+    assert.equal(guard.noProgressCount, 0);
   });
 
   it("只保留最近八项并能为新任务清空全部状态", () => {
@@ -128,20 +140,18 @@ describe("领域化循环门禁", () => {
       );
     }
     assert.equal(guard.evaluateAction(action("strategy-reset", { query: "reset" })).kind, "strategy_reset");
-    for (let index = 5; index < 8; index += 1) {
+    const progress = action("progress-route", { query: "progress" });
+    assert.equal(guard.evaluateAction(progress).kind, "allow");
+    assert.equal(guard.recordOutcome({
+      action: progress,
+      result: { value: "progress" },
+      evidenceRevision: 1,
+    }), true);
+    for (let index = 5; index < 10; index += 1) {
       const suffix = String(index);
       recordWithoutEvidence(
         guard,
         action(`first-${suffix}`, { query: `first-${suffix}` }),
-        { value: index },
-      );
-    }
-    guard.noteProgress();
-    for (let index = 8; index < 10; index += 1) {
-      const suffix = String(index);
-      recordWithoutEvidence(
-        guard,
-        action(`second-${suffix}`, { query: `second-${suffix}` }),
         { value: index },
       );
     }
@@ -152,5 +162,22 @@ describe("领域化循环门禁", () => {
     assert.equal(guard.noProgressCount, 0);
     assert.deepEqual(guard.recentOutcomes, []);
     assert.equal(guard.evaluateAction(action("first-0", { query: "first-0" })).kind, "allow");
+  });
+
+  it("新 Episode 清除 hard stop 计数但保留已冻结动作，强制 recover 换路线", () => {
+    const guard = new LoopGuard();
+    const repeated = { toolName: "inspect", input: { action: "status" } };
+    for (let index = 0; index < 2; index += 1) {
+      assert.equal(guard.evaluateAction(repeated).kind, "allow");
+      guard.recordOutcome({ action: repeated, result: { same: true }, evidenceRevision: 0 });
+    }
+    assert.equal(guard.evaluateAction(repeated).kind, "block");
+    guard.beginEpisode();
+    assert.equal(guard.noProgressCount, 0);
+    assert.equal(guard.evaluateAction(repeated).kind, "block");
+    assert.equal(guard.evaluateAction({
+      toolName: "inspect",
+      input: { action: "search", query: "different-route" },
+    }).kind, "allow");
   });
 });

@@ -7,6 +7,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "../src/config.js";
+import { EvidenceStore } from "../src/evidence/store.js";
 import type { GameDriver } from "../src/game/driver.js";
 import type { PlayView } from "../src/game/protocol.js";
 import { SemanticTrace } from "../src/logging/trace.js";
@@ -84,7 +85,7 @@ function requireHook(
   return hook;
 }
 
-describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
+describe("Pi Extension 单循环工具、命令和会话阻断", () => {
   it("注册十个领域工具，并用执行门禁保护固定 Coding 工具面", async () => {
     const repository = await createTemporaryGitRepository({
       ".maintainer/project.json": JSON.stringify({
@@ -108,6 +109,7 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
         piSessionDir: join(store.taskDir("task-extension"), "pi"),
       });
       const pi = new RecordingExtensionApi();
+      const evidence = new EvidenceStore(dataDir, task);
       const config = loadConfig({
         LOCALAPPDATA: dataDir,
         MAINTAINER_API_KEY: "provider-secret",
@@ -145,6 +147,7 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
         config,
         store,
         task,
+        evidenceStore: evidence,
         gameRuntime: {
           currentDriver: () => driver,
           requireDriver: () => driver,
@@ -251,7 +254,7 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
           },
         ],
       }) as { messages: Array<{ content: Array<{ text: string }> }> };
-      assert.match(contextResult.messages[0]?.content[0]?.text ?? "", /重复工具结果已省略/u);
+      assert.equal(contextResult.messages[0]?.content[0]?.text, repeatedToolText);
       assert.equal(contextResult.messages[1]?.content[0]?.text, repeatedToolText);
 
       const oversizedContext = await requireHook(pi, "context")({
@@ -270,12 +273,13 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
       const boundedTexts = oversizedContext.messages.map(
         (message) => message.content[0]?.text ?? "",
       );
-      assert.ok(boundedTexts.every((text) => text.length <= 4_096));
-      assert.ok(boundedTexts.some((text) => text.includes("已按 Token 预算截断")));
-      assert.ok(boundedTexts.some((text) => text === "[较早工具结果已省略]"));
+      assert.equal(boundedTexts.length, 32);
+      assert.ok(boundedTexts.reduce((sum, text) => sum + text.length, 0) <= 16_384);
+      assert.ok(boundedTexts.some((text) => text.includes("TOOL_RESULT_RECEIPT")));
+      assert.equal(boundedTexts.at(-1)?.length, 2_048);
+      assert.match(boundedTexts.at(-1) ?? "", /工具结果稳定截断/u);
       assert.match(boundedTexts.at(-1) ?? "", /^31-/u);
-      assert.equal(boundedTexts.at(0), "[较早工具结果已省略]");
-      assert.ok(boundedTexts.reduce((sum, text) => sum + text.length, 0) <= 24_576);
+      assert.match(boundedTexts.at(0) ?? "", /TOOL_RESULT_RECEIPT/u);
 
       const resetAcrossUsers = await requireHook(pi, "context")({
         messages: [
@@ -303,11 +307,14 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
           },
         ],
       }) as { messages: Array<{ role: string; content: Array<{ text: string }> }> };
-      assert.equal(resetAcrossUsers.messages[1]?.content[0]?.text, repeatedToolText);
+      assert.equal(resetAcrossUsers.messages.length, 4);
       assert.equal(resetAcrossUsers.messages[3]?.content[0]?.text, repeatedToolText);
 
       const promptResult = await requireHook(pi, "before_agent_start")(
-        { prompt: "当前在哪一层，状态是什么？" },
+        {
+          prompt: "当前在哪一层，状态是什么？",
+          systemPrompt: "PROJECT AGENTS SENTINEL",
+        },
         { getContextUsage: () => undefined },
       ) as {
         systemPrompt: string;
@@ -319,21 +326,19 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
       assert.ok(!fixedToolNames.has("grep"));
       assert.ok(!fixedToolNames.has("find"));
       assert.ok(!fixedToolNames.has("ls"));
-      assert.ok(fixedToolNames.has("edit"));
+      assert.ok(!fixedToolNames.has("edit"));
       assert.ok(fixedToolNames.has("write"));
       assert.ok(!fixedToolNames.has("bash"));
-      assert.match(promptResult.systemPrompt, /detached worktree/u);
       assert.match(promptResult.systemPrompt, /SQL Dungeon/u);
-      assert.match(promptResult.systemPrompt, /实时玩家投影/u);
-      assert.match(promptResult.systemPrompt, /普通状态问题最多 3 次低价值读取/u);
+      assert.match(promptResult.systemPrompt, /PROJECT AGENTS SENTINEL/u);
+      assert.match(promptResult.systemPrompt, /一个 Pi Agent Loop/u);
       assert.match(promptResult.systemPrompt, /finish\(status=proposed\)/u);
-      assert.match(promptResult.systemPrompt, /只询问一次是否执行/u);
+      assert.match(promptResult.systemPrompt, /用户批准.*前，write\/patch 都会被拒绝/u);
       assert.match(promptResult.systemPrompt, /结构化断言/u);
-      assert.match(promptResult.systemPrompt, /本轮最高优先级请求/u);
-      assert.match(promptResult.systemPrompt, /当前在哪一层/u);
-      assert.match(promptResult.systemPrompt, /full-view-sentinel/u);
-      assert.equal(promptResult.message, undefined);
-      assert.ok(!promptResult.systemPrompt.includes("bash"));
+      assert.match(JSON.stringify(promptResult.message), /本轮最高优先级请求/u);
+      assert.match(JSON.stringify(promptResult.message), /当前在哪一层/u);
+      assert.match(JSON.stringify(promptResult.message), /full-view-sentinel/u);
+      assert.match(promptResult.systemPrompt, /不加载 Bash/u);
 
       const finishTool = pi.toolDefinitions.get("finish");
       assert.ok(finishTool?.execute);
@@ -450,7 +455,7 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
         isError: false,
       }, refreshContext);
       assert.equal(firstNativeResult, undefined);
-      assert.deepEqual(lifecycle, ["ensure", "checkpoint"]);
+      assert.deepEqual(lifecycle, ["checkpoint"]);
       const secondNativeResult = await toolResultHook({
         type: "tool_result",
         toolCallId: "native-two",
@@ -463,7 +468,7 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
         content: Array<{ text: string }>;
         isError?: boolean;
       };
-      assert.deepEqual(lifecycle, ["ensure", "checkpoint", "reload"]);
+      assert.deepEqual(lifecycle, ["checkpoint", "reload"]);
       assert.equal(secondNativeResult.content[0]?.text, "second written");
       assert.match(secondNativeResult.content[1]?.text ?? "", /已刷新/u);
       assert.equal(secondNativeResult.isError, undefined);
@@ -479,6 +484,14 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
       }, refreshContext);
       lifecycle.push("check-gate");
       assert.equal(checkGate, undefined);
+      task.state = "verifying";
+      await store.save(task);
+      assert.equal(await toolCallHook({
+        type: "tool_call",
+        toolCallId: "second-check-while-verifying",
+        toolName: "check",
+        input: { id: "game-architecture" },
+      }, refreshContext), undefined);
       const finishGate = await toolCallHook({
         type: "tool_call",
         toolCallId: "finish-after-refresh",
@@ -507,7 +520,6 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
       assert.match(conclusionNotifications.at(-1) ?? "", /已修复楼层推进状态/u);
       assert.match(conclusionNotifications.at(-1) ?? "", /可以执行 \/apply/u);
       assert.deepEqual(lifecycle, [
-        "ensure",
         "checkpoint",
         "reload",
         "check-gate",
@@ -544,110 +556,6 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
       assert.equal(deniedProposal.terminate, true);
       assert.equal(deniedProposal.details.executionApproved, false);
       assert.deepEqual(pi.activeTools, [...FULL_CODING_TOOLS]);
-
-      const agentStartHook = requireHook(pi, "agent_start");
-      const budgetNotifications: string[] = [];
-      const budgetContext = {
-        ui: {
-          notify: (message: string) => budgetNotifications.push(message),
-        },
-      };
-      await agentStartHook({});
-      for (let index = 0; index < 3; index += 1) {
-        assert.equal(await toolCallHook({
-          toolName: "inspect",
-          input: { action: "search", query: "candidate-" + String(index) },
-        }, budgetContext), undefined);
-      }
-      // 普通状态请求在低价值读取达到上限后自动收尾，不能误伤第一个游戏动作。
-      assert.equal(await toolCallHook({ toolName: "look", input: {} }, budgetContext), undefined);
-      const inspectOverflow = await toolCallHook({
-        toolName: "inspect",
-        input: { action: "status" },
-      }, budgetContext) as { block?: boolean; terminate?: boolean; reason?: string };
-      assert.deepEqual(inspectOverflow, {
-        block: true,
-        terminate: false,
-        reason: "本轮读取预算已达到上限；正在根据已有证据自动收尾。",
-      });
-      assert.match(budgetNotifications.at(-1) ?? "", /自动收尾/u);
-
-      await requireHook(pi, "input")({
-        source: "rpc",
-        text: "新的状态问题",
-      });
-      await agentStartHook({});
-      for (let index = 0; index < 6; index += 1) {
-        assert.equal(await toolCallHook({
-          toolName: "use",
-          input: { actionId: "candidate-" + String(index) },
-        }, budgetContext), undefined);
-      }
-
-      // 同一修复请求跨 agent follow-up 共享 inspect 预算；新自然语言问题才会重置。
-      await requireHook(pi, "input")({
-        source: "rpc",
-        text: "请重新定位并修复右侧游戏动作失败的问题。",
-      });
-      await agentStartHook({});
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        assert.equal(await toolCallHook({
-          toolCallId: "repeated-inspect-" + String(attempt),
-          toolName: "inspect",
-          input: { action: "status" },
-        }, budgetContext), undefined);
-        await toolResultHook({
-          type: "tool_result",
-          toolCallId: "repeated-inspect-" + String(attempt),
-          toolName: "inspect",
-          input: { action: "status" },
-          content: [{ type: "text", text: "same-status" }],
-          details: { status: "same" },
-          isError: false,
-        }, budgetContext);
-      }
-      const repeatedInspect = await toolCallHook({
-        toolCallId: "repeated-inspect-third",
-        toolName: "inspect",
-        input: { action: "status" },
-      }, budgetContext) as { block?: boolean; terminate?: boolean };
-      assert.equal(repeatedInspect.block, true);
-      assert.equal(repeatedInspect.terminate, true);
-      assert.match(budgetNotifications.at(-1) ?? "", /相同工具动作/u);
-
-      await requireHook(pi, "input")({
-        source: "rpc",
-        text: "请定位并修复右侧游戏动作失败的问题。",
-      });
-      await agentStartHook({});
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        assert.equal(await toolCallHook({
-          type: "tool_call",
-          toolCallId: "failed-go-" + String(attempt),
-          toolName: "go",
-          input: { target: "objective", maxSteps: 64 },
-        }, budgetContext), undefined);
-        await requireHook(pi, "tool_result")({
-          type: "tool_result",
-          toolCallId: "failed-go-" + String(attempt),
-          toolName: "go",
-          input: { target: "objective", maxSteps: 64 },
-          content: [{ type: "text", text: "blocked" }],
-          details: { ok: false, event: "blocked" },
-          isError: false,
-        }, budgetContext);
-      }
-      const repeatedFailedGameAction = await toolCallHook({
-        type: "tool_call",
-        toolCallId: "failed-go-third",
-        toolName: "go",
-        input: { target: "objective", maxSteps: 64 },
-      }, budgetContext) as { block?: boolean; terminate?: boolean; reason?: string };
-      assert.equal(repeatedFailedGameAction.block, true);
-      assert.equal(repeatedFailedGameAction.terminate, false);
-      assert.match(repeatedFailedGameAction.reason ?? "", /失败两次/u);
-      task.objective = INITIAL_TASK_OBJECTIVE;
-      await store.save(task);
 
       const notifications: string[] = [];
       const switchResult = await requireHook(pi, "session_before_switch")(
@@ -694,313 +602,31 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
     }
   });
 
-  it("修复请求覆盖旧目标并自动续跑，状态问答仍可自然结束", async () => {
+  it("修复请求覆盖旧目标但不创建隐藏阶段，状态问答仍可自然结束", async () => {
     const repository = await createTemporaryGitRepository({
-      "README.md": "test\n",
+      "README.md": "baseline\n",
     });
     try {
       const dataDir = join(repository.temporaryRoot, "data");
       const store = new TaskStore(dataDir);
       const task = await store.create({
-        id: "task-repair-continuation",
-        objective: "当前在哪一层，状态是什么？",
-        repoRoot: repository.repoRoot,
-        baseHead: repository.baseHead,
-        worktreeRoot: repository.repoRoot,
-        piSessionDir: join(store.taskDir("task-repair-continuation"), "pi"),
-      });
-      const pi = new RecordingExtensionApi();
-      const driver = {
-        peek: async () => ({
-          floor: 3,
-          mode: "combat",
-          terminal: {
-            task: "找出由主人守卫的怪物",
-            inputSql: "SELECT id FROM monsters;",
-          },
-        }),
-      } as unknown as GameDriver;
-      installDungeonMaintainerExtension(pi as unknown as ExtensionAPI, {
-        config: loadConfig({
-          LOCALAPPDATA: dataDir,
-          MAINTAINER_API_KEY: "provider-secret",
-        }),
-        store,
-        task,
-        gameRuntime: {
-          currentDriver: () => driver,
-          requireDriver: () => driver,
-          ensure: async () => driver,
-          close: async () => undefined,
-        },
-      });
-      const inputHook = requireHook(pi, "input");
-      const agentEndHook = requireHook(pi, "agent_end");
-      const continuationNotifications: string[] = [];
-      const agentEndContext = {
-        hasPendingMessages: () => false,
-        getContextUsage: () => ({ percent: 20 }),
-        ui: {
-          notify: (message: string) => continuationNotifications.push(message),
-        },
-      };
-
-      await inputHook({ source: "rpc", text: "当前状态是什么？" });
-      await agentEndHook({ type: "agent_end", messages: [] }, agentEndContext);
-      assert.equal(pi.sentMessages.length, 0);
-
-      const selectCombatRepair = "第一层进入 SELECT 战斗后终端不出现，请直接定位并修复。";
-      await inputHook({ source: "rpc", text: selectCombatRepair });
-      assert.equal(task.objective, selectCombatRepair);
-      const promptResult = await requireHook(pi, "before_agent_start")(
-        { prompt: selectCombatRepair },
-        { getContextUsage: () => undefined },
-      ) as { systemPrompt: string; message?: unknown };
-      assert.match(promptResult.systemPrompt, /本轮最高优先级请求/u);
-      assert.match(promptResult.systemPrompt, /SELECT 战斗后终端不出现/u);
-      assert.match(promptResult.systemPrompt, /SELECT id FROM monsters/u);
-      assert.equal(promptResult.message, undefined);
-
-      const toolCallHook = requireHook(pi, "tool_call");
-      const finishDiagnosed = await toolCallHook({
-        type: "tool_call",
-        toolCallId: "finish-diagnosed",
-        toolName: "finish",
-        input: { status: "diagnosed" },
-      }, agentEndContext) as { block?: boolean; terminate?: boolean; reason?: string };
-      assert.equal(finishDiagnosed.block, true);
-      assert.equal(finishDiagnosed.terminate, false);
-      assert.match(finishDiagnosed.reason ?? "", /不能用 diagnosed 快速结束/u);
-
-      const finishWithoutEvidence = await toolCallHook({
-        type: "tool_call",
-        toolCallId: "finish-proposed-empty",
-        toolName: "finish",
-        input: { status: "proposed", summary: "empty" },
-      }, agentEndContext) as { block?: boolean; terminate?: boolean; reason?: string };
-      assert.equal(finishWithoutEvidence.block, true);
-      assert.equal(finishWithoutEvidence.terminate, false);
-      assert.match(finishWithoutEvidence.reason ?? "", /源码读取证据/u);
-
-      await requireHook(pi, "tool_result")({
-        type: "tool_result",
-        toolCallId: "look-only",
-        toolName: "look",
-        input: {},
-        content: [{ type: "text", text: "visible state" }],
-        details: { floor: 3, mode: "combat" },
-        isError: false,
-      }, agentEndContext);
-      const blockedFromLookOnly = await toolCallHook({
-        type: "tool_call",
-        toolCallId: "finish-blocked-look-only",
-        toolName: "finish",
-        input: { status: "blocked", summary: "look only" },
-      }, agentEndContext) as { block?: boolean; reason?: string };
-      assert.equal(blockedFromLookOnly.block, true);
-      assert.match(blockedFromLookOnly.reason ?? "", /客观证据/u);
-
-      await requireHook(pi, "tool_result")({
-        type: "tool_result",
-        toolCallId: "query-failed",
-        toolName: "query",
-        input: {},
-        content: [{ type: "text", text: "query-rejected" }],
-        details: { ok: false, event: "query-rejected" },
-        isError: false,
-      }, agentEndContext);
-      assert.equal(await toolCallHook({
-        type: "tool_call",
-        toolCallId: "finish-blocked-query-failed",
-        toolName: "finish",
-        input: { status: "blocked", summary: "query failed" },
-      }, agentEndContext), undefined);
-
-      await requireHook(pi, "tool_result")({
-        type: "tool_result",
-        toolCallId: "inspect-status",
-        toolName: "inspect",
-        input: { action: "status" },
-        content: [{ type: "text", text: "status only" }],
-        details: undefined,
-        isError: false,
-      }, agentEndContext);
-      const proposedFromStatusOnly = await toolCallHook({
-        type: "tool_call",
-        toolCallId: "finish-proposed-status-only",
-        toolName: "finish",
-        input: { status: "proposed", summary: "status only" },
-      }, agentEndContext) as { block?: boolean; reason?: string };
-      assert.equal(proposedFromStatusOnly.block, true);
-      assert.match(proposedFromStatusOnly.reason ?? "", /源码读取证据/u);
-
-      await requireHook(pi, "tool_result")({
-        type: "tool_result",
-        toolCallId: "check-failed",
-        toolName: "check",
-        input: { id: "game-test" },
-        content: [{ type: "text", text: "game-test: failed" }],
-        details: { status: "failed" },
-        isError: false,
-      }, agentEndContext);
-      const proposedFromFailedCheckOnly = await toolCallHook({
-        type: "tool_call",
-        toolCallId: "finish-proposed-check-only",
-        toolName: "finish",
-        input: { status: "proposed", summary: "check only" },
-      }, agentEndContext) as { block?: boolean; reason?: string };
-      assert.equal(proposedFromFailedCheckOnly.block, true);
-      assert.match(proposedFromFailedCheckOnly.reason ?? "", /源码读取证据/u);
-
-      await requireHook(pi, "tool_result")({
-        type: "tool_result",
-        toolCallId: "finish-reproduced",
-        toolName: "finish",
-        input: { status: "reproduced" },
-        content: [{ type: "text", text: "reproduced" }],
-        details: { status: "reproduced" },
-        isError: false,
-      }, agentEndContext);
-      await requireHook(pi, "tool_result")({
-        type: "tool_result",
-        toolCallId: "inspect-source",
-        toolName: "inspect",
-        input: { action: "search", query: "answerSql" },
-        content: [{ type: "text", text: "SRC evidence" }],
-        details: undefined,
-        isError: false,
-      }, agentEndContext);
-      const proposedFromSearchOnly = await toolCallHook({
-        type: "tool_call",
-        toolCallId: "finish-proposed-search-only",
-        toolName: "finish",
-        input: { status: "proposed", summary: "search only" },
-      }, agentEndContext) as { block?: boolean; reason?: string };
-      assert.equal(proposedFromSearchOnly.block, true);
-      assert.match(proposedFromSearchOnly.reason ?? "", /inspect\(read\)/u);
-      assert.equal(await toolCallHook({
-        type: "tool_call",
-        toolCallId: "inspect-source-read",
-        toolName: "inspect",
-        input: { action: "read", path: "src/game.ts", startLine: 1 },
-      }, agentEndContext), undefined);
-      await requireHook(pi, "tool_result")({
-        type: "tool_result",
-        toolCallId: "inspect-source-read",
-        toolName: "inspect",
-        input: { action: "read", path: "src/game.ts", startLine: 1 },
-        content: [{ type: "text", text: "SRC read evidence" }],
-        details: undefined,
-        isError: false,
-      }, agentEndContext);
-      assert.equal(await toolCallHook({
-        type: "tool_call",
-        toolCallId: "finish-proposed-with-evidence",
-        toolName: "finish",
-        input: { status: "proposed", summary: "source and failed check" },
-      }, agentEndContext), undefined);
-      const forcedProposalTurn = await toolCallHook({
-        type: "tool_call",
-        toolCallId: "inspect-after-evidence",
-        toolName: "inspect",
-        input: { action: "search", query: "unrelated" },
-      }, agentEndContext) as { block?: boolean; terminate?: boolean; reason?: string };
-      assert.deepEqual(forcedProposalTurn, {
-        block: true,
-        terminate: true,
-        reason: "复现和源码证据已经足够；当前诊断回合已停止，请立即调用 finish(status=proposed) 提交一次性修复方案，不要继续搜索。",
-      });
-
-      for (let index = 0; index < 5; index += 1) {
-        await agentEndHook({ type: "agent_end", messages: [] }, agentEndContext);
-      }
-      assert.equal(pi.sentMessages.length, 1);
-      for (const entry of pi.sentMessages) {
-        assert.deepEqual(entry.options, {
-          triggerTurn: true,
-          deliverAs: "followUp",
-        });
-        assert.match(JSON.stringify(entry.message), /修复任务尚未完成/u);
-      }
-
-      await inputHook({
-        source: "rpc",
-        text: "请继续修复默认 SQL 错误。",
-      });
-      await agentEndHook(
-        { type: "agent_end", messages: [] },
-        {
-          ...agentEndContext,
-          getContextUsage: () => ({ percent: 85 }),
-        },
-      );
-      assert.equal(pi.sentMessages.length, 1);
-      assert.match(continuationNotifications.at(-1) ?? "", /上下文已接近上限/u);
-
-      const agentStartHook = requireHook(pi, "agent_start");
-      await agentStartHook({ type: "agent_start" });
-      for (let index = 0; index < 8; index += 1) {
-        assert.equal(await toolCallHook({
-          type: "tool_call",
-          toolCallId: "repair-budget-inspect-" + String(index),
-          toolName: "inspect",
-          input: {
-            action: "search",
-            query: "budget-inspect-" + String(index),
-          },
-        }, agentEndContext), undefined);
-      }
-      // follow-up 不会重置累计总预算；换用另一工具族仍可继续到总上限。
-      await agentStartHook({ type: "agent_start" });
-      for (let index = 0; index < 8; index += 1) {
-        assert.equal(await toolCallHook({
-          type: "tool_call",
-          toolCallId: "repair-budget-game-" + String(index),
-          toolName: "use",
-          input: { actionId: "budget-game-" + String(index) },
-        }, agentEndContext), undefined);
-      }
-      await agentStartHook({ type: "agent_start" });
-      const cumulativeBudget = await toolCallHook({
-        type: "tool_call",
-        toolCallId: "repair-budget-overflow",
-        toolName: "use",
-        input: { actionId: "budget-overflow" },
-      }, agentEndContext) as { block?: boolean; terminate?: boolean; reason?: string };
-      assert.equal(cumulativeBudget.block, true);
-      assert.equal(cumulativeBudget.terminate, false);
-      assert.match(cumulativeBudget.reason ?? "", /达到工具预算上限/u);
-      await agentEndHook({ type: "agent_end", messages: [] }, agentEndContext);
-      assert.equal(pi.sentMessages.length, 2);
-
-      const repairObjective = task.objective;
-      await inputHook({ source: "rpc", text: "现在状态如何？" });
-      await agentEndHook({ type: "agent_end", messages: [] }, agentEndContext);
-      assert.equal(pi.sentMessages.length, 2);
-      assert.equal(task.objective, repairObjective);
-    } finally {
-      await repository.dispose();
-    }
-  });
-
-  it("action-not-available 必须读取执行分支、动作映射和真实 DOM 后才能提交方案", async () => {
-    const repository = await createTemporaryGitRepository({
-      "README.md": "test\n",
-    });
-    try {
-      const dataDir = join(repository.temporaryRoot, "data");
-      const store = new TaskStore(dataDir);
-      const task = await store.create({
-        id: "task-action-evidence",
+        id: "task-single-agent-request",
         objective: INITIAL_TASK_OBJECTIVE,
         repoRoot: repository.repoRoot,
         baseHead: repository.baseHead,
         worktreeRoot: repository.repoRoot,
-        piSessionDir: join(store.taskDir("task-action-evidence"), "pi"),
+        piSessionDir: join(store.taskDir("task-single-agent-request"), "pi"),
       });
+      await store.transition(task, "active");
+      const evidence = new EvidenceStore(dataDir, task);
       const pi = new RecordingExtensionApi();
       const driver = {
-        peek: async () => ({ floor: 1, mode: "combat", terminal: null }),
+        trace: new SemanticTrace(10),
+        peek: async () => ({
+          floor: 3,
+          mode: "combat",
+          prompt: "SELECT id FROM monsters",
+        }),
       } as unknown as GameDriver;
       installDungeonMaintainerExtension(pi as unknown as ExtensionAPI, {
         config: loadConfig({
@@ -1009,6 +635,7 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
         }),
         store,
         task,
+        evidenceStore: evidence,
         gameRuntime: {
           currentDriver: () => driver,
           requireDriver: () => driver,
@@ -1016,178 +643,81 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
           close: async () => undefined,
         },
       });
+      const notifications: string[] = [];
       const hookContext = {
-        hasPendingMessages: () => false,
         getContextUsage: () => ({ percent: 20 }),
-        ui: { notify: () => undefined },
+        ui: {
+          notify: (message: string) => notifications.push(message),
+        },
       };
       const inputHook = requireHook(pi, "input");
-      const toolCallHook = requireHook(pi, "tool_call");
-      const toolResultHook = requireHook(pi, "tool_result");
       const agentEndHook = requireHook(pi, "agent_end");
 
-      await inputHook({
-        source: "rpc",
-        text: "terminal 动作返回 action-not-available，请直接定位并修复。",
-      });
-      // details 缺失时仍必须从真实工具正文识别运行时失败类型和失败 actionId。
-      await toolResultHook({
-        type: "tool_result",
-        toolCallId: "use-terminal-failed",
-        toolName: "use",
-        input: { actionId: "terminal" },
-        content: [{
-          type: "text",
-          text: "{\"ok\":false,\"event\":\"action-not-available\"}",
-        }],
-        details: {},
-        isError: false,
-      }, hookContext);
-      const sourceBeforeReproduction = await toolCallHook({
+      await inputHook({ source: "rpc", text: "当前状态是什么？" });
+      await agentEndHook({ type: "agent_end", messages: [] }, hookContext);
+      assert.equal(pi.sentMessages.length, 0);
+
+      const repairRequest = "第一层进入 SELECT 战斗后终端不出现，请直接定位并修复。";
+      await inputHook({ source: "rpc", text: repairRequest });
+      assert.equal(task.objective, repairRequest);
+      assert.equal(pi.hooks.has("agent_start"), false);
+      assert.equal(pi.hooks.has("agent_settled"), false);
+
+      const dynamic = await requireHook(pi, "before_agent_start")(
+        { prompt: repairRequest, systemPrompt: "PROJECT AGENTS SENTINEL" },
+        hookContext,
+      ) as { systemPrompt: string; message?: unknown };
+      const dynamicText = JSON.stringify(dynamic.message);
+      assert.match(dynamic.systemPrompt, /PROJECT AGENTS SENTINEL/u);
+      assert.match(dynamicText, /本轮最高优先级请求/u);
+      assert.match(dynamicText, /SELECT 战斗后终端不出现/u);
+      assert.match(dynamicText, /SELECT id FROM monsters/u);
+      assert.doesNotMatch(dynamicText, /滚动任务|阶段指令|诊断门禁|active 证据卡/u);
+
+      const inspectGate = await requireHook(pi, "tool_call")({
         type: "tool_call",
-        toolCallId: "inspect-before-reproduced",
+        toolCallId: "autonomous-inspect",
         toolName: "inspect",
         input: { action: "search", query: "terminal" },
-      }, hookContext) as { block?: boolean; terminate?: boolean; reason?: string };
-      assert.equal(sourceBeforeReproduction.block, true);
-      assert.equal(sourceBeforeReproduction.terminate, true);
-      assert.match(sourceBeforeReproduction.reason ?? "", /finish\(status=reproduced\)/u);
-      await toolResultHook({
-        type: "tool_result",
-        toolCallId: "finish-reproduced-action",
-        toolName: "finish",
-        input: { status: "reproduced" },
-        content: [{ type: "text", text: "reproduced" }],
-        details: { status: "reproduced" },
-        isError: false,
       }, hookContext);
-      await toolResultHook({
-        type: "tool_result",
-        toolCallId: "read-use-branch",
-        toolName: "inspect",
-        input: {
-          action: "read",
-          path: "game/src/devtools/dungeon-agent/bridge.ts",
-          startLine: 278,
-        },
-        content: [{
-          type: "text",
-          text: [
-            "const selector = DUNGEON_AGENT_ACTION_SELECTORS[actionId];",
-            "if (!selector) return result(false, \"action-not-available\");",
-            "if (!clickDungeonAgentAction(options.root, selector)) return result(false, \"action-not-available\");",
-          ].join("\n"),
-        }],
-        details: { action: "read" },
-        isError: false,
-      }, hookContext);
-      await toolResultHook({
-        type: "tool_result",
-        toolCallId: "read-projection",
-        toolName: "inspect",
-        input: {
-          action: "read",
-          path: "game/src/devtools/dungeon-agent/projection.ts",
-          startLine: 100,
-        },
-        content: [{
-          type: "text",
-          text: "actions.push(action(\"terminal\", \"打开当前 SQL 战斗终端\"));\nreturn { terminal: terminalView(snapshot, overlay) };",
-        }],
-        details: { action: "read" },
-        isError: false,
-      }, hookContext);
-
-      const prematureProposal = await toolCallHook({
+      assert.equal(inspectGate, undefined);
+      const unapprovedWrite = await requireHook(pi, "tool_call")({
         type: "tool_call",
-        toolCallId: "finish-proposed-too-early",
-        toolName: "finish",
-        input: { status: "proposed" },
-      }, hookContext) as { block?: boolean; reason?: string };
-      assert.equal(prematureProposal.block, true);
-      assert.match(prematureProposal.reason ?? "", /terminal 的动作映射字面量/u);
-      assert.match(prematureProposal.reason ?? "", /真实 DOM 按钮定义/u);
-      assert.equal(await toolCallHook({
-        type: "tool_call",
-        toolCallId: "inspect-mapping-allowed",
-        toolName: "inspect",
-        input: {
-          action: "read",
-          path: "game/src/devtools/dungeon-agent/actions.ts",
-        },
-      }, hookContext), undefined);
+        toolCallId: "unapproved-write",
+        toolName: "write",
+        input: { path: "README.md", content: "forbidden\n" },
+      }, hookContext) as { block: boolean; terminate: boolean; reason: string };
+      assert.equal(unapprovedWrite.block, true);
+      assert.equal(unapprovedWrite.terminate, false);
+      assert.match(unapprovedWrite.reason, /finish\(status=proposed\)/u);
 
-      await agentEndHook({ type: "agent_end", messages: [] }, hookContext);
-      assert.match(
-        JSON.stringify(pi.sentMessages.at(-1)?.message),
-        /terminal 的动作映射字面量.*真实 DOM 按钮定义/u,
+      const finishTool = pi.toolDefinitions.get("finish");
+      assert.ok(finishTool?.execute);
+      const executeFinish = finishTool.execute;
+      await assert.rejects(
+        async () => await executeFinish(
+          "premature-diagnosed",
+          { status: "diagnosed", summary: "已找到原因。", risk: "无" },
+          undefined,
+          undefined,
+          hookContext,
+        ),
+        /diagnosed 不是终态/u,
       );
+      await agentEndHook({ type: "agent_end", messages: [] }, hookContext);
+      assert.equal(pi.sentMessages.length, 0);
 
-      await toolResultHook({
-        type: "tool_result",
-        toolCallId: "read-action-mapping",
-        toolName: "inspect",
-        input: {
-          action: "read",
-          path: "game/src/devtools/dungeon-agent/actions.ts",
-          startLine: 14,
+      await inputHook({ source: "rpc", text: "现在状态如何？" });
+      assert.equal(task.objective, repairRequest);
+      await requireHook(pi, "before_agent_start")(
+        { prompt: "现在状态如何？", systemPrompt: "PROJECT AGENTS SENTINEL" },
+        {
+          ...hookContext,
+          getContextUsage: () => ({ percent: 85 }),
         },
-        content: [{
-          type: "text",
-          text: "   16 export const DUNGEON_AGENT_ACTION_SELECTORS = {\n   20   terminal: \"#open-sql-broken\",\n   28 };",
-        }],
-        details: { action: "read" },
-        isError: false,
-      }, hookContext);
-      const missingDomProposal = await toolCallHook({
-        type: "tool_call",
-        toolCallId: "finish-proposed-no-dom",
-        toolName: "finish",
-        input: { status: "proposed" },
-      }, hookContext) as { block?: boolean; reason?: string };
-      assert.equal(missingDomProposal.block, true);
-      assert.doesNotMatch(missingDomProposal.reason ?? "", /动作映射字面量/u);
-      assert.match(missingDomProposal.reason ?? "", /真实 DOM 按钮定义/u);
-      assert.equal(await toolCallHook({
-        type: "tool_call",
-        toolCallId: "inspect-dom-search-allowed",
-        toolName: "inspect",
-        input: {
-          action: "search",
-          query: "open-sql",
-        },
-      }, hookContext), undefined);
-
-      await toolResultHook({
-        type: "tool_result",
-        toolCallId: "search-real-dom",
-        toolName: "inspect",
-        input: {
-          action: "search",
-          query: "open-sql",
-        },
-        content: [{
-          type: "text",
-          text: "game/src/presentation/dom/appShellTemplate.ts:356:  <button id=\"open-sql\" type=\"button\">SQL 战斗</button>",
-        }],
-        details: { action: "search" },
-        isError: false,
-      }, hookContext);
-      assert.equal(await toolCallHook({
-        type: "tool_call",
-        toolCallId: "finish-proposed-complete",
-        toolName: "finish",
-        input: { status: "proposed" },
-      }, hookContext), undefined);
-      const stoppedSearch = await toolCallHook({
-        type: "tool_call",
-        toolCallId: "inspect-after-complete-evidence",
-        toolName: "inspect",
-        input: { action: "search", query: "unrelated" },
-      }, hookContext) as { block?: boolean; terminate?: boolean; reason?: string };
-      assert.equal(stoppedSearch.block, true);
-      assert.equal(stoppedSearch.terminate, true);
-      assert.match(stoppedSearch.reason ?? "", /源码证据已经足够/u);
+      );
+      assert.match(notifications.at(-1) ?? "", /上下文已超过 60%/u);
+      assert.equal(pi.sentMessages.length, 0);
     } finally {
       await repository.dispose();
     }
@@ -1394,8 +924,8 @@ describe("Pi Extension 分阶段工具、命令和会话阻断", () => {
       const parentTraversal = await toolCallHook({
         type: "tool_call",
         toolCallId: "parent-traversal-write",
-        toolName: "edit",
-        input: { path: "../escape.txt", oldText: "a", newText: "b" },
+        toolName: "write",
+        input: { path: "../escape.txt", content: "b" },
       }, { ui: { notify: () => undefined } }) as {
         block: boolean;
         terminate: boolean;

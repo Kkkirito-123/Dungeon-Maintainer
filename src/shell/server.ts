@@ -13,11 +13,11 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
-import type { PiRpcCommand } from "../pi/rpc-process.js";
+import type { AgentRpcCommand } from "../agent/rpc.js";
 import {
   decideTokenControl,
   promptTokenLimit,
-} from "../pi/token-control.js";
+} from "../agent/token-control.js";
 import type { TaskStore } from "../task/store.js";
 import type { TaskRecord } from "../task/types.js";
 import {
@@ -40,7 +40,7 @@ import {
 } from "./protocol.js";
 
 type JsonRecord = Record<string, unknown>;
-type RpcSender = (command: PiRpcCommand) => Promise<unknown>;
+type RpcSender = (command: AgentRpcCommand) => Promise<unknown>;
 type ShellClient = { response: ServerResponse; lastEventId: number };
 
 /** Shell 启动后返回的本机访问地址。 */
@@ -886,7 +886,7 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
     if (request.method === "GET" && url.pathname === "/api/workspace/tree") {
       writeJson(response, {
         taskId: task.id,
-        files: await readWorkspaceTree(task),
+        files: await readWorkspaceTree(task, options.store.dataDir),
         writeScope: task.writeScope,
       });
       return;

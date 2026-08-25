@@ -16,6 +16,8 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { claimEvidence } from "../../evidence/projector.js";
+import type { EvidenceStore } from "../../evidence/store.js";
 import type { GameDriver } from "../../game/driver.js";
 import { appendEvent } from "../../logging/events.js";
 import { redactText } from "../../logging/redact.js";
@@ -29,10 +31,32 @@ const ReproductionAssertionsParameters = Type.Object({
   floor: Type.Optional(Type.Integer({ minimum: 1, maximum: 8 })),
   mode: Type.Optional(Type.String({ minLength: 1, maxLength: 40 })),
   minLessons: Type.Optional(Type.Integer({ minimum: 0 })),
-  advancedFromFloor: Type.Optional(Type.Integer({ minimum: 1, maximum: 8 })),
+  minStageIndex: Type.Optional(Type.Integer({
+    minimum: 0,
+    description: "修复后战斗终端 stageIndex 至少达到的值；战斗题目阶段必须使用本字段，不能写 advancedFromFloor。",
+  })),
+  advancedFromFloor: Type.Optional(Type.Integer({
+    minimum: 1,
+    maximum: 8,
+    description: "修复后应离开的楼层号，只用于楼层/传送门推进，不表示战斗终端题目阶段。",
+  })),
   bossDefeated: Type.Optional(Type.Boolean()),
   queryAccepted: Type.Optional(Type.Boolean({
     description: "修复后重放期望查询是否被接受，不是当前故障现场值。",
+  })),
+  queryAcceptedSequence: Type.Optional(Type.Array(Type.Boolean(), {
+    minItems: 1,
+    maxItems: 8,
+    description: "按提交顺序精确声明每次 query 修复后是否被接受。",
+  })),
+  queryPlanSequence: Type.Optional(Type.Array(Type.Union([
+    Type.Literal("scan"),
+    Type.Literal("search"),
+    Type.Literal("none"),
+  ]), {
+    minItems: 1,
+    maxItems: 8,
+    description: "按提交顺序精确声明每次 query 展示的计划类别。",
   })),
   terminalOpen: Type.Optional(Type.Boolean({
     description: "修复后重放期望终端是否打开；终端本应打开时必须填 true。",
@@ -72,8 +96,10 @@ const ExecutionPlanParameters = Type.Object({
     maxItems: 12,
   }),
 }, { additionalProperties: false });
+// 只拒绝“根因或修改目标仍未确定”的方案。验证步骤本来就描述未来要执行的检查，
+// 因此“需要运行测试验证”不能被误判为未完成诊断。
 const UNRESOLVED_PLAN_PATTERN =
-  /(?:需(?:要)?[^。；]{0,32}(?:确认|验证|检查|读取|定位|查找|补充)|必须(?:先)?(?:确认|验证|检查|读取|定位|查找)|尚未(?:确认|验证|检查|读取)|未及(?:读取|验证|检查)|不确定|无法确认|有待(?:确认|验证|检查))/iu;
+  /(?:仍需(?:确认|检查|读取|定位|查找|补充)|需(?:要)?(?:先|进一步)(?:确认|检查|读取|定位|查找|补充)|必须先(?:确认|检查|读取|定位|查找)|尚未(?:确认|检查|读取|定位|查明)|未及(?:读取|检查|定位)|不确定|无法确认|有待(?:确认|检查|读取|定位|查明))/iu;
 
 /** `finish` 的严格结论契约。 */
 export const FinishParameters = Type.Object({
@@ -102,10 +128,12 @@ export const FinishParameters = Type.Object({
 export interface FinishToolContext {
   task: TaskRecord;
   store: TaskStore;
+  evidence: EvidenceStore;
   currentDriver(): GameDriver | null;
   approveExecution(): void;
   completeExecution(): void;
   isExecutionApproved(): boolean;
+  repairRequested(): boolean;
   verifyTask(signal?: AbortSignal): Promise<VerificationResult>;
 }
 
@@ -161,6 +189,7 @@ export function registerFinishTool(
     promptSnippet: "修改前用 proposed 提交病因和完整方案；完成后用 result 保存结果",
     promptGuidelines: [
       "运行时问题复现成功后，以 reproduced 保存语义动作及至少一项修复后应满足的结构化结果断言；不要把当前故障值当成断言。",
+      "首次 query-accepted 已经证明 stageIndex 未按期望推进时立即 reproduced，不要再追加 input_sql/query 确认；阶段目标使用 minStageIndex。",
       "用户要求修复时，定位病因后必须以 proposed 一次提交完整步骤与验证方法；批准后立即执行，不再询问。",
       "代码修改后用 result；工具会自动运行当前代码的固定检查、刷新重放和隐藏断言，失败时继续修复。",
       "确认无法继续且原因客观时才用 blocked。",
@@ -182,6 +211,11 @@ export function registerFinishTool(
       }
       const summary = plain(input.summary, 1_200);
       const risk = plain(input.risk, 600);
+      if (input.status === "diagnosed" && context.repairRequested()) {
+        throw new Error(
+          "当前用户请求要求修复，diagnosed 不是终态；请继续提交 proposed，或在客观无法继续时提交 blocked。",
+        );
+      }
       if (input.status === "proposed" && !input.plan) {
         throw new Error("proposed 必须给出一次性完整方案和验证方法");
       }
@@ -215,6 +249,7 @@ export function registerFinishTool(
         if (!driver) throw new Error("浏览器不可用，不能保存运行时复现");
         const reproduction = await saveReproduction(
           context.store,
+          context.evidence,
           context.task,
           driver.trace,
           {
@@ -227,7 +262,7 @@ export function registerFinishTool(
         );
         reproductionId = reproduction.id;
       } else if (input.reproduction) {
-        if (input.status !== "proposed" || !context.task.activeReproductionId) {
+        if (input.status !== "proposed" || !(await context.evidence.latest("reproduction"))) {
           throw new Error("只有 reproduced 状态可以新建 reproduction；proposed 只能重复携带当前已保存的复现");
         }
       }
@@ -235,6 +270,10 @@ export function registerFinishTool(
       let executionApproved: boolean | null = null;
       let verification: VerificationResult | null = null;
       let planSummary = "";
+      let planTitle: string | undefined;
+      let planSteps: string[] | undefined;
+      let planVerification: string | undefined;
+      let planAllowedPaths: string[] | undefined;
       if (input.status === "proposed" && input.plan) {
         const title = plain(input.plan.title, 160);
         const steps = input.plan.steps.map((step) => plain(
@@ -247,7 +286,6 @@ export function registerFinishTool(
           risk,
           title,
           ...steps,
-          verification,
         ].join(" "))) {
           throw new Error(
             "完整修复方案仍包含未确认推测；请删除未证实的顺手修改，只保留现有证据直接证明的最小修复后重新 proposed。",
@@ -257,6 +295,10 @@ export function registerFinishTool(
           context.task.worktreeRoot,
           input.plan.allowedPaths,
         );
+        planTitle = title;
+        planSteps = steps;
+        planVerification = verification;
+        planAllowedPaths = allowedPaths;
         planSummary = [
           "方案：" + title,
           ...steps.map((step, index) => String(index + 1) + ". " + step),
@@ -270,8 +312,26 @@ export function registerFinishTool(
           "",
           "风险：" + risk,
           "",
-          "确认后将为当前 Agent 运行开放 Pi 原生 write/edit 与精确 patch，并在 detached worktree 一次执行完整方案。",
+          "确认后将为当前 Agent 运行开放 Pi 原生 write 与精确 patch，并在 detached worktree 一次执行完整方案。",
         ].join("\n");
+        const factLinks = (await context.evidence.active())
+          .filter((record) => (
+            record.kind === "source"
+            || record.kind === "game"
+            || record.kind === "check"
+            || record.kind === "reproduction"
+          ))
+          .map((record) => record.id);
+        await context.evidence.capture(claimEvidence({
+          status: input.status,
+          summary,
+          risk,
+          planTitle,
+          planSteps,
+          verification: planVerification,
+          allowedPaths: planAllowedPaths,
+          links: factLinks,
+        }));
         executionApproved = await extensionContext.ui.confirm(
           "是否执行完整修复方案",
           approvalMessage,
@@ -319,11 +379,20 @@ export function registerFinishTool(
         await context.store.closeWriteScope(context.task);
       }
 
-      context.task.conclusion = [
-        "结论：" + summary,
-        planSummary,
-        "风险：" + risk,
-      ].filter(Boolean).join("\n");
+      if (input.status === "result" || input.status === "blocked" || input.status === "diagnosed") {
+        const terminalLinks = input.status === "result"
+          ? (await context.evidence.active("verification")).map((record) => record.id)
+          : (await context.evidence.active())
+            .filter((record) => record.kind !== "claim")
+            .map((record) => record.id);
+        await context.evidence.capture(claimEvidence({
+          status: input.status,
+          summary,
+          risk,
+          links: terminalLinks,
+        }));
+      }
+
       if (input.status === "blocked" && context.task.state !== "blocked") {
         await context.store.transition(context.task, "blocked");
       } else {
@@ -337,7 +406,7 @@ export function registerFinishTool(
       const visibleConclusion = [
         summary,
         input.status === "blocked" ? "阻塞：" + risk : "风险：" + risk,
-        input.status === "result" ? "自动验证通过；现在可以执行 /apply。" : "",
+        input.status === "result" ? "候选聚焦验证通过；现在可以执行 /apply，写回前会运行完整质量门。" : "",
         executionApproved === false ? "用户未批准执行；worktree 保持不变。" : "",
       ].filter(Boolean).join("\n");
       if (
@@ -380,8 +449,8 @@ export function registerFinishTool(
             replayPassed: verification.record.replayPassed,
           } : null,
         },
-        // 保存复现是修复流程的中间检查点；若用户已经要求修复，应允许同一 Agent
-        // 继续定位和 patch。其余结论则结束本次模型循环，避免无证据地追加动作。
+        // 复现和获批方案都在同一个 Pi Agent turn 内继续；拒绝、最终结果、诊断结论
+        // 或真实阻塞才结束本次自然请求，不创建隐藏的后继模型回合。
         terminate: input.status === "proposed"
           ? executionApproved !== true
           : input.status !== "reproduced",

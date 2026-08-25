@@ -6,14 +6,14 @@
  * 非职责：不解释模型正文、不调用 Pi、不读取任务或工作区、不决定哪些事实算作领域证据；
  * 证据值和路线值由 Extension 按工具语义提供。
  * 输入输出：调用前接收工具名、参数和可选路线，返回允许、策略重置、阻止或硬停止决策；
- * 调用后接收结果与证据，只保存 SHA-256 摘要，不保留源码、SQL 或工具正文。
+ * 调用后接收结果与 EvidenceStore revision，只保存 SHA-256 摘要和数字版本。
  * 相邻模块边界：Extension 负责遵守门禁、构造领域证据并注入策略重置；任务状态和持久化
  * 仍由 TaskStore 负责，本模块只维护单活动任务的进程内状态。
  * 副作用与权限：除进程内计数与冻结集合外无副作用，不访问文件、网络、进程或任何工具权限。
  * 隐私：最近结果仅包含工具名和不可逆摘要；原始参数、结果与证据不会被本模块持久化。
  * 关键失败模式与恢复：循环引用无法形成确定性摘要时会抛出 TypeError；调用方应拒绝该次
- * 工具调用并修正领域投影。任务切换必须调用 resetForNewTask，客观进展必须调用 noteProgress
- * 或通过 recordOutcome 提交新证据，否则冻结会按设计继续生效。
+ * 工具调用并修正领域投影。任务切换必须用当前证据 revision 调用 resetForNewTask；
+ * 后续只有 revision 增长或调用方明确 madeProgress 才算客观进展。
  */
 
 import { createHash } from "node:crypto";
@@ -42,8 +42,8 @@ export interface ActionOutcome {
   routeDigest: string;
   /** 规范化工具结果的 SHA-256 摘要。 */
   resultDigest: string;
-  /** 本次调用观察到的证据摘要；不包含原始证据。 */
-  evidenceDigests: readonly string[];
+  /** 本次调用完成后的 EvidenceStore revision。 */
+  evidenceRevision: number;
   /** 记录该结果时的客观进展版本。 */
   progressRevision: number;
 }
@@ -54,8 +54,10 @@ export interface CompletedAction {
   action: LoopAction;
   /** 已按工具语义移除随机字段的结果投影。 */
   result: unknown;
-  /** 能代表新客观事实的证据投影；空数组表示本次没有新增证据候选。 */
-  evidence?: readonly unknown[];
+  /** 本次调用完成后的 EvidenceStore revision；缓存命中不会增加它。 */
+  evidenceRevision: number;
+  /** 非 EvidenceStore 事实的显式进展；一般调用方应省略。 */
+  madeProgress?: boolean;
 }
 
 /**
@@ -149,18 +151,18 @@ function routeDigest(action: LoopAction): string {
  */
 export class LoopGuard {
   private outcomes: ActionOutcome[] = [];
-  private evidenceDigests = new Set<string>();
   private frozenActionDigests = new Set<string>();
   private frozenRouteDigests = new Set<string>();
   private strategyResetRevision: number | null = null;
   private hardStopRevision: number | null = null;
   private currentProgressRevision = 0;
   private currentNoProgressCount = 0;
+  private observedEvidenceRevision = 0;
 
   /**
    * 返回当前进展版本。
    *
-   * @returns 从零开始、仅由新证据或 noteProgress 推进的单调递增版本号。
+   * @returns 从零开始、仅由证据 revision 或显式进展推进的单调递增版本号。
    * @remarks 只读访问，不修改门禁状态，也不涉及任何工具权限。
    */
   public get progressRevision(): number {
@@ -184,10 +186,7 @@ export class LoopGuard {
    * @remarks 只读访问，不返回原始动作、结果、源码或 SQL。
    */
   public get recentOutcomes(): readonly ActionOutcome[] {
-    return this.outcomes.map((outcome) => ({
-      ...outcome,
-      evidenceDigests: [...outcome.evidenceDigests],
-    }));
+    return this.outcomes.map((outcome) => ({ ...outcome }));
   }
 
   /**
@@ -279,34 +278,32 @@ export class LoopGuard {
   /**
    * 记录一次已经真实完成的工具调用，并判断它是否带来了新证据。
    *
-   * @param completed 允许执行的动作、稳定结果投影和可选证据投影。
-   * @returns 任一证据摘要在当前任务首次出现时返回 true，否则返回 false。
-   * @throws {TypeError} 任一投影含循环引用，无法形成稳定摘要时抛出；失败时不写入部分状态。
-   * @remarks 新证据会自动推进进展版本、清零无进展次数并解除冻结；无新证据时只增加一次
-   * 无进展计数。调用前置条件是 evaluateAction 返回 `allow` 且工具确已完成；本方法不调用
+   * @param completed 允许执行的动作、稳定结果投影和证据 revision。
+   * @returns revision 增长或显式 madeProgress 时返回 true，否则返回 false。
+   * @throws {TypeError} 结果投影含循环引用时抛出；失败时不写入部分状态。
+   * @remarks cacheHit 不会增加 EvidenceStore revision，因此只增加无进展计数。本方法不调用
    * 工具、不持久化正文，也不扩大权限。
    */
   public recordOutcome(completed: CompletedAction): boolean {
     const nextActionDigest = actionDigest(completed.action);
     const nextRouteDigest = routeDigest(completed.action);
     const nextResultDigest = stableDigest(completed.result);
-    const nextEvidenceDigests = [...new Set(
-      (completed.evidence ?? []).map((evidence) => stableDigest(evidence)),
-    )];
-    const hasNewEvidence = nextEvidenceDigests.some(
-      (digest) => !this.evidenceDigests.has(digest),
+    const hasNewEvidence = completed.madeProgress === true
+      || completed.evidenceRevision > this.observedEvidenceRevision;
+    this.observedEvidenceRevision = Math.max(
+      this.observedEvidenceRevision,
+      completed.evidenceRevision,
     );
 
-    if (hasNewEvidence) this.noteProgress();
+    if (hasNewEvidence) this.advanceProgress();
     else this.currentNoProgressCount += 1;
-    for (const digest of nextEvidenceDigests) this.evidenceDigests.add(digest);
 
     const outcome: ActionOutcome = {
       toolName: completed.action.toolName,
       actionDigest: nextActionDigest,
       routeDigest: nextRouteDigest,
       resultDigest: nextResultDigest,
-      evidenceDigests: nextEvidenceDigests,
+      evidenceRevision: completed.evidenceRevision,
       progressRevision: this.currentProgressRevision,
     };
     this.outcomes.push(outcome);
@@ -317,13 +314,12 @@ export class LoopGuard {
   }
 
   /**
-   * 登记一次由任务状态、工作区 Hash、检查或用户批准产生的客观进展。
+   * 处理一次由证据 revision 或调用方显式确认产生的客观进展。
    *
    * @returns 无返回值；调用后 progressRevision 加一，无进展次数归零，当前冻结全部解除。
-   * @remarks 调用方必须已经验证进展是客观且不同于旧事实；本方法不读取 TaskStore、工作区或
-   * 用户消息，也不修改工具权限。误报进展会错误放行旧路线，因此不得用“模型继续思考”调用。
+   * @remarks 只由 recordOutcome 调用，不读取 TaskStore、工作区或用户消息。
    */
-  public noteProgress(): void {
+  private advanceProgress(): void {
     this.currentProgressRevision += 1;
     this.currentNoProgressCount = 0;
     this.frozenActionDigests.clear();
@@ -335,18 +331,30 @@ export class LoopGuard {
   /**
    * 清空上一任务的全部循环、证据和进展状态。
    *
-   * @returns 无返回值；最近结果、已见证据、冻结、计数和版本全部恢复初始值。
+   * @returns 无返回值；最近结果、冻结、计数和版本全部恢复到给定证据 revision。
    * @remarks 单活动任务切换前必须调用；它只修改本实例内存，不删除任务文件、不终止 Pi、
    * 不触发工具，也不持久化任何内容。
    */
-  public resetForNewTask(): void {
+  public resetForNewTask(evidenceRevision = 0): void {
     this.outcomes = [];
-    this.evidenceDigests.clear();
     this.frozenActionDigests.clear();
     this.frozenRouteDigests.clear();
     this.strategyResetRevision = null;
     this.hardStopRevision = null;
     this.currentProgressRevision = 0;
     this.currentNoProgressCount = 0;
+    this.observedEvidenceRevision = evidenceRevision;
+  }
+
+  /**
+   * 开始同一 Bug Goal 的新 Episode。
+   *
+   * 清除只属于上一 Episode 的无进展计数和 hard stop，但保留已冻结的精确动作与
+   * 路线，确保 recover 必须真正换策略，不能靠创建新 Episode 立刻重放同一动作。
+   */
+  public beginEpisode(): void {
+    this.currentNoProgressCount = 0;
+    this.strategyResetRevision = null;
+    this.hardStopRevision = null;
   }
 }

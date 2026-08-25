@@ -4,7 +4,7 @@
   "secretInputs": {
     "indexed-query": "SELECT code, score FROM index_records WHERE id = 3;"
   },
-  "beforeOracle": "plan-placeholder",
+  "beforeOracle": "stale-query-plan",
   "afterOracle": "query-plan-current",
   "requiredChecks": ["game-test", "game-architecture", "game-build"],
   "forbiddenPaths": [".env", ".env.local", ".git"]

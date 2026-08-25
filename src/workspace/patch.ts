@@ -13,10 +13,12 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { appendEvent } from "../logging/events.js";
+import { changeEvidence } from "../evidence/projector.js";
+import type { EvidenceStore } from "../evidence/store.js";
 import { containsCredentialText } from "../logging/redact.js";
 import type { TaskStore } from "../task/store.js";
 import type { TaskRecord } from "../task/types.js";
-import { hashBytes, hashFile, pathExists } from "./git.js";
+import { hashBytes, hashFile, hashWorktree, pathExists } from "./git.js";
 import {
   classifyPath,
   decidePatch,
@@ -52,6 +54,7 @@ export interface PrecisePatchResult {
 export interface PatchExecutionContext {
   task: TaskRecord;
   store: TaskStore;
+  evidence?: EvidenceStore;
   confirmCore(paths: readonly string[], changedLines: number): Promise<boolean>;
   beforePatch(): Promise<void>;
   afterPatch(): Promise<void>;
@@ -227,13 +230,25 @@ export async function applyPrecisePatch(
   task.verification = null;
   task.patchPath = null;
   task.reversePatchPath = null;
-  // 核心审批无论批准或拒绝都会回到 active；非核心补丁从入口起也保持 active。
-  // 此处只持久化补丁元数据，避免制造一个实际上不可达的重复状态分支。
-  await store.save(task);
   const hashes = Object.fromEntries(staged.map((item) => [
     item.relative,
     hashBytes(Buffer.from(item.content, "utf8")),
   ]));
+  if (context.evidence) {
+    const worktreeHash = await hashWorktree(task.worktreeRoot);
+    await context.evidence.invalidatePaths(staged.map((item) => item.relative));
+    const proposed = (await context.evidence.active("claim"))
+      .filter((record) => record.metadata.finishStatus === "proposed")
+      .at(-1);
+    await context.evidence.capture(changeEvidence(
+      staged.map((item) => item.relative),
+      worktreeHash,
+      proposed ? [proposed.id] : [],
+    ));
+  }
+  // 核心审批无论批准或拒绝都会回到 active；非核心补丁从入口起也保持 active。
+  // 此处只持久化补丁元数据，避免制造一个实际上不可达的重复状态分支。
+  await store.save(task);
   await appendEvent(store, task.id, "tool.patch", {
     pathCount: staged.length,
     changedLines,

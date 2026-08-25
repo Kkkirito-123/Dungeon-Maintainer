@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { decideTokenControl, estimateInputTokens, promptTokenLimit } from "../src/pi/token-control.js";
+import { decideTokenControl, estimateInputTokens, promptTokenLimit } from "../src/agent/token-control.js";
 
 describe("Token 请求前门禁", () => {
   it("同时预留 25% 上下文和模型最大输出", () => {
