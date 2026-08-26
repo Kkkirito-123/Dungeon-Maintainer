@@ -63,6 +63,7 @@ export interface GameRepairMatrixCliOptions {
   timeoutMs: number | null;
   repetitions: number;
   profile: GameRepairMatrixProfile;
+  resumeDirectory: string | null;
 }
 
 export interface BenchmarkSuiteCliOptions {
@@ -71,6 +72,7 @@ export interface BenchmarkSuiteCliOptions {
   archiveRoot: string;
   suite: GameRepairSuite;
   ui: "progress" | "none";
+  resumeDirectory: string | null;
 }
 
 const HELP = [
@@ -84,7 +86,7 @@ const HELP = [
   "  pnpm benchmark -- preflight-matrix --dependency-repo <依赖仓库> [--archive-root <目录>]",
   "  pnpm benchmark -- game-repair --profile maintainer-current --fixture <案例> --dependency-repo <依赖仓库>",
   "  pnpm benchmark -- game-repair-matrix --profile maintainer-current|pi-original|both --dependency-repo <依赖仓库> --archive-root <目录> --repetitions 1",
-  "  pnpm benchmark -- benchmark-suite --suite four-regressions|full --dependency-repo <依赖仓库> [--ui progress|none]",
+  "  pnpm benchmark -- benchmark-suite --suite four-regressions|full --dependency-repo <依赖仓库> [--ui progress|none] [--resume <归档目录>]",
 ].join("\n");
 
 /** 解析仅运行当前 Maintainer 的固定回归套件；案例、重复次数和超时不能任意注入。 */
@@ -95,6 +97,7 @@ export function parseBenchmarkSuiteArgs(args: readonly string[]): BenchmarkSuite
   let archiveRoot = resolve("benchmark-results", "flash-current");
   let suite: GameRepairSuite | null = null;
   let ui: "progress" | "none" = process.stdout.isTTY ? "progress" : "none";
+  let resumeDirectory: string | null = null;
   for (let index = 0; index < args.length; index += 2) {
     const name = args[index];
     const value = args[index + 1];
@@ -108,11 +111,12 @@ export function parseBenchmarkSuiteArgs(args: readonly string[]): BenchmarkSuite
     } else if (name === "--ui") {
       if (value !== "progress" && value !== "none") throw new Error("--ui 只允许 progress 或 none");
       ui = value;
-    } else throw new Error("未知 benchmark-suite 参数：" + name);
+    } else if (name === "--resume") resumeDirectory = resolve(value);
+    else throw new Error("未知 benchmark-suite 参数：" + name);
   }
   if (!suite) throw new Error("benchmark-suite 缺少 --suite");
   if (!dependencyRepoRoot) throw new Error("benchmark-suite 缺少 --dependency-repo");
-  return { fixtureRoot, dependencyRepoRoot, archiveRoot, suite, ui };
+  return { fixtureRoot, dependencyRepoRoot, archiveRoot, suite, ui, resumeDirectory };
 }
 
 /** 解析不接受命令、脚本或模型提示的固定基准参数。 */
@@ -266,6 +270,7 @@ export function parseGameRepairMatrixArgs(
   let timeoutMs: number | null = null;
   let repetitions = 1;
   let profile: GameRepairMatrixProfile = "both";
+  let resumeDirectory: string | null = null;
   for (let index = 0; index < args.length; index += 2) {
     const name = args[index];
     const value = args[index + 1];
@@ -290,7 +295,8 @@ export function parseGameRepairMatrixArgs(
         throw new Error("--timeout-ms 必须在 60000 至 600000 之间");
       }
       timeoutMs = parsed;
-    } else {
+    } else if (name === "--resume") resumeDirectory = resolve(value);
+    else {
       throw new Error("未知 game-repair-matrix 参数：" + name);
     }
   }
@@ -302,6 +308,7 @@ export function parseGameRepairMatrixArgs(
     timeoutMs,
     repetitions,
     profile,
+    resumeDirectory,
   };
 }
 
@@ -328,6 +335,7 @@ export async function runBenchmarkCli(args: readonly string[]): Promise<number> 
         timeoutMs: suite.suite === "four-regressions" ? 300_000 : 600_000,
         profile: "maintainer-current",
         concurrency: 6,
+        ...(suite.resumeDirectory ? { resumeDirectory: suite.resumeDirectory } : {}),
         ...(suite.fixtureRoot ? { fixtureRoot: suite.fixtureRoot } : {}),
         ...(progress ? { onProgress: (event: Parameters<typeof progress.publish>[0]) => progress.publish(event) } : {}),
       });
@@ -402,6 +410,7 @@ export async function runBenchmarkCli(args: readonly string[]): Promise<number> 
       profile: matrix.profile,
       ...(matrix.fixtureRoot ? { fixtureRoot: matrix.fixtureRoot } : {}),
       ...(matrix.timeoutMs === null ? {} : { timeoutMs: matrix.timeoutMs }),
+      ...(matrix.resumeDirectory ? { resumeDirectory: matrix.resumeDirectory } : {}),
     });
     process.stdout.write(JSON.stringify(result, null, 2) + "\n");
     return result.status === "passed" ? 0 : 1;

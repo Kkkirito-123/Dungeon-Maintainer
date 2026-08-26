@@ -55,7 +55,7 @@ export class GameDriver {
   /** SQL 只在当前进程内按 Trace 序号保留，永不写入复现文件或事件日志。 */
   private readonly replayInputSql = new Map<number, string>();
 
-  /** @param browser 已打开协议 v2 页面。 */
+  /** @param browser 已打开协议 v2 或 v3 页面。 */
   constructor(private readonly browser: GameBrowser) {}
 
   /**

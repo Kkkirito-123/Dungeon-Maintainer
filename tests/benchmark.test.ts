@@ -18,6 +18,7 @@ import {
 import { buildPiOriginalArguments } from "../src/benchmark/pi-original.js";
 import {
   gameRepairExternalCorrectnessPassed,
+  gameRepairFailureCode,
   gameRepairJudgeOutcome,
 } from "../src/benchmark/agent-eval-runner.js";
 import {
@@ -49,6 +50,18 @@ function metricValue(
 }
 
 describe("Dungeon Maintainer Benchmark", () => {
+  it("把模型启动前鉴权错误记录为稳定低敏原因码", () => {
+    assert.equal(
+      gameRepairFailureCode(new Error("BLOCKED_ENV: MAINTAINER_API_KEY 未配置")),
+      "model-auth-unavailable",
+    );
+    assert.equal(
+      gameRepairFailureCode(new Error("provider model registration failed")),
+      "model-unavailable",
+    );
+    assert.equal(gameRepairFailureCode("opaque"), "unknown-error");
+  });
+
   it("真实 mutation 与结束时保留变更分别记录", () => {
     const reverted = buildMaintainerWorkflowClosure({
       taskState: "active",
@@ -267,6 +280,7 @@ describe("Dungeon Maintainer Benchmark", () => {
       archiveRoot: resolve(process.cwd(), "benchmark-results", "flash-current"),
       suite: "four-regressions",
       ui: "none",
+      resumeDirectory: null,
     });
     assert.throws(
       () => parseBenchmarkSuiteArgs(["--suite", "custom", "--dependency-repo", "."]),
@@ -283,7 +297,17 @@ describe("Dungeon Maintainer Benchmark", () => {
       timeoutMs: null,
       repetitions: 1,
       profile: "both",
+      resumeDirectory: null,
     });
+    assert.equal(parseGameRepairMatrixArgs([
+      "--dependency-repo", ".",
+      "--resume", "benchmark-results/interrupted-matrix",
+    ])?.resumeDirectory, resolve(process.cwd(), "benchmark-results", "interrupted-matrix"));
+    assert.equal(parseBenchmarkSuiteArgs([
+      "--suite", "full",
+      "--dependency-repo", ".",
+      "--resume", "benchmark-results/interrupted-suite",
+    ])?.resumeDirectory, resolve(process.cwd(), "benchmark-results", "interrupted-suite"));
     assert.equal(parseGameRepairMatrixArgs([
       "--dependency-repo", ".",
       "--profile", "maintainer-current",

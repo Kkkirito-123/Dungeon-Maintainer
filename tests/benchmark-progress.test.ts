@@ -40,7 +40,14 @@ describe("Benchmark 常驻进度页", () => {
       assert.match(text, /stale-query-plan-evidence/u);
       assert.match(text, /"cumulativeTokens":1200/u);
       assert.match(text, /正在核对最终状态/u);
-      await reader.cancel();
+      await Promise.race([
+        progress.close(),
+        new Promise<never>((_resolve, reject) => setTimeout(
+          () => reject(new Error("存在 SSE 客户端时进度页关闭超时")),
+          1_000,
+        )),
+      ]);
+      assert.equal((await reader.read()).done, true);
     } finally {
       await progress.close();
     }

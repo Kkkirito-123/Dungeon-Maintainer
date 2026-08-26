@@ -26,9 +26,6 @@ export const CheckParameters = Type.Object({
     Type.Literal("rules-validate"),
     Type.Literal("agent-test"),
     Type.Literal("game-related-test"),
-    Type.Literal("game-test"),
-    Type.Literal("game-architecture"),
-    Type.Literal("game-build"),
   ]),
 }, { additionalProperties: false });
 
@@ -52,10 +49,12 @@ export function registerCheckTool(
   pi.registerTool({
     name: "check",
     label: "运行检查",
-    description: "运行维护器源码登记的 SQL Dungeon 测试、规则、架构或生产构建检查。",
-    promptSnippet: "用 check 运行固定质量门",
+    description: "运行维护器源码登记的 SQL Dungeon 聚焦诊断检查。",
+    promptSnippet: "用 check 运行聚焦诊断检查",
     promptGuidelines: [
-      "诊断时优先 game-related-test；finish(result) 会运行候选聚焦验证，完整质量门只在 /apply 前运行一次。",
+      "只有测试、规则或构建症状需要定向诊断时才调用 check；正常修改完成后直接 finish(result)。",
+      "finish(result) 会复用同一 Hash 的检查结果或运行一次候选聚焦验证，不要在写入后预先重复运行 game-related-test。",
+      "完整 game-test、game-architecture 和 game-build 不属于模型工具，只在 /apply 前运行一次。",
       "不得把失败检查描述为通过；根据日志尾部继续定位。",
     ],
     executionMode: "sequential",
@@ -67,6 +66,7 @@ export function registerCheckTool(
         context.task,
         input.id,
         signal,
+        { preserveTaskState: true },
       );
       return {
         content: [{
