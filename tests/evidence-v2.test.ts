@@ -13,8 +13,15 @@ import {
 import { createTemporaryGitRepository } from "./testSupport.js";
 import { TaskStore } from "../src/task/store.js";
 import { startShellServer } from "../src/shell/server.js";
+import { EvidenceParameters } from "../src/pi/tools/evidence.js";
 
 describe("Evidence Chain V2 低敏投影", () => {
+  it("函数参数 Schema 使用 object 根节点，兼容 OpenAI-compatible 模型", () => {
+    assert.equal(EvidenceParameters.type, "object");
+    assert.equal("anyOf" in EvidenceParameters, false);
+    assert.equal("oneOf" in EvidenceParameters, false);
+  });
+
   it("按节点关系返回 list/get，并限制工件尾部和敏感正文", async () => {
     const repository = await createTemporaryGitRepository({ "src/game.ts": "export const state = 'ready';\n" });
     try {
@@ -170,7 +177,10 @@ describe("Evidence Chain V2 低敏投影", () => {
         model: "test-model",
         contextWindow: 64_000,
         store,
-        evidence,
+        // 模拟真实父子进程：写入者和 Shell 读取者不是同一个内存 Store。
+        readEvidenceSnapshot: async () => await buildEvidenceSnapshot(
+          new EvidenceStore(dataDir, task),
+        ),
         sendPiCommand: async () => ({ ok: true }),
         onClose: async () => undefined,
       });

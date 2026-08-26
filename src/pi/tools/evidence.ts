@@ -35,19 +35,20 @@ const EvidenceStatusParameter = Type.Union([
   Type.Literal("all"),
 ]);
 
-/** `evidence` 工具严格区分 list 与 get 的参数集合。 */
-export const EvidenceParameters = Type.Union([
-  Type.Object({
-    action: Type.Literal("list"),
-    status: Type.Optional(EvidenceStatusParameter),
-    kind: Type.Optional(EvidenceKindParameter),
-    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("get"),
-    evidenceId: Type.String({ pattern: "^[a-f0-9]{16}$" }),
-  }, { additionalProperties: false }),
-]);
+/**
+ * `evidence` 工具参数必须以 object 为根节点。
+ *
+ * DeepSeek 的 OpenAI-compatible 函数接口拒绝顶层 `anyOf`/`oneOf`（Type.Union 会生成
+ * 这种 Schema），因此这里使用一个兼容根对象，再在执行层按 action 严格校验 list/get
+ * 的参数集合。这样既保留运行时边界，也不会让整个模型回合在工具注册阶段被 400 拒绝。
+ */
+export const EvidenceParameters = Type.Object({
+  action: Type.Union([Type.Literal("list"), Type.Literal("get")]),
+  status: Type.Optional(EvidenceStatusParameter),
+  kind: Type.Optional(EvidenceKindParameter),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+  evidenceId: Type.Optional(Type.String({ pattern: "^[a-f0-9]{16}$" })),
+}, { additionalProperties: false });
 
 export type EvidenceInput = Static<typeof EvidenceParameters>;
 
@@ -95,6 +96,9 @@ export function registerEvidenceTool(
     async execute(_toolCallId, input: EvidenceInput, signal) {
       signal?.throwIfAborted();
       if (input.action === "list") {
+        if (input.evidenceId !== undefined) {
+          throw new Error("evidence(list) 不接受 evidenceId");
+        }
         const output = await listEvidenceNodes(context.evidence, {
           ...(input.status === undefined ? {} : { status: input.status }),
           ...(input.kind === undefined ? {} : { kind: input.kind }),
@@ -116,6 +120,12 @@ export function registerEvidenceTool(
           }],
           details: { action: "list", ...output },
         };
+      }
+      if (input.status !== undefined || input.kind !== undefined || input.limit !== undefined) {
+        throw new Error("evidence(get) 只接受 evidenceId");
+      }
+      if (input.evidenceId === undefined) {
+        throw new Error("evidence(get) 缺少 evidenceId");
       }
       const detail = await getEvidenceDetail(context.evidence, input.evidenceId);
       if (!detail) throw new Error("evidenceId 不属于当前任务");

@@ -21,6 +21,7 @@ import { createTaskWorktreeSnapshot } from "../workspace/worktree.js";
 import type { PiRunMetrics, PiRunOutcome } from "./pi-original.js";
 import { requestWithDeadline, SESSION_STATS_TIMEOUT_MS } from "./rpc-timeout.js";
 import { EvidenceStore } from "../evidence/store.js";
+import { buildEvidenceSnapshot } from "../evidence/view.js";
 import { assertFlashBenchmarkModel } from "./model-policy.js";
 
 /** 当前实现单次运行参数；与原版 Profile 使用完全相同的公开输入。 */
@@ -390,7 +391,6 @@ export async function runPiMaintainer(
   const apiKey = requireApiKey(config);
   const profile = defaultModelProfile(config);
   assertFlashBenchmarkModel(profile.modelId);
-  const evidenceStore = new EvidenceStore(dataDirectory, task);
   let turns = 0;
   let toolCalls = 0;
   let diagnosticToolCalls = 0;
@@ -453,7 +453,11 @@ export async function runPiMaintainer(
       contextWindow: profile.contextWindow,
       maxOutputTokens: profile.maxOutputTokens,
       store,
-      evidence: evidenceStore,
+      // Pi Extension 运行在独立子进程中，会直接追加 evidence.jsonl。每次刷新都使用
+      // 新 Store 从磁盘重建，避免 Benchmark 父进程把启动时的空内存快照永久缓存。
+      readEvidenceSnapshot: async () => await buildEvidenceSnapshot(
+        new EvidenceStore(dataDirectory, task),
+      ),
       sendPiCommand: async (command) => {
         const activeRpc = rpc;
         if (!activeRpc) throw new Error("Benchmark Pi RPC 尚未启动");
@@ -712,13 +716,14 @@ export async function runPiMaintainer(
   } catch {
     runState.failureCode ??= "maintainer-state-read-failed";
   }
-  const evidenceGraph = await evidenceStore.active().then((records) => records.map((record) => ({
-    id: record.id,
-    kind: record.kind,
-    status: record.status,
-    links: [...record.links],
-    worktreeHash: record.worktreeHash,
-  }))).catch(() => []);
+  const evidenceGraph = await new EvidenceStore(dataDirectory, task)
+    .active().then((records) => records.map((record) => ({
+      id: record.id,
+      kind: record.kind,
+      status: record.status,
+      links: [...record.links],
+      worktreeHash: record.worktreeHash,
+    }))).catch(() => []);
   return {
     metrics: { ...metrics, failureCode: runState.failureCode },
     evaluationRoot: snapshot.root,
