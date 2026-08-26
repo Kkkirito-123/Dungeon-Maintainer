@@ -52,6 +52,36 @@ describe("schema v4 任务状态、证据与审批", () => {
     }
   });
 
+  it("同一进程并发保存不会争用固定临时文件或损坏任务记录", async () => {
+    const repository = await createTemporaryGitRepository({ "README.md": "test\n" });
+    try {
+      const store = new TaskStore(join(repository.temporaryRoot, "data"));
+      const task = await store.create({
+        id: "task-concurrent-save",
+        objective: "并发保存任务状态",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: join(repository.temporaryRoot, "worktree"),
+        piSessionDir: join(
+          repository.temporaryRoot,
+          "data",
+          "tasks",
+          "task-concurrent-save",
+          "pi",
+        ),
+      });
+
+      await Promise.all(Array.from({ length: 32 }, async () => await store.save(task)));
+
+      const persisted = await store.read(task.id);
+      assert.equal(persisted.id, task.id);
+      assert.equal(persisted.schemaVersion, 4);
+      assert.equal(persisted.state, "created");
+    } finally {
+      await repository.dispose();
+    }
+  });
+
   it("schema v2 明确拒绝恢复，不保留双写迁移分支", async () => {
     const repository = await createTemporaryGitRepository({ "README.md": "test\n" });
     try {

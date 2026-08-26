@@ -6,12 +6,15 @@
  * 旧 schema v1-v3 明确拒绝恢复；EvidenceStore 上线后不保留双写迁移分支。
  *
  * 重要失败模式：非法任务 ID、非法状态迁移、旧 schema 或损坏 JSON 都会在产生
- * 副作用前抛错。批准记录只保存摘要，不保存补丁正文或用户确认内容。
+ * 副作用前抛错。Windows 可能短暂锁住 task.json，保存时使用唯一临时文件并重试
+ * 原子替换，避免并发工具事件把审批状态卡在半途。批准记录只保存摘要，不保存补丁正文
+ * 或用户确认内容。
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { redactText } from "../logging/redact.js";
 import type {
   ApprovalRecord,
@@ -47,6 +50,26 @@ const TRANSITIONS: Readonly<Record<TaskState, readonly TaskState[]>> = {
   blocked: ["active", "discarded"],
   discarded: [],
 };
+
+const TASK_REPLACE_RETRY_DELAYS_MS = [0, 10, 25, 50, 100, 200, 400, 800] as const;
+
+function isRetryableTaskReplaceError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "EPERM" || code === "EBUSY" || code === "EACCES";
+}
+
+async function replaceTaskFile(temporary: string, target: string): Promise<void> {
+  for (const [index, waitMs] of TASK_REPLACE_RETRY_DELAYS_MS.entries()) {
+    if (waitMs > 0) await delay(waitMs);
+    try {
+      await rename(temporary, target);
+      return;
+    } catch (error) {
+      const isLastAttempt = index === TASK_REPLACE_RETRY_DELAYS_MS.length - 1;
+      if (isLastAttempt || !isRetryableTaskReplaceError(error)) throw error;
+    }
+  }
+}
 
 /** 创建不可预测且可作为 Pi session-id 的任务 ID。 */
 export function createTaskId(): string {
@@ -248,13 +271,22 @@ export class TaskStore {
     await mkdir(directory, { recursive: true });
     task.updatedAt = new Date().toISOString();
     const target = join(directory, "task.json");
-    const temporary = target + "." + String(process.pid) + ".tmp";
-    await writeFile(
-      temporary,
-      JSON.stringify(task, null, 2) + "\n",
-      "utf8",
-    );
-    await rename(temporary, target);
+    const temporary = target
+      + "."
+      + String(process.pid)
+      + "."
+      + randomUUID()
+      + ".tmp";
+    try {
+      await writeFile(
+        temporary,
+        JSON.stringify(task, null, 2) + "\n",
+        "utf8",
+      );
+      await replaceTaskFile(temporary, target);
+    } finally {
+      await rm(temporary, { force: true }).catch(() => undefined);
+    }
   }
 
   /**

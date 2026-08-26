@@ -945,4 +945,41 @@ describe("Dungeon Maintainer Benchmark", () => {
       perResultCharacters: 1_000,
     }).messages, result.messages);
   });
+
+  it("新增工具批次不会再次改写更早的回执前缀", () => {
+    const firstHistory = [
+      { role: "assistant", content: [{ type: "text", text: "先检查旧区域" }] },
+      {
+        role: "toolResult",
+        toolCallId: "old-result",
+        toolName: "inspect",
+        content: [{ type: "text", text: "旧证据:" + "x".repeat(700) }],
+      },
+      { role: "assistant", content: [{ type: "text", text: "再读取当前区域" }] },
+      {
+        role: "toolResult",
+        toolCallId: "current-result",
+        toolName: "inspect",
+        content: [{ type: "text", text: "当前证据:" + "y".repeat(700) }],
+      },
+    ];
+    const limits = { perTurnCharacters: 1_500, perResultCharacters: 1_000 };
+    const first = shapeModelContext(firstHistory, limits).messages;
+    const second = shapeModelContext([
+      ...firstHistory,
+      { role: "assistant", content: [{ type: "text", text: "继续检查" }] },
+      {
+        role: "toolResult",
+        toolCallId: "next-result",
+        toolName: "inspect",
+        content: [{ type: "text", text: "下一证据:" + "z".repeat(700) }],
+      },
+    ], limits).messages;
+
+    assert.deepEqual(second[1], first[1]);
+    assert.match(JSON.stringify(first[1]), /TOOL_RESULT_RECEIPT/u);
+    assert.match(JSON.stringify(first[3]), /当前证据/u);
+    assert.match(JSON.stringify(second[3]), /TOOL_RESULT_RECEIPT/u);
+    assert.match(JSON.stringify(second.at(-1)), /下一证据/u);
+  });
 });

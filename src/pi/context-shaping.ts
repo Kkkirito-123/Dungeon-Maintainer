@@ -1,9 +1,10 @@
 /**
  * Pi Provider 请求前的工具结果整形。
  *
- * 本模块先对每条过长 toolResult 做稳定首尾截断，再按总预算把较旧结果替换为
- * 内容 Hash 回执。相同输入始终得到相同字节；最新证据优先保留，原始 session 和
- * Evidence Store 不会被修改。
+ * 本模块先对每条过长 toolResult 做稳定首尾截断，再把历史工具批次固定替换为
+ * 内容 Hash 回执，只让上下文尾部刚产生的工具批次携带正文。这样旧消息从下一轮起
+ * 不再反复改写，Provider 可以持续命中 Prompt 前缀缓存；原始 session 和 Evidence
+ * Store 不会被修改，需要回看正文时由 evidence(get) 明确取回。
  */
 
 import { createHash } from "node:crypto";
@@ -101,10 +102,19 @@ export function shapeModelContext<T extends ShapeableMessage>(
     return { index, fullText, receipt };
   }).filter((entry): entry is NonNullable<typeof entry> => entry !== null);
 
+  let currentBatchStart = messages.length;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "toolResult") {
+      currentBatchStart = index;
+      continue;
+    }
+    break;
+  }
+  const currentBatch = toolResults.filter((entry) => entry.index >= currentBatchStart);
   const receiptCharacters = toolResults.reduce((sum, entry) => sum + entry.receipt.length, 0);
   let expansionBudget = Math.max(0, perTurnCharacters - receiptCharacters);
   const expanded = new Set<number>();
-  for (const entry of [...toolResults].reverse()) {
+  for (const entry of [...currentBatch].reverse()) {
     const extra = Math.max(0, entry.fullText.length - entry.receipt.length);
     if (extra > expansionBudget) continue;
     expanded.add(entry.index);
