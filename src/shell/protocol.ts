@@ -11,6 +11,7 @@
 
 import type { TaskRecord, TaskState } from "../task/types.js";
 import { promptTokenLimit } from "../agent/token-control.js";
+import type { EvidenceNode } from "../evidence/view.js";
 
 /** Shell 可选择的 Pi 模型安全摘要。 */
 export interface ShellModelOption {
@@ -91,6 +92,7 @@ export type ShellEvent =
   | { type: "notice"; level: "info" | "warning" | "error"; text: string }
   | { type: "approval"; request: ShellApprovalRequest }
   | { type: "game"; state: "starting" | "ready" | "error" | "stopped"; gameUrl: string | null }
+  | { type: "evidence.snapshot"; taskId: string; revision: number; records: EvidenceNode[] }
   | { type: "closed"; code: number };
 
 /** Shell 内确认框使用的安全摘要。 */

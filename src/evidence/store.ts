@@ -355,11 +355,31 @@ export class EvidenceStore {
     return this.records.get(id) ?? null;
   }
 
-  async active(kind?: EvidenceRecord["kind"]): Promise<EvidenceRecord[]> {
+  /**
+   * 按状态和类型读取当前任务的证据快照。
+   *
+   * 本方法只返回内存中的最终记录，不读取工件正文。默认按时间正序，调用方需要最近
+   * 记录时可显式反转并限制数量；这样 Shell 全量快照和模型有限列表共享同一事实源。
+   */
+  async list(options: {
+    status?: EvidenceStatus | "all";
+    kind?: EvidenceRecord["kind"];
+  } = {}): Promise<EvidenceRecord[]> {
     await this.load();
+    const status = options.status ?? "all";
     return [...this.records.values()]
-      .filter((record) => record.status === "active" && (!kind || record.kind === kind))
-      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+      .filter((record) => (
+        (status === "all" || record.status === status)
+        && (!options.kind || record.kind === options.kind)
+      ))
+      .sort((left, right) => (
+        left.createdAt.localeCompare(right.createdAt)
+        || left.id.localeCompare(right.id)
+      ));
+  }
+
+  async active(kind?: EvidenceRecord["kind"]): Promise<EvidenceRecord[]> {
+    return await this.list({ status: "active", ...(kind ? { kind } : {}) });
   }
 
   /** 返回在给定账本 revision 之后新增或重新激活的当前证据。 */

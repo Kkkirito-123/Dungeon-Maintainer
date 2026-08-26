@@ -308,7 +308,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
     }
   });
 
-  it("注册十个领域工具，并用执行门禁保护固定 Coding 工具面", async () => {
+  it("注册十一个领域工具，并用执行门禁保护固定 Coding 工具面", async () => {
     const repository = await createTemporaryGitRepository({
       ".maintainer/project.json": JSON.stringify({
         schemaVersion: 1,
@@ -401,6 +401,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
 
       assert.deepEqual(pi.tools, [
         "inspect",
+        "evidence",
         "patch",
         "check",
         "finish",

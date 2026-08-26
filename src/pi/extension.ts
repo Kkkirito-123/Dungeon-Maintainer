@@ -6,7 +6,7 @@
  * `game-runtime.ts` 负责，补丁、检查、复现和 apply 仍属于各自 workspace/repair 模块。
  *
  * 输入是父进程已经校验并固定绑定的 TaskRecord、TaskStore、配置和可选测试运行时；输出是
- * 注册到 Pi 的十个领域工具、五个命令、系统提示和事件钩子，不返回可跨任务复用的运行时对象。
+ * 注册到 Pi 的十一个领域工具、五个命令、系统提示和事件钩子，不返回可跨任务复用的运行时对象。
  * Pi 是唯一模型循环；Extension 只注入游戏上下文、记录低敏事实并执行确定性安全边界，
  * 不在 agent_settled 后创建隐藏请求，也不按证据数量替模型规划或自动暂停。
  *
@@ -60,6 +60,7 @@ import {
 import { registerMaintainerCommands } from "./commands/index.js";
 import { DungeonGameRuntime } from "./game-runtime.js";
 import { buildDungeonMaintainerPrompt } from "./prompt.js";
+import { currentEvidenceContext } from "./evidence-context.js";
 import {
   FULL_CODING_TOOLS,
 } from "./tool-policy.js";
@@ -762,7 +763,22 @@ export function installDungeonMaintainerExtension(
             || (details.action === "bundle" && Number(details.bundleWindows ?? 0) > 0)
           )
           && Number(details.lines ?? 0) > 0;
-        recordGuardResult(meaningfulInspectProgress);
+        const meaningfulCheckProgress = event.toolName === "check"
+          && !event.isError
+          && details?.cached !== true;
+        const finishStatus = typeof details?.status === "string" ? details.status : null;
+        const meaningfulFinishProgress = event.toolName === "finish"
+          && !event.isError
+          && (
+            finishStatus === "reproduced"
+            || finishStatus === "result"
+            || (finishStatus === "proposed" && details?.executionApproved === true)
+          );
+        recordGuardResult(
+          meaningfulInspectProgress
+          || meaningfulCheckProgress
+          || meaningfulFinishProgress,
+        );
       }
       return undefined;
     }
@@ -883,6 +899,7 @@ export function installDungeonMaintainerExtension(
     const currentRequest = latestNaturalRequest || eventPrompt || task.objective;
     currentArchitectureRoute = routeArchitecture(architectureMap, currentRequest, view?.floor ?? null);
     const routeCard = architectureRouteCard(currentArchitectureRoute);
+    const evidenceContext = await currentEvidenceContext(evidence);
     const dynamicContext = [
       "本轮最高优先级请求：",
       currentRequest,
@@ -894,6 +911,8 @@ export function installDungeonMaintainerExtension(
       view ? JSON.stringify(view) : null,
       task.changedPaths.length > 0 ? "当前 Agent 增量文件：" : null,
       task.changedPaths.length > 0 ? JSON.stringify(task.changedPaths) : null,
+      evidenceContext ? "" : null,
+      evidenceContext,
     ].filter((line): line is string => line !== null).join("\n");
     return {
       // 保留 Pi 已经根据项目 AGENTS/Skills 组装的基础 Prompt；只追加维护器固定规则。

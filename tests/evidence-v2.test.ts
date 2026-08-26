@@ -1,0 +1,221 @@
+import assert from "node:assert/strict";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { describe, it } from "node:test";
+import { buildEvidenceCard } from "../src/evidence/card.js";
+import { EvidenceStore } from "../src/evidence/store.js";
+import { checkEvidence, sourceEvidence } from "../src/evidence/projector.js";
+import {
+  buildEvidenceSnapshot,
+  getEvidenceDetail,
+  listEvidenceNodes,
+} from "../src/evidence/view.js";
+import { createTemporaryGitRepository } from "./testSupport.js";
+import { TaskStore } from "../src/task/store.js";
+import { startShellServer } from "../src/shell/server.js";
+
+describe("Evidence Chain V2 低敏投影", () => {
+  it("按节点关系返回 list/get，并限制工件尾部和敏感正文", async () => {
+    const repository = await createTemporaryGitRepository({ "src/game.ts": "export const state = 'ready';\n" });
+    try {
+      const dataDir = join(repository.temporaryRoot, "data");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "evidence-v2-view",
+        objective: "测试证据链",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(dataDir, "tasks", "evidence-v2-view", "pi"),
+      });
+      const evidence = new EvidenceStore(dataDir, task);
+      const source = await evidence.captureText(sourceEvidence({
+        action: "read",
+        path: "src/game.ts",
+        startLine: 1,
+        lineCount: 1,
+      }, {
+        action: "read",
+        evidenceId: "",
+        contentHash: "source-hash",
+        baseHash: "base-hash",
+        lines: 1,
+        truncated: false,
+        actionKey: "source-action",
+        cacheHit: false,
+      }, "worktree-hash", ["src"]), "line 1\nSELECT hidden_answer;\n" );
+      const checkLogPath = join(store.taskDir(task.id), "checks", "game-test.log");
+      await mkdir(join(store.taskDir(task.id), "checks"), { recursive: true });
+      await writeFile(checkLogPath, "check passed\napiKey=secret\n", "utf8");
+      const check = await evidence.capture(checkEvidence({
+        id: "game-test",
+        worktreeHash: "worktree-hash",
+        status: "passed",
+        durationMs: 10,
+        logPath: checkLogPath,
+        savedAt: new Date().toISOString(),
+      }));
+      const claim = await evidence.capture({
+        kind: "claim",
+        actionKey: null,
+        fingerprint: "claim-fingerprint",
+        status: "active",
+        summary: "方案已提交",
+        artifactRef: null,
+        path: null,
+        startLine: null,
+        lineCount: null,
+        baseHash: null,
+        worktreeHash: null,
+        validityKey: "proposed",
+        links: [source.record.id, check.record.id],
+        metadata: {},
+      });
+
+      const listed = await listEvidenceNodes(evidence, { status: "active", limit: 10 });
+      assert.equal(listed.records.length, 3);
+      const sourceNode = listed.records.find((record) => record.id === source.record.id);
+      assert.ok(sourceNode?.downstreamIds.includes(claim.record.id));
+      const detail = await getEvidenceDetail(evidence, source.record.id);
+      assert.ok(detail);
+      assert.equal(detail.artifact.available, true);
+      assert.doesNotMatch(detail.artifact.text, /SELECT hidden_answer/iu);
+      const checkDetail = await getEvidenceDetail(evidence, check.record.id);
+      assert.ok(checkDetail);
+      assert.doesNotMatch(checkDetail.artifact.text, /apiKey=secret/iu);
+      const snapshot = await buildEvidenceSnapshot(evidence);
+      assert.equal(snapshot.taskId, task.id);
+      assert.equal(snapshot.revision, evidence.revision);
+      const card = buildEvidenceCard(await evidence.active());
+      assert.match(card, /claim\/active/u);
+      assert.match(card, /downstream=/u);
+      assert.ok(Buffer.byteLength(card, "utf8") <= 4 * 1024);
+      assert.doesNotMatch(card, /SELECT hidden_answer/iu);
+      assert.equal(await readFile(join(dataDir, "tasks", task.id, "evidence.jsonl"), "utf8").then((text) => text.includes("SELECT hidden_answer")), false);
+    } finally {
+      await repository.dispose();
+    }
+  });
+
+  it("stale/superseded 证据可过滤，未知 ID 不产生详情", async () => {
+    const repository = await createTemporaryGitRepository({ "README.md": "test\n" });
+    try {
+      const dataDir = join(repository.temporaryRoot, "data");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "evidence-v2-status",
+        objective: "测试状态过滤",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(dataDir, "tasks", "evidence-v2-status", "pi"),
+      });
+      const evidence = new EvidenceStore(dataDir, task);
+      await evidence.capture({
+        kind: "game",
+        actionKey: null,
+        fingerprint: "active-game",
+        status: "active",
+        summary: "active",
+        artifactRef: null,
+        path: null,
+        startLine: null,
+        lineCount: null,
+        baseHash: null,
+        worktreeHash: null,
+        validityKey: "runtime",
+        links: [],
+        metadata: {},
+      });
+      await evidence.capture({
+        kind: "check",
+        actionKey: null,
+        fingerprint: "stale-check",
+        status: "stale",
+        summary: "stale",
+        artifactRef: null,
+        path: null,
+        startLine: null,
+        lineCount: null,
+        baseHash: null,
+        worktreeHash: null,
+        validityKey: "old",
+        links: [],
+        metadata: {},
+      });
+      assert.equal((await listEvidenceNodes(evidence, { status: "active" })).records.length, 1);
+      assert.equal((await listEvidenceNodes(evidence, { status: "stale" })).records.length, 1);
+      assert.equal(await getEvidenceDetail(evidence, "0000000000000000"), null);
+    } finally {
+      await repository.dispose();
+    }
+  });
+
+  it("Shell 只保留最新 evidence.snapshot，并按 revision 去重", async () => {
+    const repository = await createTemporaryGitRepository({ "README.md": "test\n" });
+    try {
+      const dataDir = join(repository.temporaryRoot, "data");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "evidence-v2-shell",
+        objective: "测试 Shell 证据面板",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(dataDir, "tasks", "evidence-v2-shell", "pi"),
+      });
+      const evidence = new EvidenceStore(dataDir, task);
+      const shell = await startShellServer({
+        task,
+        model: "test-model",
+        contextWindow: 64_000,
+        store,
+        evidence,
+        sendPiCommand: async () => ({ ok: true }),
+        onClose: async () => undefined,
+      });
+      const controller = new AbortController();
+      try {
+        const response = await fetch(shell.url.replace("/?", "/events?"), { signal: controller.signal });
+        const reader = response.body?.getReader();
+        assert.ok(reader);
+        await evidence.capture({
+          kind: "game",
+          actionKey: null,
+          fingerprint: "shell-game-1",
+          status: "active",
+          summary: "游戏状态已读取",
+          artifactRef: null,
+          path: null,
+          startLine: null,
+          lineCount: null,
+          baseHash: null,
+          worktreeHash: null,
+          validityKey: "runtime",
+          links: [],
+          metadata: {},
+        });
+        await shell.syncEvidence();
+        const decoder = new TextDecoder();
+        let raw = "";
+        for (;;) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          raw += decoder.decode(chunk.value, { stream: true });
+          if (raw.includes('"type":"evidence.snapshot"')) break;
+        }
+        assert.match(raw, /"type":"evidence\.snapshot"/u);
+        const snapshotCount = (raw.match(/"type":"evidence\.snapshot"/gu) ?? []).length;
+        assert.equal(snapshotCount, 1);
+        await shell.syncEvidence();
+        assert.equal((raw.match(/"type":"evidence\.snapshot"/gu) ?? []).length, 1);
+        await reader.cancel();
+      } finally {
+        controller.abort();
+        await shell.close();
+      }
+    } finally {
+      await repository.dispose();
+    }
+  });
+});

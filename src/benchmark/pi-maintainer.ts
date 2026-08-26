@@ -390,6 +390,7 @@ export async function runPiMaintainer(
   const apiKey = requireApiKey(config);
   const profile = defaultModelProfile(config);
   assertFlashBenchmarkModel(profile.modelId);
+  const evidenceStore = new EvidenceStore(dataDirectory, task);
   let turns = 0;
   let toolCalls = 0;
   let diagnosticToolCalls = 0;
@@ -452,6 +453,7 @@ export async function runPiMaintainer(
       contextWindow: profile.contextWindow,
       maxOutputTokens: profile.maxOutputTokens,
       store,
+      evidence: evidenceStore,
       sendPiCommand: async (command) => {
         const activeRpc = rpc;
         if (!activeRpc) throw new Error("Benchmark Pi RPC 尚未启动");
@@ -563,6 +565,9 @@ export async function runPiMaintainer(
         if (eventRecord.type === "agent_settled") scheduleSettledCheck();
         if (eventRecord.type === "agent_settled" || eventRecord.type === "compaction_end") {
           void activeShell?.syncPiState().catch(() => undefined);
+        }
+        if (eventRecord.type === "tool_execution_end" || eventRecord.type === "agent_settled") {
+          void activeShell?.syncEvidence().catch(() => undefined);
         }
         void store.read(task.id)
           .then((currentTask) => activeShell?.updateTask(currentTask))
@@ -707,7 +712,6 @@ export async function runPiMaintainer(
   } catch {
     runState.failureCode ??= "maintainer-state-read-failed";
   }
-  const evidenceStore = new EvidenceStore(dataDirectory, task);
   const evidenceGraph = await evidenceStore.active().then((records) => records.map((record) => ({
     id: record.id,
     kind: record.kind,

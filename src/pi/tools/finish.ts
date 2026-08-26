@@ -17,6 +17,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { claimEvidence } from "../../evidence/projector.js";
+import { readDiagnosticEvidence } from "../../evidence/diagnostic.js";
 import type { EvidenceStore } from "../../evidence/store.js";
 import type { GameDriver } from "../../game/driver.js";
 import { appendEvent } from "../../logging/events.js";
@@ -173,6 +174,36 @@ function assertExpectedBoolean(
 }
 
 /**
+ * proposed 阶段的证据软提示。
+ *
+ * 这些提示帮助模型补齐证据链，但不改变既有审批流程；只有 result 阶段的固定检查、
+ * 刷新重放和隐藏断言继续承担硬门禁，避免诊断阶段因额外读取而拖慢任务。
+ */
+async function proposedEvidenceWarnings(
+  evidence: EvidenceStore,
+): Promise<string[]> {
+  const warnings: string[] = [];
+  let state;
+  try {
+    state = await readDiagnosticEvidence(evidence);
+  } catch {
+    // proposed 的证据提示必须是软门槛；账本损坏或历史工件缺失不能阻止用户审批，
+    // 只把异常降级为可见提示，result 阶段仍会通过真实验证暴露问题。
+    return ["证据账本读取不完整；请在执行前用 evidence(list/get) 检查现有记录。"];
+  }
+  if (!state.hasReproduction) {
+    warnings.push("未保存可重放复现；若这是非运行时问题可以忽略。");
+  }
+  if (!state.hasSourceRead) {
+    warnings.push("当前源码证据不足；建议在执行前补一次 inspect read/bundle。");
+  }
+  if (state.actionNotAvailable && state.missingActionEvidence.length > 0) {
+    warnings.push("action-not-available 证据仍缺少：" + state.missingActionEvidence.join("、") + "。");
+  }
+  return warnings;
+}
+
+/**
  * 向单个 Pi 会话注册 `finish`。
  *
  * @param pi 当前 Extension API。
@@ -274,6 +305,7 @@ export function registerFinishTool(
       let planSteps: string[] | undefined;
       let planVerification: string | undefined;
       let planAllowedPaths: string[] | undefined;
+      let evidenceWarnings: string[] = [];
       if (input.status === "proposed" && input.plan) {
         const title = plain(input.plan.title, 160);
         const steps = input.plan.steps.map((step) => plain(
@@ -299,6 +331,7 @@ export function registerFinishTool(
         planSteps = steps;
         planVerification = verification;
         planAllowedPaths = allowedPaths;
+        evidenceWarnings = await proposedEvidenceWarnings(context.evidence);
         planSummary = [
           "方案：" + title,
           ...steps.map((step, index) => String(index + 1) + ". " + step),
@@ -309,6 +342,9 @@ export function registerFinishTool(
           "病因：" + summary,
           "",
           planSummary,
+          evidenceWarnings.length > 0
+            ? "\n证据提示（软提示，不会阻止批准）：\n" + evidenceWarnings.map((warning) => "- " + warning).join("\n")
+            : "",
           "",
           "风险：" + risk,
           "",
@@ -429,6 +465,9 @@ export function registerFinishTool(
             summary,
             planSummary,
             "风险：" + risk,
+            evidenceWarnings.length > 0
+              ? "证据提示：" + evidenceWarnings.join(" ")
+              : "",
             executionApproved === true ? "用户已批准方案；立即完整执行，不要再次询问。" : "",
             executionApproved === false ? "用户未批准执行；worktree 保持不变。" : "",
             reproductionId ? "复现：" + reproductionId : "",
@@ -443,6 +482,7 @@ export function registerFinishTool(
           reproductionId,
           changedPaths: [...context.task.changedPaths],
           executionApproved,
+          evidenceWarnings,
           verification: verification ? {
             worktreeHash: verification.record.worktreeHash,
             checkIds: verification.record.checkIds,
