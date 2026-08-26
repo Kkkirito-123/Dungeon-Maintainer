@@ -233,6 +233,7 @@ export interface CheckExecutionResult {
  * @param task 当前任务。
  * @param id 维护器源码登记的检查 ID。
  * @param signal 取消时终止子进程。
+ * @param options 独立诊断工具保持任务状态；验证流水线使用默认状态迁移。
  */
 export async function runCheck(
   store: TaskStore,

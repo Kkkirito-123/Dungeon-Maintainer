@@ -29,7 +29,8 @@ Pi RPC + Dungeon Maintainer Extension
 核心代码按单一职责分区：`src/app.ts` 只保留稳定导出，`src/app/` 分别拥有仓库事实、Pi 进程、
 任务生命周期与 start/resume；`src/pi/extension.ts` 只做 Pi 装配，会话安全策略和游戏运行时分别
 位于 `session-policy.ts` 与 `game-runtime.ts`。游戏开发桥也将投影、导航、固定动作和查询执行拆开，
-`bridge.ts` 只组合协议生命周期。外部命令、Pi 工具/命令和协议 v2 均未因内部拆分改变。
+`bridge.ts` 只组合协议生命周期。外部命令和 Pi 工具/命令不因内部拆分改变；浏览器驱动优先消费
+协议 v3，同时保留协议 v2 兼容。
 
 ## 环境要求
 
@@ -188,7 +189,7 @@ schema v2 任务会在 `resume`/读取时自动迁移到 v3；旧 schema v1 任�
 
 ## 游戏开发桥
 
-目标游戏仓库需要实现协议 v2 的开发桥。桥只有在以下条件同时成立时安装：
+目标游戏仓库需要实现协议 v2 或 v3 的开发桥。当前游戏使用 v3，维护器保留 v2 兼容。桥只有在以下条件同时成立时安装：
 
 - `import.meta.env.DEV`
 - 页面主机为 `127.0.0.1`、`localhost` 或 `[::1]`

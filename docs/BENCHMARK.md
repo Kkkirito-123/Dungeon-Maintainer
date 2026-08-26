@@ -204,6 +204,12 @@ floorRoutedInspectCalls
 + floorRouteSharedExecutions + floorRouteFallbackExecutions
 ```
 
+V4 不增加一个与游戏源码绑定的 Benchmark 分支。游戏仓库拥有 schema v4 架构表和 Adapter，
+维护器按 feature primary/adjacent/shared/fallback 搜索，并把楼层作为可选上下文；旧 v1-v3 地图仍
+规范化读取，非法核心地图回退普通安全搜索。案例继续由当前游戏的 `catalog/describe/materialize`
+安全能力物化，因此游戏目录重组后只需更新游戏拥有的稳定路由边界和故障 Patch，维护器无需复制
+游戏文件清单。
+
 ## 推荐固定用例
 
 每次比较模型、提示词或上下文策略时都从干净任务运行以下三项，不能复用旧 Pi session：

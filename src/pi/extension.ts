@@ -220,7 +220,13 @@ function loopActionFor(
       worktreeHash,
       routeDigest: stableDigest(
         toolName === "inspect"
-          ? { action: input.action, path: input.path, partitionId: input.partitionId }
+          ? {
+            action: input.action,
+            path: input.path,
+            partitionId: input.partitionId,
+            featureId: input.featureId,
+            floorId: input.floorId,
+          }
           : { status: input.status, id: input.id },
       ),
     },
@@ -746,7 +752,17 @@ export function installDungeonMaintainerExtension(
         );
         recordGuardResult(changed);
       } else {
-        recordGuardResult(false);
+        const meaningfulInspectProgress = event.toolName === "inspect"
+          && !event.isError
+          && details !== null
+          && details.receiptOnly !== true
+          && (
+            details.action === "read"
+            || details.action === "read_many"
+            || (details.action === "bundle" && Number(details.bundleWindows ?? 0) > 0)
+          )
+          && Number(details.lines ?? 0) > 0;
+        recordGuardResult(meaningfulInspectProgress);
       }
       return undefined;
     }

@@ -15,6 +15,7 @@ import {
   replayableTraceActions,
   type ReproductionRecord,
 } from "../src/repair/reproduction.js";
+import { CheckParameters } from "../src/pi/tools/check.js";
 import { TaskStore } from "../src/task/store.js";
 import {
   checkIds,
@@ -814,6 +815,13 @@ describe("固定检查白名单", () => {
       "game-test",
       "game-architecture",
       "game-build",
+    ]);
+    const modelCheckIds = CheckParameters.properties.id.anyOf.map((entry) => entry.const);
+    assert.deepEqual(modelCheckIds, [
+      "rules-test",
+      "rules-validate",
+      "agent-test",
+      "game-related-test",
     ]);
   });
 });

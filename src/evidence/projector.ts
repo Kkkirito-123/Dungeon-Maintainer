@@ -32,6 +32,7 @@ export function inspectActionKey(
     startLine: input.action === "read" ? input.startLine ?? 1 : input.startLine ?? null,
     lineCount: input.action === "read" ? input.lineCount ?? 80 : input.lineCount ?? null,
     partitionId: input.partitionId?.trim().toLocaleLowerCase("en-US") ?? null,
+    featureId: input.featureId?.trim().toLocaleLowerCase("en-US") ?? null,
     floorId: input.floorId?.trim().toLocaleLowerCase("en-US") ?? null,
     ranges: input.ranges?.map((range) => ({
       path: normalizedPath(range.path),

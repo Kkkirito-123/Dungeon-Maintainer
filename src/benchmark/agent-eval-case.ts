@@ -10,9 +10,13 @@
  * 事件、公开报告或模型工具结果。
  */
 
+import { execFile } from "node:child_process";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+
+const executeFile = promisify(execFile);
 
 /** 正式游戏修复案例的五类固定分类。 */
 export type AgentEvalCategory =
@@ -78,6 +82,12 @@ export interface AgentEvalCaseReadOptions {
   readonly id: string;
   /** 测试可注入的 fixture 根；省略时定位仓库内 `test-fixtures/agent-evals`。 */
   readonly fixtureRoot?: string;
+}
+
+/** 当前游戏 Benchmark Adapter 的案例读取参数。 */
+export interface GameBenchmarkAdapterCaseReadOptions {
+  readonly id: string;
+  readonly gameRepositoryRoot: string;
 }
 
 const CATEGORIES = new Set<AgentEvalCategory>([
@@ -360,4 +370,67 @@ export async function readAgentEvalCase(
     }
   }
   return { directory, publicCase, reproduction, expected };
+}
+
+/**
+ * 通过游戏仓库拥有的版本化 Adapter 读取案例，而不是读取维护器内置快照。
+ * Adapter 的 runner 输出仍会在维护器边界再次执行严格 schema 校验。
+ */
+export async function readAgentEvalCaseFromGameAdapter(
+  options: GameBenchmarkAdapterCaseReadOptions,
+): Promise<AgentEvalCase> {
+  const id = fixtureId(options.id);
+  const root = await realpath(resolve(options.gameRepositoryRoot));
+  const rootInformation = await lstat(root);
+  if (rootInformation.isSymbolicLink() || !rootInformation.isDirectory()) {
+    throw new Error("游戏 Benchmark Adapter 根必须是真实目录");
+  }
+  const adapter = join(root, "scripts", "benchmark-adapter.mjs");
+  const adapterInformation = await lstat(adapter);
+  if (adapterInformation.isSymbolicLink() || !adapterInformation.isFile()) {
+    throw new Error("游戏 Benchmark Adapter 必须是普通文件");
+  }
+  const result = await executeFile(process.execPath, [
+    adapter,
+    "describe",
+    "--fixture", id,
+    "--audience", "runner",
+  ], {
+    cwd: root,
+    encoding: "utf8",
+    windowsHide: true,
+    maxBuffer: 1024 * 1024,
+    timeout: 30_000,
+  });
+  let value: unknown;
+  try {
+    value = JSON.parse(result.stdout) as unknown;
+  } catch (error) {
+    throw new Error("游戏 Benchmark Adapter 返回无效 JSON", { cause: error });
+  }
+  const input = record(value, "Benchmark Adapter describe");
+  exactKeys(input, [
+    "adapterVersion",
+    "case",
+    "expected",
+    "reproduction",
+    "schemaVersion",
+  ], "Benchmark Adapter describe");
+  if (input.schemaVersion !== 1 || input.adapterVersion !== 1) {
+    throw new Error("游戏 Benchmark Adapter 版本不受支持");
+  }
+  const publicCase = parsePublicCase(input.case, id);
+  const reproduction = parseReproduction(input.reproduction, id);
+  const expected = parseExpected(input.expected, id);
+  for (const step of reproduction.steps) {
+    if (step.op === "input-sql" && !(step.inputRef in expected.secretInputs)) {
+      throw new Error("Benchmark Adapter 复现引用了不存在的隐藏输入");
+    }
+  }
+  return {
+    directory: join(root, "benchmark", "agent-evals", id),
+    publicCase,
+    reproduction,
+    expected,
+  };
 }

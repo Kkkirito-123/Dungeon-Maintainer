@@ -63,6 +63,7 @@ function openLocalPage(url: string): void {
 export async function startBenchmarkProgressPage(openBrowser = true): Promise<BenchmarkProgressPage> {
   const clients = new Set<ServerResponse>();
   let latestOverall: BenchmarkProgressEvent | null = null;
+  let closed = false;
   const latestWorkers = new Map<number, BenchmarkProgressEvent>();
   const server = createServer((request, response) => {
     if (request.url === "/events") {
@@ -97,10 +98,16 @@ export async function startBenchmarkProgressPage(openBrowser = true): Promise<Be
       const data = "data: " + JSON.stringify(event) + "\n\n";
       for (const client of clients) client.write(data);
     },
-    close: async () => await new Promise<void>((resolveClose) => {
-      server.close(() => resolveClose());
+    close: async () => {
+      if (closed) return;
+      closed = true;
+      // SSE keep-alive 连接会阻止 server.close() 的回调触发，因此先结束客户端，
+      // 再停止监听。反过来会让已经写完汇总的 Benchmark 永久不退出。
       for (const client of clients) client.end();
       clients.clear();
-    }),
+      await new Promise<void>((resolveClose, rejectClose) => {
+        server.close((error) => error ? rejectClose(error) : resolveClose());
+      });
+    },
   };
 }

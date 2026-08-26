@@ -90,6 +90,14 @@ export interface MaterializedAgentEvalFixture {
   readonly dirtyPaths: readonly string[];
 }
 
+/** 当前游戏 Benchmark Adapter 的物化参数。 */
+export interface GameBenchmarkAdapterMaterializeOptions {
+  readonly id: string;
+  readonly destination: string;
+  readonly gameRepositoryRoot: string;
+  readonly variant?: "broken" | "clean";
+}
+
 function isMissing(error: unknown): boolean {
   return (error as NodeJS.ErrnoException).code === "ENOENT";
 }
@@ -545,4 +553,71 @@ export async function materializeAgentEvalFixture(
     }
     throw error;
   }
+}
+
+/** 让当前游戏仓库从自身工作树物化评测仓库，维护器不再持有游戏源码快照。 */
+export async function materializeAgentEvalFixtureFromGameAdapter(
+  options: GameBenchmarkAdapterMaterializeOptions,
+): Promise<MaterializedAgentEvalFixture> {
+  const id = normalizeFixtureId(options.id);
+  const destination = resolve(options.destination);
+  if (dirname(destination) === destination || await pathExists(destination)) {
+    throw new Error("游戏 Benchmark Adapter 目标非法或已存在");
+  }
+  const root = await realpath(resolve(options.gameRepositoryRoot));
+  const rootInformation = await lstat(root);
+  if (rootInformation.isSymbolicLink() || !rootInformation.isDirectory()) {
+    throw new Error("游戏 Benchmark Adapter 根必须是真实目录");
+  }
+  const adapter = join(root, "scripts", "benchmark-adapter.mjs");
+  await requirePlainFile(adapter, "游戏 Benchmark Adapter");
+  const variant = options.variant ?? "broken";
+  const result = await executeFile(process.execPath, [
+    adapter,
+    "materialize",
+    "--fixture", id,
+    "--destination", destination,
+    "--variant", variant,
+  ], {
+    cwd: root,
+    encoding: "utf8",
+    windowsHide: true,
+    maxBuffer: 1024 * 1024,
+    timeout: 120_000,
+  });
+  let value: unknown;
+  try {
+    value = JSON.parse(result.stdout) as unknown;
+  } catch (error) {
+    throw new Error("游戏 Benchmark Adapter 物化结果不是有效 JSON", { cause: error });
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("游戏 Benchmark Adapter 物化结果必须是对象");
+  }
+  const output = value as Record<string, unknown>;
+  const expectedKeys = [
+    "adapterVersion", "baseCommit", "destination", "dirtyPaths",
+    "fixtureId", "schemaVersion", "variant",
+  ];
+  if (Object.keys(output).sort().join("\n") !== expectedKeys.sort().join("\n")) {
+    throw new Error("游戏 Benchmark Adapter 物化结果字段不一致");
+  }
+  if (
+    output.schemaVersion !== 1
+    || output.adapterVersion !== 1
+    || output.fixtureId !== id
+    || output.variant !== variant
+    || resolve(String(output.destination)) !== destination
+    || typeof output.baseCommit !== "string"
+    || !/^[0-9a-f]{40}$/u.test(output.baseCommit)
+    || !Array.isArray(output.dirtyPaths)
+  ) throw new Error("游戏 Benchmark Adapter 物化结果不合法");
+  const dirtyPaths = output.dirtyPaths.map(normalizeFixturePath).sort();
+  if (new Set(dirtyPaths).size !== dirtyPaths.length) {
+    throw new Error("游戏 Benchmark Adapter dirtyPaths 不允许重复");
+  }
+  if (variant === "clean" && dirtyPaths.length !== 0) {
+    throw new Error("游戏 Benchmark Adapter clean 结果不得包含 dirtyPaths");
+  }
+  return { destination, baseCommit: output.baseCommit, dirtyPaths };
 }

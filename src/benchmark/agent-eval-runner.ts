@@ -17,10 +17,14 @@ import { promisify } from "node:util";
 import {
   GAME_REPAIR_TIMEOUT_MAX_MS,
   readAgentEvalCase,
+  readAgentEvalCaseFromGameAdapter,
   type AgentEvalCase,
   type AgentEvalReproductionStep,
 } from "./agent-eval-case.js";
-import { materializeAgentEvalFixture } from "./agent-eval-fixture.js";
+import {
+  materializeAgentEvalFixture,
+  materializeAgentEvalFixtureFromGameAdapter,
+} from "./agent-eval-fixture.js";
 import { runPiMaintainer, type PiMaintainerLiveEvent } from "./pi-maintainer.js";
 import {
   runPiOriginal,
@@ -152,6 +156,43 @@ function dependencyKey(path: string): string {
   return createHash("sha256").update(resolve(path)).digest("hex").slice(0, 16);
 }
 
+async function readConfiguredAgentEvalCase(options: {
+  readonly fixtureId: string;
+  readonly fixtureRoot?: string;
+  readonly dependencyRepoRoot: string;
+}): Promise<AgentEvalCase> {
+  return options.fixtureRoot
+    ? await readAgentEvalCase({ id: options.fixtureId, fixtureRoot: options.fixtureRoot })
+    : await readAgentEvalCaseFromGameAdapter({
+        id: options.fixtureId,
+        gameRepositoryRoot: options.dependencyRepoRoot,
+      });
+}
+
+async function materializeConfiguredAgentEvalFixture(options: {
+  readonly fixtureId: string;
+  readonly fixtureRoot?: string;
+  readonly dependencyRepoRoot: string;
+  readonly destination: string;
+  readonly variant?: "broken" | "clean";
+}): Promise<void> {
+  if (options.fixtureRoot) {
+    await materializeAgentEvalFixture({
+      id: options.fixtureId,
+      fixtureRoot: options.fixtureRoot,
+      destination: options.destination,
+      ...(options.variant ? { variant: options.variant } : {}),
+    });
+    return;
+  }
+  await materializeAgentEvalFixtureFromGameAdapter({
+    id: options.fixtureId,
+    gameRepositoryRoot: options.dependencyRepoRoot,
+    destination: options.destination,
+    ...(options.variant ? { variant: options.variant } : {}),
+  });
+}
+
 function validPreflightCertificate(input: {
   readonly certificate: AgentEvalPreflightCertificate;
   readonly fixtureId: string;
@@ -218,27 +259,41 @@ export interface AgentEvalOracleDiagnostic {
   readonly oracle: string;
   readonly finalStepIndex: number | null;
   readonly finalOp: AgentEvalReproductionStep["op"] | null;
+  readonly finalEvent: string | null;
   readonly finalFloor: number | null;
   readonly finalMode: string | null;
   readonly finalAdvanced: boolean | null;
   readonly finalBossDefeated: boolean | null;
+  readonly finalClaimableReward: string | null;
+  readonly finalVictories: number | null;
   readonly reloadObserved: boolean;
+  readonly stepEvents: readonly string[];
   readonly queryEvents: readonly string[];
   readonly planClasses: readonly string[];
 }
 
 type AgentEvalObservation = AgentEvalOracleObservation;
 
-function safeErrorCode(error: unknown): string {
+/** 把异常正文压缩为不含凭据、路径或模型正文的稳定 Benchmark 原因码。 */
+export function gameRepairFailureCode(error: unknown): string {
   if (!(error instanceof Error)) return "unknown-error";
   const message = error.message.toLowerCase();
   if (/^[a-z0-9-]+$/u.test(message)) return message;
+  if (
+    message.includes("blocked_env")
+    || message.includes("api key")
+    || message.includes("api_key")
+    || message.includes("鉴权")
+  ) return "model-auth-unavailable";
+  if (message.includes("model") || message.includes("provider")) return "model-unavailable";
   if (message.includes("chromium")) return "chromium-unavailable";
   if (message.includes("vite")) return "vite-unavailable";
   if (message.includes("node_modules")) return "dependencies-unavailable";
   if (message.includes("fixture") || message.includes("base.json")) return "fixture-invalid";
   return "eval-error";
 }
+
+const safeErrorCode = gameRepairFailureCode;
 
 async function exists(path: string): Promise<boolean> {
   try {
@@ -401,11 +456,15 @@ async function runBrowserOracle(input: {
           : input.testCase.expected.afterOracle,
         finalStepIndex: final?.stepIndex ?? null,
         finalOp: final?.op ?? null,
+        finalEvent: final?.event ?? null,
         finalFloor: final?.view.floor ?? null,
         finalMode: final?.view.mode ?? null,
         finalAdvanced: final?.judge.advanced ?? null,
         finalBossDefeated: final?.judge.bossDefeated ?? null,
+        finalClaimableReward: final?.judge.claimableReward ?? null,
+        finalVictories: final?.judge.victories ?? null,
         reloadObserved: final?.reloadObserved ?? false,
+        stepEvents: observations.map((entry) => entry.event),
         queryEvents: observations.filter((entry) => entry.op === "query").map((entry) => entry.event),
         planClasses: observations.filter((entry) => entry.op === "query").map((entry) => entry.planClass),
       };
@@ -514,6 +573,7 @@ export async function runGameRepairEval(
   let forbiddenPathsUntouched: boolean | null = null;
   let headUnchanged: boolean | null = null;
   let agentStarted = false;
+  let agentStartedAt: number | null = null;
   let infrastructureFailure = false;
   let agentFailureCode: string | null = null;
   let judgeFailureCode: string | null = null;
@@ -581,18 +641,16 @@ export async function runGameRepairEval(
     failureCode: null,
   };
   try {
-    testCase = await readAgentEvalCase({
-      id: options.fixtureId,
-      ...(options.fixtureRoot ? { fixtureRoot: options.fixtureRoot } : {}),
-    });
+    testCase = await readConfiguredAgentEvalCase(options);
     const timeoutMs = Math.min(
       options.timeoutMs ?? testCase.publicCase.timeoutMs,
       GAME_REPAIR_TIMEOUT_MAX_MS,
     );
     temporaryRoot = await mkdtemp(join(tmpdir(), "dungeon-game-repair-eval-"));
     materializedRoot = join(temporaryRoot, "repository");
-    await materializeAgentEvalFixture({
-      id: testCase.publicCase.fixtureId,
+    await materializeConfiguredAgentEvalFixture({
+      fixtureId: testCase.publicCase.fixtureId,
+      dependencyRepoRoot: options.dependencyRepoRoot,
       ...(options.fixtureRoot ? { fixtureRoot: options.fixtureRoot } : {}),
       destination: materializedRoot,
     });
@@ -635,6 +693,7 @@ export async function runGameRepairEval(
       publicPrompt: testCase.publicCase.prompt,
     });
     agentStarted = true;
+    agentStartedAt = performance.now();
     const commonRunOptions = {
       runId,
       repositoryRoot: materializedRoot,
@@ -681,8 +740,21 @@ export async function runGameRepairEval(
     if (!forbiddenPathsUntouched) judgeFailureCode ??= "forbidden-path-changed";
     if (!headUnchanged) judgeFailureCode ??= "unexpected-commit";
   } catch (error) {
-    if (!agentStarted) infrastructureFailure = true;
-    judgeFailureCode ??= safeErrorCode(error);
+    infrastructureFailure = true;
+    const failureCode = gameRepairFailureCode(error);
+    if (agentStarted) {
+      agentFailureCode ??= failureCode;
+      piMetrics = {
+        ...piMetrics,
+        status: "infra_error",
+        durationMs: agentStartedAt === null
+          ? 0
+          : Math.max(0, Math.round(performance.now() - agentStartedAt)),
+        failureCode,
+      };
+    } else {
+      judgeFailureCode ??= failureCode;
+    }
   } finally {
     if (dependencyLease) {
       await releaseAgentEvalDependencies(dependencyLease).catch((error: unknown) => {
@@ -784,15 +856,13 @@ export async function runAgentEvalPreflight(
   let failureCode: string | null = null;
   let browserErrorCount = 0;
   try {
-    testCase = await readAgentEvalCase({
-      id: options.fixtureId,
-      ...(options.fixtureRoot ? { fixtureRoot: options.fixtureRoot } : {}),
-    });
+    testCase = await readConfiguredAgentEvalCase(options);
     const timeoutMs = options.timeoutMs ?? testCase.publicCase.timeoutMs;
     temporaryRoot = await mkdtemp(join(tmpdir(), "dungeon-agent-eval-"));
     materializedRoot = join(temporaryRoot, "repository");
-    await materializeAgentEvalFixture({
-      id: testCase.publicCase.fixtureId,
+    await materializeConfiguredAgentEvalFixture({
+      fixtureId: testCase.publicCase.fixtureId,
+      dependencyRepoRoot: options.dependencyRepoRoot,
       ...(options.fixtureRoot ? { fixtureRoot: options.fixtureRoot } : {}),
       destination: materializedRoot,
     });
@@ -813,8 +883,9 @@ export async function runAgentEvalPreflight(
     failureCode = oracle.failureCode ?? (initialFailureMatched ? null : "initial-failure-not-matched");
     if (!failureCode) {
       const cleanRoot = join(temporaryRoot, "clean-repository");
-      await materializeAgentEvalFixture({
-        id: testCase.publicCase.fixtureId,
+      await materializeConfiguredAgentEvalFixture({
+        fixtureId: testCase.publicCase.fixtureId,
+        dependencyRepoRoot: options.dependencyRepoRoot,
         ...(options.fixtureRoot ? { fixtureRoot: options.fixtureRoot } : {}),
         destination: cleanRoot,
         variant: "clean",

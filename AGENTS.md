@@ -46,7 +46,7 @@ tests/                   Node 测试；安全边界优先使用真实临时 Git 
 ```
 
 不要在相邻模块复制权威：任务状态只由 `TaskStore` 持久化；正式仓库写入只由
-`workspace/apply.ts` 执行；浏览器只能调用协议 v2 固定方法；Pi prompt 不能替代执行层权限。
+`workspace/apply.ts` 执行；浏览器只能调用协议 v2/v3 固定方法；Pi prompt 不能替代执行层权限。
 
 ## 开发规则
 

@@ -136,12 +136,13 @@ export class DungeonGameRuntime {
           );
         }, shellUrl);
         await browser.open(start.floor, start.headless);
+        const protocolVersion = await browser.protocolVersion();
         if (start.preset) await browser.prepare(start.preset);
         await notifyShellRuntime(shellUrl, "ready", gameUrl);
         const driver = new GameDriver(browser);
         this.active = { server, browser, driver };
         await appendEvent(this.store, this.task.id, "game.started", {
-          protocolVersion: 2,
+          protocolVersion,
           floor: start.floor,
           presetApplied: start.preset !== null,
         });

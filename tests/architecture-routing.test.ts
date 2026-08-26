@@ -142,7 +142,286 @@ const architectureMapV3 = JSON.stringify({
   ],
 }, null, 2);
 
+const architectureMapV4Value = {
+  schemaVersion: 4,
+  contractId: "dungeon.game.architecture",
+  contractVersion: 1,
+  projectRoot: "game",
+  boundaryRevision: 1,
+  layers: [
+    { id: "content", root: "game/src/content", responsibility: "游戏内容" },
+    { id: "domain", root: "game/src/domain", responsibility: "游戏规则" },
+  ],
+  areas: [
+    {
+      id: "content.world",
+      parentId: "content",
+      root: "game/src/content/world",
+      responsibility: "楼层作者内容",
+      notResponsibleFor: ["状态提交"],
+      signals: ["第一层"],
+      neighbors: ["domain.session"],
+    },
+    {
+      id: "domain.combat",
+      parentId: "domain",
+      root: "game/src/domain/combat",
+      responsibility: "战斗规则",
+      notResponsibleFor: ["界面"],
+      signals: ["boss"],
+      neighbors: ["domain.session"],
+    },
+    {
+      id: "domain.session",
+      parentId: "domain",
+      root: "game/src/domain/session",
+      responsibility: "状态提交门面",
+      notResponsibleFor: ["界面"],
+      signals: ["状态"],
+      neighbors: ["domain.combat", "content.world"],
+    },
+  ],
+  partitions: [
+    {
+      id: "domain.session.combat",
+      parentId: "domain.session",
+      root: "game/src/domain/session/combat",
+      responsibility: "Session 战斗协调",
+      notResponsibleFor: ["SQL 执行"],
+      signals: ["生命下限"],
+      neighbors: [],
+    },
+  ],
+  floorScopes: [
+    {
+      id: "floor.01",
+      floor: 1,
+      roots: ["game/src/content/world/floors/floor01"],
+      responsibility: "第一层内容",
+      signals: ["第一层"],
+      neighbors: [],
+      sharedPartitions: [],
+      contentRefs: ["content.world"],
+      serviceRefs: ["domain.session"],
+      featureRefs: ["feature.combat-resolution"],
+    },
+  ],
+  features: [
+    {
+      id: "feature.combat-resolution",
+      roots: ["domain.session.combat", "domain.combat", "domain.session"],
+      responsibility: "战斗阶段、伤害与胜负状态提交",
+      notResponsibleFor: ["战斗画面"],
+      signals: ["最终阶段生命下限", "永远剩余 1 HP", "最终阶段"],
+      negativeSignals: ["只修改样式"],
+      neighbors: ["domain.combat"],
+      route: {
+        primary: ["domain.session.combat", "domain.session"],
+        adjacent: ["domain.combat"],
+        shared: [],
+        fallback: [],
+      },
+      contentRefs: [],
+      serviceProviders: ["domain.session"],
+    },
+  ],
+  runtime: {
+    sourceRoot: "game",
+    bridgeProtocol: 3,
+    adapterVersion: 1,
+    supportedCapabilities: ["catalog", "describe", "materialize"],
+  },
+  maintenancePolicy: {
+    ordinaryFile: "no-update",
+    internalDirectory: "no-update",
+    rootMoveOrRename: "update",
+    areaPartitionChange: "update",
+    responsibilityOrRouteChange: "update",
+    invalidCore: "fallback",
+  },
+  boundary: {
+    algorithm: "direct-child-v1",
+    signature: "0".repeat(64),
+  },
+};
+
+const architectureMapV4 = JSON.stringify(architectureMapV4Value, null, 2);
+
 describe("游戏区域职责路由", () => {
+  it("schema v4 先按跨层 feature 路由，再保留楼层上下文", async () => {
+    const repository = await createTemporaryGitRepository({
+      ".maintainer/architecture-map.json": architectureMapV4,
+      "game/src/content/world/floors/floor01/content.ts": "export const floorNeedle = 'floor-only';\n",
+      "game/src/domain/combat/damage.ts": "export const damageRule = true;\n",
+      "game/src/domain/session/combat/finalBoss.ts": "export const minimumHp = 'final-needle';\n",
+      "game/src/domain/session/GameSession.ts": "export const commitState = true;\n",
+    });
+    try {
+      const loaded = await loadArchitectureMap(repository.repoRoot);
+      assert.equal(loaded.warning, null);
+      assert.equal(loaded.map?.schemaVersion, 4);
+      assert.ok(loaded.map);
+      assert.equal(loaded.map.runtime.bridgeProtocol, 3);
+      const route = routeArchitecture(
+        loaded.map,
+        "第一层区域层主最终阶段生命下限错误，永远剩余 1 HP",
+        1,
+      );
+      assert.equal(route?.primaryFeatures[0]?.id, "feature.combat-resolution");
+      assert.ok(route);
+      assert.equal(route.currentFloorScope?.id, "floor.01");
+      assert.equal(route.featurePrimaryRoots[0], "game/src/domain/session/combat");
+      assert.match(architectureRouteCard(route) ?? "", /feature\.combat-resolution/u);
+
+      const dataDir = join(repository.temporaryRoot, "data-v4");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "architecture-routing-v4",
+        objective: "修复最终阶段生命下限",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(dataDir, "tasks", "architecture-routing-v4", "pi"),
+      });
+      await store.transition(task, "active");
+      const evidence = new EvidenceStore(dataDir, task);
+      const context = {
+        task,
+        store,
+        evidence,
+        architectureMap: () => loaded.map,
+        architectureRoute: () => route,
+      };
+      const bundle = await inspectTask(context, { action: "bundle", query: "final-needle" });
+      assert.equal(bundle.details.expansionLevel, "feature-primary");
+      assert.equal(bundle.details.expanded, false);
+      assert.match(bundle.text, /domain\/session\/combat\/finalBoss\.ts/u);
+      assert.doesNotMatch(bundle.text, /content\/world\/floors/u);
+
+      const explicit = await inspectTask(context, {
+        action: "bundle",
+        query: "final-needle",
+        featureId: "feature.combat-resolution",
+      });
+      assert.equal(explicit.details.expansionLevel, "explicit-feature");
+    } finally {
+      await repository.dispose();
+    }
+  });
+
+  it("feature bundle 字面症状零命中时只在同一职责范围使用概念词补搜", async () => {
+    const repository = await createTemporaryGitRepository({
+      ".maintainer/architecture-map.json": architectureMapV4,
+      "game/src/content/world/floors/floor01/content.ts": "export const floorOnly = true;\n",
+      "game/src/domain/combat/damage.ts": "export const unrelated = true;\n",
+      "game/src/domain/session/combat/resolveHit.ts": [
+        "/** 战斗命中的伤害规则。 */",
+        "export const minimumHp = 0;",
+        "",
+      ].join("\n"),
+      "game/src/domain/session/state.ts": "export const state = true;\n",
+    });
+    try {
+      const loaded = await loadArchitectureMap(repository.repoRoot);
+      assert.ok(loaded.map);
+      const dataDir = join(repository.temporaryRoot, "data-v4-concept-bundle");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "architecture-routing-v4-concept-bundle",
+        objective: "验证 feature 概念补搜",
+        repoRoot: repository.repoRoot,
+        baseHead: "a".repeat(40),
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(dataDir, "tasks", "architecture-routing-v4-concept-bundle", "pi"),
+      });
+      await store.transition(task, "active");
+      const evidence = new EvidenceStore(dataDir, task);
+      const bundle = await inspectTask({
+        task,
+        store,
+        evidence,
+        architectureMap: () => loaded.map,
+        architectureRoute: () => routeArchitecture(
+          loaded.map,
+          "最终阶段层主永远剩一滴血",
+          1,
+        ),
+      }, {
+        action: "bundle",
+        query: "boss stuck at one hp",
+        featureId: "feature.combat-resolution",
+      });
+      assert.equal(bundle.details.expansionLevel, "explicit-feature");
+      assert.equal(bundle.details.expanded, false);
+      assert.equal(bundle.details.bundleWindows, 1);
+      assert.match(bundle.text, /domain\/session\/combat\/resolveHit\.ts/u);
+      assert.doesNotMatch(bundle.text, /content\/world\/floors/u);
+    } finally {
+      await repository.dispose();
+    }
+  });
+
+  it("schema v4 忽略未来元数据并丢弃单个非法 feature，不使核心地图失效", async () => {
+    const compatible = structuredClone(architectureMapV4Value) as Record<string, unknown> & {
+      features: Array<Record<string, unknown>>;
+    };
+    compatible.futureMetadata = { version: 5 };
+    compatible.features.push({
+      ...compatible.features[0],
+      id: "feature.invalid-route",
+      roots: ["domain.missing"],
+    });
+    const repository = await createTemporaryGitRepository({
+      ".maintainer/architecture-map.json": JSON.stringify(compatible),
+      "game/src/content/world/floors/floor01/content.ts": "export const floor = 1;\n",
+      "game/src/domain/combat/damage.ts": "export const damage = 1;\n",
+      "game/src/domain/session/combat/finalBoss.ts": "export const boss = 1;\n",
+      "game/src/domain/session/GameSession.ts": "export const session = 1;\n",
+    });
+    try {
+      const loaded = await loadArchitectureMap(repository.repoRoot);
+      assert.ok(loaded.map);
+      assert.deepEqual(loaded.map.features.map((feature) => feature.id), [
+        "feature.combat-resolution",
+      ]);
+      assert.match(loaded.warning ?? "", /futureMetadata/u);
+      assert.match(loaded.warning ?? "", /已忽略/u);
+    } finally {
+      await repository.dispose();
+    }
+  });
+
+  it("旧 schema 的 projectRoot 不再硬编码为 game", async () => {
+    const portable = JSON.parse(architectureMap) as {
+      projectRoot: string;
+      layers: Array<{ root: string }>;
+      areas: Array<{ root: string }>;
+    };
+    portable.projectRoot = "client";
+    const [domainLayer] = portable.layers;
+    const [combatArea, sessionArea] = portable.areas;
+    assert.ok(domainLayer);
+    assert.ok(combatArea);
+    assert.ok(sessionArea);
+    domainLayer.root = "client/src/domain";
+    combatArea.root = "client/src/domain/combat";
+    sessionArea.root = "client/src/domain/session";
+    const repository = await createTemporaryGitRepository({
+      ".maintainer/architecture-map.json": JSON.stringify(portable),
+      "client/src/domain/combat/damage.ts": "export const damage = 1;\n",
+      "client/src/domain/session/state.ts": "export const state = 1;\n",
+    });
+    try {
+      const loaded = await loadArchitectureMap(repository.repoRoot);
+      assert.equal(loaded.warning, null);
+      assert.equal(loaded.map?.projectRoot, "client");
+      assert.ok(loaded.map);
+      assert.equal(loaded.map.runtime.sourceRoot, "client");
+    } finally {
+      await repository.dispose();
+    }
+  });
+
   it("共享 benchmark 地图把终端动作路由到 devtools，而不是实时楼层", async () => {
     const fixtureRoot = join(
       process.cwd(),

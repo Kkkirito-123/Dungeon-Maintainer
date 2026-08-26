@@ -93,9 +93,14 @@ describe("领域化循环门禁", () => {
     });
     assert.equal(guard.noProgressCount, 8);
     assert.equal(guard.recentOutcomes.length, 8);
+    assert.equal(guard.evaluateAction({
+      toolName: "finish",
+      input: { status: "result" },
+      route: { status: "result" },
+    }).kind, "allow");
   });
 
-  it("EvidenceStore revision 与显式进展会清零次数并解除冻结", () => {
+  it("EvidenceStore revision 本身不算进展，只有显式领域进展会解除冻结", () => {
     const guard = new LoopGuard();
     const repeated = action("repeated");
     recordWithoutEvidence(guard, repeated);
@@ -108,17 +113,22 @@ describe("领域化循环门禁", () => {
       action: progressAction,
       result: { matches: ["src/game.ts:20"] },
       evidenceRevision: 1,
+    }), false);
+    assert.equal(guard.progressRevision, 0);
+    assert.equal(guard.noProgressCount, 3);
+    assert.equal(guard.evaluateAction(repeated).kind, "block");
+
+    const explicitProgress = action("explicit-progress", { query: "new-source-window" });
+    assert.equal(guard.evaluateAction(explicitProgress).kind, "allow");
+    assert.equal(guard.recordOutcome({
+      action: explicitProgress,
+      result: { matches: ["src/game.ts:20"] },
+      evidenceRevision: 1,
+      madeProgress: true,
     }), true);
     assert.equal(guard.progressRevision, 1);
     assert.equal(guard.noProgressCount, 0);
     assert.equal(guard.evaluateAction(repeated).kind, "allow");
-    assert.equal(guard.recordOutcome({
-      action: repeated,
-      result: { matches: ["src/game.ts:20"] },
-      evidenceRevision: 1,
-    }), false);
-    assert.equal(guard.progressRevision, 1);
-    assert.equal(guard.noProgressCount, 1);
     assert.equal(guard.recordOutcome({
       action: action("same-evidence", { query: "terminal state" }),
       result: { matches: ["src/game.ts:20"] },
@@ -127,6 +137,48 @@ describe("领域化循环门禁", () => {
     }), true);
     assert.equal(guard.progressRevision, 2);
     assert.equal(guard.noProgressCount, 0);
+  });
+
+  it("同一 worktree 和搜索路线换 query 仍在第三次执行前阻止", () => {
+    const guard = new LoopGuard();
+    const route = { action: "search", scope: "devtools", worktreeHash: "worktree-v1" };
+    const first = {
+      toolName: "inspect",
+      input: { query: "terminal" },
+      route,
+    };
+    const second = {
+      toolName: "inspect",
+      input: { query: "open sql" },
+      route,
+    };
+    const third = {
+      toolName: "inspect",
+      input: { query: "action selector" },
+      route,
+    };
+    recordWithoutEvidence(guard, first, { matches: 0 });
+    recordWithoutEvidence(guard, second, { matches: 12 });
+
+    assert.deepEqual(guard.evaluateAction(third), {
+      kind: "block",
+      reason: "route_no_progress",
+      noProgressCount: 2,
+    });
+
+    const sourceWindow = {
+      toolName: "inspect",
+      input: { path: "game/src/devtools/dungeon-agent/actions.ts" },
+      route: { action: "read", path: "game/src/devtools/dungeon-agent/actions.ts" },
+    };
+    assert.equal(guard.evaluateAction(sourceWindow).kind, "allow");
+    assert.equal(guard.recordOutcome({
+      action: sourceWindow,
+      result: { baseHash: "base-v1", lines: 48 },
+      evidenceRevision: 3,
+      madeProgress: true,
+    }), true);
+    assert.equal(guard.evaluateAction(third).kind, "allow");
   });
 
   it("只保留最近八项并能为新任务清空全部状态", () => {
@@ -146,6 +198,7 @@ describe("领域化循环门禁", () => {
       action: progress,
       result: { value: "progress" },
       evidenceRevision: 1,
+      madeProgress: true,
     }), true);
     for (let index = 5; index < 10; index += 1) {
       const suffix = String(index);

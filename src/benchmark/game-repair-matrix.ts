@@ -7,7 +7,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   runAgentEvalPreflight,
@@ -58,6 +58,8 @@ export interface GameRepairMatrixOptions {
   readonly suite?: GameRepairSuite;
   /** 正式运行 worker 数；每个 worker 仍使用独立临时仓库和运行时。 */
   readonly concurrency?: number;
+  /** 可选的已有矩阵归档；提供后复用其中的预检和已完成单题。 */
+  readonly resumeDirectory?: string;
   readonly onProgress?: (event: BenchmarkProgressEvent) => void;
 }
 
@@ -93,16 +95,21 @@ async function runPreflights(
         ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
       });
     }));
-    const stableResults = await Promise.all(batchResults.map(async (result) => {
-      if (result.status !== "infra_error") return result;
-      return await runAgentEvalPreflight({
+    const stableResults: AgentEvalPreflightResult[] = [];
+    for (const result of batchResults) {
+      if (result.status !== "infra_error") {
+        stableResults.push(result);
+        continue;
+      }
+      // 并发 Chromium/Vite 的偶发页面错误顺序重试，避免同一批再次争用资源。
+      stableResults.push(await runAgentEvalPreflight({
         fixtureId: result.fixtureId,
         dependencyRepoRoot: options.dependencyRepoRoot,
         archiveRoot,
         ...(options.fixtureRoot ? { fixtureRoot: options.fixtureRoot } : {}),
         ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
-      });
-    }));
+      }));
+    }
     results.push(...stableResults);
   }
   return results;
@@ -278,6 +285,78 @@ function uniqueArchiveDirectory(root: string, label: string): string {
   return join(resolve(root), label + "-" + stamp + "-" + randomUUID().slice(0, 8));
 }
 
+function matrixJobKey(input: {
+  fixtureId: string;
+  profile: GameRepairEvalProfile;
+  repetition: number;
+}): string {
+  return input.fixtureId + ":" + input.profile + ":" + String(input.repetition);
+}
+
+interface MatrixCheckpoint {
+  readonly schemaVersion: 1;
+  readonly profile: GameRepairMatrixProfile;
+  readonly suite: GameRepairSuite;
+  readonly repetitions: number;
+  readonly expectedRuns: number;
+  readonly results: readonly GameRepairEvalResultV5[];
+  readonly runFailures: readonly GameRepairMatrixResult["runFailures"][number][];
+}
+
+async function writeMatrixCheckpoint(
+  archiveDirectory: string,
+  checkpoint: MatrixCheckpoint,
+): Promise<void> {
+  const target = join(archiveDirectory, "checkpoint.json");
+  const temporary = target + ".tmp-" + randomUUID();
+  await writeFile(temporary, JSON.stringify(checkpoint, null, 2) + "\n", "utf8");
+  await rename(temporary, target);
+}
+
+async function readMatrixCheckpoint(path: string): Promise<MatrixCheckpoint | null> {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
+    if (!parsed || typeof parsed !== "object") return null;
+    const value = parsed as Partial<MatrixCheckpoint>;
+    if (
+      value.schemaVersion !== 1
+      || !Array.isArray(value.results)
+      || !Array.isArray(value.runFailures)
+      || typeof value.expectedRuns !== "number"
+      || typeof value.repetitions !== "number"
+      || (value.profile !== "both"
+        && value.profile !== "pi-original"
+        && value.profile !== "maintainer-current")
+      || (value.suite !== "full" && value.suite !== "four-regressions")
+    ) return null;
+    return value as MatrixCheckpoint;
+  } catch {
+    return null;
+  }
+}
+
+async function readSavedPreflights(
+  archiveDirectory: string,
+  fixtureIds: readonly string[],
+): Promise<AgentEvalPreflightResult[] | null> {
+  const entries: AgentEvalPreflightResult[] = [];
+  for (const fixtureId of fixtureIds) {
+    try {
+      const parsed: unknown = JSON.parse(await readFile(
+        join(archiveDirectory, "preflight", fixtureId + "-preflight.json"),
+        "utf8",
+      ));
+      if (!parsed || typeof parsed !== "object") return null;
+      const entry = parsed as AgentEvalPreflightResult;
+      if (entry.fixtureId !== fixtureId) return null;
+      entries.push(entry);
+    } catch {
+      return null;
+    }
+  }
+  return entries;
+}
+
 function safeCode(error: unknown): string {
   if (!(error instanceof Error)) return "matrix-run-error";
   const text = error.message.toLowerCase();
@@ -383,21 +462,44 @@ export async function runGameRepairMatrix(
     : GAME_REPAIR_FIXTURE_IDS;
   const selectedProfileCount = selectedProfile === "both" ? 2 : 1;
   const requestedConcurrency = Math.max(1, Math.floor(options.concurrency ?? 1));
-  const archiveDirectory = uniqueArchiveDirectory(options.archiveRoot, "matrix");
+  const archiveDirectory = options.resumeDirectory
+    ? resolve(options.resumeDirectory)
+    : uniqueArchiveDirectory(options.archiveRoot, "matrix");
   await mkdir(archiveDirectory, { recursive: true });
-  const preflightResults = await runPreflights(
-    options,
-    join(archiveDirectory, "preflight"),
-    fixtureIds,
-    options.onProgress,
-    requestedConcurrency,
-  );
+  const preflightResults = options.resumeDirectory
+    ? await readSavedPreflights(archiveDirectory, fixtureIds)
+      ?? await runPreflights(
+        options,
+        join(archiveDirectory, "preflight"),
+        fixtureIds,
+        options.onProgress,
+        requestedConcurrency,
+      )
+    : await runPreflights(
+      options,
+      join(archiveDirectory, "preflight"),
+      fixtureIds,
+      options.onProgress,
+      requestedConcurrency,
+    );
   const certificates = new Map(preflightResults.flatMap((entry) => (
     entry.certificate ? [[entry.fixtureId, entry.certificate] as const] : []
   )));
   const preflightPassed = preflightResults.every((entry) => entry.status === "passed");
-  const results: GameRepairEvalResultV5[] = [];
-  const runFailures: GameRepairMatrixResult["runFailures"][number][] = [];
+  const priorCheckpoint = options.resumeDirectory
+    ? await readMatrixCheckpoint(join(archiveDirectory, "checkpoint.json"))
+    : null;
+  const checkpointMatches = priorCheckpoint !== null
+    && priorCheckpoint.profile === selectedProfile
+    && priorCheckpoint.suite === (options.suite ?? "full")
+    && priorCheckpoint.repetitions === options.repetitions
+    && priorCheckpoint.expectedRuns === fixtureIds.length * selectedProfileCount * options.repetitions;
+  const results: GameRepairEvalResultV5[] = checkpointMatches
+    ? [...priorCheckpoint.results]
+    : [];
+  const runFailures: GameRepairMatrixResult["runFailures"][number][] = checkpointMatches
+    ? [...priorCheckpoint.runFailures]
+    : [];
   if (preflightPassed) {
     const jobs: Array<{
       fixtureId: string;
@@ -415,16 +517,35 @@ export async function runGameRepairMatrix(
         }
       }
     }
+    const completedKeys = new Set([
+      ...results.map((result) => matrixJobKey(result)),
+      ...runFailures.map((failure) => matrixJobKey(failure)),
+    ]);
+    const pendingJobs = jobs.filter((job) => !completedKeys.has(matrixJobKey(job)));
     let nextJob = 0;
-    const workerCount = Math.min(requestedConcurrency, jobs.length);
+    const workerCount = Math.min(requestedConcurrency, pendingJobs.length);
+    let checkpointWrite = Promise.resolve();
+    const persistCheckpoint = (): Promise<void> => {
+      checkpointWrite = checkpointWrite.then(() => writeMatrixCheckpoint(archiveDirectory, {
+        schemaVersion: 1,
+        profile: selectedProfile,
+        suite: options.suite ?? "full",
+        repetitions: options.repetitions,
+        expectedRuns: jobs.length,
+        results,
+        runFailures,
+      }));
+      return checkpointWrite;
+    };
+    await persistCheckpoint();
     const totals = () => ({
       completed: results.length + runFailures.length,
       cumulativeTokens: results.reduce((sum, item) => sum + item.agentOutcome.totalTokens, 0),
       cumulativeToolCalls: results.reduce((sum, item) => sum + item.agentOutcome.toolCalls, 0),
     });
     const runWorker = async (workerId: number): Promise<void> => {
-      while (nextJob < jobs.length) {
-        const job = jobs[nextJob];
+      while (nextJob < pendingJobs.length) {
+        const job = pendingJobs[nextJob];
         nextJob += 1;
         if (!job) return;
         const { fixtureId, profile, repetition } = job;
@@ -455,14 +576,17 @@ export async function runGameRepairMatrix(
             } } : {}),
           });
           results.push(run);
+          await persistCheckpoint();
           publish(run.status === "passed" ? "passed" : "failed", { liveKind: "finish" });
         } catch (error) {
           runFailures.push({ fixtureId, profile, repetition, code: safeCode(error) });
+          await persistCheckpoint();
           publish("failed", { liveKind: "finish" });
         }
       }
     };
     await Promise.all(Array.from({ length: workerCount }, (_, index) => runWorker(index + 1)));
+    await checkpointWrite;
     const jobOrder = new Map(jobs.map((job) => [
       job.fixtureId + ":" + job.profile + ":" + String(job.repetition),
       job.order,

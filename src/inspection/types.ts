@@ -16,6 +16,7 @@ export interface InspectInput {
   startLine?: number;
   lineCount?: number;
   partitionId?: string;
+  featureId?: string;
   floorId?: string;
   ranges?: InspectReadRange[];
 }

@@ -13,7 +13,8 @@
  * 隐私：最近结果仅包含工具名和不可逆摘要；原始参数、结果与证据不会被本模块持久化。
  * 关键失败模式与恢复：循环引用无法形成确定性摘要时会抛出 TypeError；调用方应拒绝该次
  * 工具调用并修正领域投影。任务切换必须用当前证据 revision 调用 resetForNewTask；
- * 后续只有 revision 增长或调用方明确 madeProgress 才算客观进展。
+ * 后续只有调用方按工具语义明确 madeProgress 才算客观进展；Evidence revision 只作
+ * 低敏审计水位，不能把零命中搜索或新增回执误判为问题求解进展。
  */
 
 import { createHash } from "node:crypto";
@@ -71,7 +72,7 @@ export type LoopGuardDecision =
   | { kind: "strategy_reset"; reason: "no_progress"; noProgressCount: number }
   | {
     kind: "block";
-    reason: "exact_action_result" | "alternating_route";
+    reason: "exact_action_result" | "alternating_route" | "route_no_progress";
     noProgressCount: number;
   }
   | { kind: "hard_stop"; reason: "no_progress"; noProgressCount: number };
@@ -153,6 +154,7 @@ export class LoopGuard {
   private outcomes: ActionOutcome[] = [];
   private frozenActionDigests = new Set<string>();
   private frozenRouteDigests = new Set<string>();
+  private noProgressRouteCounts = new Map<string, number>();
   private strategyResetRevision: number | null = null;
   private hardStopRevision: number | null = null;
   private currentProgressRevision = 0;
@@ -202,8 +204,9 @@ export class LoopGuard {
     const nextActionDigest = actionDigest(action);
     const nextRouteDigest = routeDigest(action);
 
-    if (this.hardStopRevision === this.currentProgressRevision
-      || this.currentNoProgressCount >= HARD_STOP_THRESHOLD) {
+    if (action.toolName !== "finish"
+      && (this.hardStopRevision === this.currentProgressRevision
+      || this.currentNoProgressCount >= HARD_STOP_THRESHOLD)) {
       this.hardStopRevision = this.currentProgressRevision;
       return {
         kind: "hard_stop",
@@ -244,6 +247,18 @@ export class LoopGuard {
       };
     }
 
+    // 搜索词属于一次动作的细节，不属于调查路线。调用方可以把同一 worktree、
+    // action 和 scope 投影为同一路线；前两次都没有明确源码覆盖进展后，第三个
+    // 同义 query 必须在执行 rg 前被挡住，不能靠改写关键词绕过精确动作去重。
+    if (action.toolName === "inspect" && (this.noProgressRouteCounts.get(nextRouteDigest) ?? 0) >= 2) {
+      this.frozenRouteDigests.add(nextRouteDigest);
+      return {
+        kind: "block",
+        reason: "route_no_progress",
+        noProgressCount: this.currentNoProgressCount,
+      };
+    }
+
     const thirdLast = currentOutcomes.at(-3);
     const secondLast = currentOutcomes.at(-2);
     const last = currentOutcomes.at(-1);
@@ -279,7 +294,7 @@ export class LoopGuard {
    * 记录一次已经真实完成的工具调用，并判断它是否带来了新证据。
    *
    * @param completed 允许执行的动作、稳定结果投影和证据 revision。
-   * @returns revision 增长或显式 madeProgress 时返回 true，否则返回 false。
+   * @returns 调用方显式 madeProgress 时返回 true，否则返回 false。
    * @throws {TypeError} 结果投影含循环引用时抛出；失败时不写入部分状态。
    * @remarks cacheHit 不会增加 EvidenceStore revision，因此只增加无进展计数。本方法不调用
    * 工具、不持久化正文，也不扩大权限。
@@ -288,15 +303,21 @@ export class LoopGuard {
     const nextActionDigest = actionDigest(completed.action);
     const nextRouteDigest = routeDigest(completed.action);
     const nextResultDigest = stableDigest(completed.result);
-    const hasNewEvidence = completed.madeProgress === true
-      || completed.evidenceRevision > this.observedEvidenceRevision;
+    const hasNewEvidence = completed.madeProgress === true;
     this.observedEvidenceRevision = Math.max(
       this.observedEvidenceRevision,
       completed.evidenceRevision,
     );
 
-    if (hasNewEvidence) this.advanceProgress();
-    else this.currentNoProgressCount += 1;
+    if (hasNewEvidence) {
+      this.advanceProgress();
+    } else {
+      this.currentNoProgressCount += 1;
+      this.noProgressRouteCounts.set(
+        nextRouteDigest,
+        (this.noProgressRouteCounts.get(nextRouteDigest) ?? 0) + 1,
+      );
+    }
 
     const outcome: ActionOutcome = {
       toolName: completed.action.toolName,
@@ -324,6 +345,7 @@ export class LoopGuard {
     this.currentNoProgressCount = 0;
     this.frozenActionDigests.clear();
     this.frozenRouteDigests.clear();
+    this.noProgressRouteCounts.clear();
     this.strategyResetRevision = null;
     this.hardStopRevision = null;
   }
@@ -339,6 +361,7 @@ export class LoopGuard {
     this.outcomes = [];
     this.frozenActionDigests.clear();
     this.frozenRouteDigests.clear();
+    this.noProgressRouteCounts.clear();
     this.strategyResetRevision = null;
     this.hardStopRevision = null;
     this.currentProgressRevision = 0;

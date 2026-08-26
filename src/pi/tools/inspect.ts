@@ -24,8 +24,10 @@ import type {
 } from "../../inspection/types.js";
 import {
   architectureArea,
+  architectureFeature,
   architectureFloorScope,
   architecturePartition,
+  architectureReferenceRoots,
   type ArchitectureMap,
   type ArchitectureRoute,
 } from "../../inspection/architecture-map.js";
@@ -76,6 +78,11 @@ export const InspectParameters = Type.Object({
   startLine: Type.Optional(Type.Integer({ minimum: 1, maximum: 1_000_000 })),
   lineCount: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_READ_LINES })),
   partitionId: Type.Optional(Type.String({ minLength: 3, maxLength: 80 })),
+  featureId: Type.Optional(Type.String({
+    pattern: "^feature\\.[a-z][a-z0-9.-]*$",
+    maxLength: 100,
+    description: "已知功能边界时传稳定 feature ID；搜索严格限制在该功能登记的所有 roots。",
+  })),
   floorId: Type.Optional(Type.String({
     pattern: "^floor\\.\\d{2,3}$",
     maxLength: 40,
@@ -583,6 +590,26 @@ interface SearchScopePlan {
   locked: boolean;
   cacheScope: string[];
   floorRouted: boolean;
+  /** bundle 字面查询零命中时，在同一 feature 范围内使用的稳定职责词正则。 */
+  fallbackQuery: string | null;
+}
+
+function conceptualSearchQuery(responsibilities: readonly string[]): string | null {
+  const terms = [...new Set(responsibilities.flatMap((value) => (
+    value.split(/[\s,，、；;：:/与和及]+/u).flatMap((part) => (
+      part.match(/[\p{L}\p{N}_-]{2,}/gu) ?? []
+    ))
+  )))];
+  const escaped: string[] = [];
+  let length = 4;
+  for (const term of terms) {
+    const candidate = term.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    if (length + candidate.length + 1 > 150) break;
+    escaped.push(candidate);
+    length += candidate.length + 1;
+    if (escaped.length >= 10) break;
+  }
+  return escaped.length > 0 ? "(?:" + escaped.join("|") + ")" : null;
 }
 
 function uniqueRoots(values: readonly string[], seen: Set<string>): string[] {
@@ -606,6 +633,7 @@ function searchScopePlan(
       locked: true,
       cacheScope: ["explicit-path:" + input.path],
       floorRouted: false,
+      fallbackQuery: null,
     };
   }
   if (input.partitionId) {
@@ -623,9 +651,25 @@ function searchScopePlan(
       locked: true,
       cacheScope: [(partition ? "explicit-partition:" : "explicit-area:") + root],
       floorRouted: false,
+      fallbackQuery: null,
     };
   }
   const map = context.architectureMap?.() ?? null;
+  if (input.featureId) {
+    const feature = architectureFeature(map, input.featureId);
+    if (!feature) throw new Error("未知架构功能：" + input.featureId);
+    const roots = architectureReferenceRoots(map, feature.roots);
+    return {
+      stages: [{ level: "explicit-feature", roots, floorScopeCount: 0 }],
+      locked: true,
+      cacheScope: [
+        "map-revision:" + String(map?.boundaryRevision ?? 0),
+        "explicit-feature:" + feature.id + ":" + roots.join(","),
+      ],
+      floorRouted: false,
+      fallbackQuery: conceptualSearchQuery([feature.responsibility]),
+    };
+  }
   const route = context.architectureRoute?.() ?? null;
   const explicitFloorScope = input.floorId
     ? architectureFloorScope(map, input.floorId)
@@ -640,12 +684,16 @@ function searchScopePlan(
       explicitFloorScope.sharedPartitions.includes(partition.id)
     )) ?? []
     : route?.sharedPartitions ?? [];
-  if (!currentFloorScope && (!route || route.primaryAreas.length === 0)) {
+  if (
+    !currentFloorScope
+    && (!route || (route.primaryFeatures.length === 0 && route.primaryAreas.length === 0))
+  ) {
     return {
       stages: [{ level: "repository", roots: [], floorScopeCount: 0 }],
       locked: false,
       cacheScope: ["repository"],
       floorRouted: false,
+      fallbackQuery: null,
     };
   }
   const seen = new Set<string>();
@@ -654,7 +702,13 @@ function searchScopePlan(
     const unique = uniqueRoots(roots, seen);
     if (unique.length > 0) stages.push({ level, roots: unique, floorScopeCount });
   };
-  if (currentFloorScope) {
+  if (route && route.primaryFeatures.length > 0) {
+    push("feature-primary", route.featurePrimaryRoots);
+    push("feature-adjacent", route.featureAdjacentRoots);
+    push("feature-shared", route.featureSharedRoots);
+    push("feature-fallback", route.featureFallbackRoots);
+    if (currentFloorScope) push("floor-context", currentFloorScope.roots, 1);
+  } else if (currentFloorScope) {
     push("floor-current", currentFloorScope.roots, 1);
     push(
       "floor-adjacent",
@@ -694,8 +748,14 @@ function searchScopePlan(
   return {
     stages,
     locked: false,
-    cacheScope: stages.flatMap((stage) => [stage.level + ":" + (stage.roots.join(",") || ".")]),
-    floorRouted: currentFloorScope !== null,
+    cacheScope: [
+      "map-revision:" + String(map?.boundaryRevision ?? 0),
+      ...stages.flatMap((stage) => [stage.level + ":" + (stage.roots.join(",") || ".")]),
+    ],
+    floorRouted: currentFloorScope !== null && (route?.primaryFeatures.length ?? 0) === 0,
+    fallbackQuery: route && route.primaryFeatures.length > 0
+      ? conceptualSearchQuery(route.primaryFeatures.map((feature) => feature.responsibility))
+      : null,
   };
 }
 
@@ -905,6 +965,9 @@ async function scopedSearch(
   };
   for (const [index, stage] of plan.stages.entries()) {
     result = await searchText(root, query, stage.roots);
+    if (followSharedImports && result.matchCount === 0 && plan.fallbackQuery) {
+      result = await searchText(root, plan.fallbackQuery, stage.roots);
+    }
     scope.push(...(stage.roots.length > 0 ? stage.roots : ["."]));
     floorScopeCount += stage.floorScopeCount;
     expansionLevel = stage.level;
@@ -1120,7 +1183,7 @@ export async function inspectTask(
   const worktreeHash = knownWorktreeHash ?? await hashWorktree(root);
   const scopePlan = input.action === "search" || input.action === "bundle"
     ? searchScopePlan(context, input)
-    : { stages: [], locked: false, cacheScope: [], floorRouted: false };
+    : { stages: [], locked: false, cacheScope: [], floorRouted: false, fallbackQuery: null };
   const actionKey = inspectActionKey(input, scopePlan.cacheScope);
   const validityKey = worktreeHash;
   const cached = await context.evidence.findReusable(actionKey, validityKey);
@@ -1319,8 +1382,8 @@ export function registerInspectTool(
     promptGuidelines: [
       "定位源码时默认先用 inspect bundle；只有上下文不足时再补 read/read_many。",
       "修改前必须取得目标文件的 baseHash；bundle 窗口已包含可用于 patch 的 baseHash。",
-      "search 默认使用本轮游戏区域路由；给出 path 或 partitionId 时固定该范围，不要无理由全仓搜索。",
-      "已知故障楼层可给 floorId；顺序固定为当前层、相邻层、共享父级 partition，再按需回退 area/仓库。相邻层不是复用依赖。",
+      "search 默认使用本轮游戏功能路由；给出 path、partitionId 或 featureId 时固定该范围，不要无理由全仓搜索。",
+      "功能路由先查 primary/adjacent/shared，再使用楼层上下文和 area；只有没有功能命中时才按当前层、相邻层、共享父级 partition 扩展。相邻层不是复用依赖。",
       "bundle 最多返回 4 个 48 行窗口且总计不超过 192 行；ALREADY_SEEN 不需要再次读取。",
     ],
     executionMode: "sequential",
