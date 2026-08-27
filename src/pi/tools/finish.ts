@@ -298,7 +298,7 @@ export function registerFinishTool(
   pi.registerTool({
     name: "finish",
     label: "提交结论",
-    description: "保存诊断、提交一次性完整修复方案、记录复现；result 会自动完成固定验证，但不会执行 /apply。",
+    description: "保存诊断、提交一次性完整修复方案、记录复现；result 会完成固定验证，但自然结束本轮不会自动触发验证，也不会执行 /apply。",
     promptSnippet: "可用 proposed 预先说明多文件方案；完成后用 result 保存结果",
     promptGuidelines: [
       "运行时问题复现成功后，以 reproduced 保存语义动作及至少一项修复后应满足的结构化结果断言；不要把当前故障值当成断言。",

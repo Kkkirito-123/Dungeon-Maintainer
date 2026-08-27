@@ -1371,6 +1371,85 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
     }
   });
 
+  it("agent_settled 只结束回合并回收写权限，不自动验证修改", async () => {
+    const repository = await createTemporaryGitRepository({ "README.md": "baseline\n" });
+    try {
+      const dataDir = join(repository.temporaryRoot, "data-settled");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "task-settled-no-auto-verify",
+        objective: "直接修复并自然结束",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(store.taskDir("task-settled-no-auto-verify"), "pi"),
+      });
+      const pi = new RecordingExtensionApi();
+      let verifyCalls = 0;
+      installDungeonMaintainerExtension(pi as unknown as ExtensionAPI, {
+        config: loadConfig({ LOCALAPPDATA: dataDir, MAINTAINER_API_KEY: "provider-secret" }),
+        store,
+        task,
+        gameRuntime: {
+          currentDriver: () => null,
+          requireDriver: () => ({}) as GameDriver,
+          ensure: async () => ({}) as GameDriver,
+          close: async () => undefined,
+        },
+        verifyTask: async () => {
+          verifyCalls += 1;
+          throw new Error("不应由 agent_settled 调用");
+        },
+      });
+      const finishTool = pi.toolDefinitions.get("finish");
+      assert.ok(finishTool?.execute);
+      await finishTool.execute(
+        "approve-settled-no-verify",
+        {
+          status: "proposed",
+          summary: "已定位最小修改。",
+          risk: "仅修改一个文件。",
+          plan: {
+            title: "写入最小修复",
+            steps: ["修改目标文件。"],
+            verification: "稍后由用户显式 /verify。",
+            allowedPaths: ["changed.txt"],
+          },
+        },
+        undefined,
+        undefined,
+        { ui: { confirm: async () => true } },
+      );
+      const toolCallHook = requireHook(pi, "tool_call");
+      const toolResultHook = requireHook(pi, "tool_result");
+      const hookContext = { ui: { notify: () => undefined } };
+      assert.equal(await toolCallHook({
+        type: "tool_call",
+        toolCallId: "settled-write",
+        toolName: "write",
+        input: { path: "changed.txt", content: "changed\n" },
+      }, hookContext), undefined);
+      await writeFile(join(task.worktreeRoot, "changed.txt"), "changed\n", "utf8");
+      await toolResultHook({
+        type: "tool_result",
+        toolCallId: "settled-write",
+        toolName: "write",
+        input: { path: "changed.txt", content: "changed\n" },
+        content: [{ type: "text", text: "written" }],
+        details: undefined,
+        isError: false,
+      }, hookContext);
+
+      await requireHook(pi, "agent_settled")({}, hookContext);
+      assert.equal(verifyCalls, 0);
+      assert.equal(task.writeScope.state, "closed");
+      assert.deepEqual(task.changedPaths, ["changed.txt"]);
+      assert.notEqual(task.state, "ready_to_apply");
+    } finally {
+      await repository.dispose();
+    }
+  });
+
   it("旧 write 刷新失败后，成功 patch 清除统一刷新门禁", async () => {
     const repository = await createTemporaryGitRepository({
       "README.md": "baseline\n",

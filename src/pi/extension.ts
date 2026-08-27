@@ -568,35 +568,12 @@ export function installDungeonMaintainerExtension(
     await contextTelemetryWrites;
     await appendEvent(store, task.id, "pi.agent_end", { state: task.state });
   });
-  pi.on("agent_settled", async (_event, context) => {
-    // 模型自然结束就是本轮控制流终点。若它已经修改代码但没有显式调用
-    // finish(result)，这里只复用同一个确定性验证器收尾，不再发送隐藏消息或
-    // 创建第二个 Agent Loop。
+  pi.on("agent_settled", async () => {
+    // 与 Pi 原生一致：没有下一次工具调用就结束当前回合。这里仅回收本轮临时写权限，
+    // 不自动刷新、运行测试或验证；模型若未提交 finish(result)，用户可稍后显式 /verify。
     if (!executionApproved) return;
-    try {
-      const refreshFailure = await refreshGateFailure();
-      if (refreshFailure) throw new Error(refreshFailure);
-      if (task.changedPaths.length === 0) return;
-      const verification = await verifyCurrentTask();
-      await appendEvent(store, task.id, "verification.agent_settled", {
-        passed: true,
-        changedPaths: verification.changedPaths.length,
-      });
-      context.ui.notify("代码修改已自动验证，可以执行 /apply。", "info");
-    } catch (error) {
-      const failure = safeRefreshFailure(error);
-      await appendEvent(store, task.id, "verification.agent_settled", {
-        passed: false,
-        failure,
-      });
-      context.ui.notify(
-        "代码已保留在 detached worktree，但自动验证未通过：" + failure,
-        "warning",
-      );
-    } finally {
-      setExecutionApproved(false);
-      await store.closeWriteScope(task);
-    }
+    setExecutionApproved(false);
+    await store.closeWriteScope(task);
   });
   pi.on("turn_end", async (_event, context) => {
     inspectWorktreeHashes.clear();

@@ -62,6 +62,9 @@ describe("外部 CLI 与固定 Pi 启动参数", () => {
     const toolsIndex = args.indexOf("--tools");
     assert.ok(toolsIndex >= 0);
     assert.equal(args[toolsIndex + 1], FULL_CODING_TOOLS.join(","));
+    const thinkingIndex = args.indexOf("--thinking");
+    assert.ok(thinkingIndex >= 0);
+    assert.equal(args[thinkingIndex + 1], task.thinkingLevel);
     assert.ok(!args.includes("--no-builtin-tools"));
     assert.deepEqual(args.slice(-4), [
       "--session-id",

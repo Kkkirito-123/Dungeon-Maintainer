@@ -96,6 +96,10 @@ export function buildPiArguments(
     profileProviderId(profile.id),
     "--model",
     profile.modelId,
+    // Thinking 以任务记录为唯一事实源。新任务默认 off；用户在 Shell 显式切换后，
+    // resume 会恢复该选择，不继承 Pi 的全局或模型级隐式默认值。
+    "--thinking",
+    task.thinkingLevel,
     "--session-id",
     task.id,
     "--session-dir",
