@@ -32,6 +32,8 @@ export interface EvidenceRecord {
   actionKey: string | null;
   /** 结果身份；不同动作得到相同事实时可以共享同一指纹。 */
   fingerprint: string;
+  /** 同一事实由其它动作取得时登记的 actionKey。 */
+  actionAliases: string[];
   status: EvidenceStatus;
   summary: string;
   artifactRef: string | null;
@@ -50,7 +52,7 @@ export interface EvidenceRecord {
 /** EvidenceStore.capture 的输入；ID、时间和 schema 由存储层统一生成。 */
 export type EvidenceCandidate = Omit<
   EvidenceRecord,
-  "schemaVersion" | "id" | "taskId" | "createdAt"
+  "schemaVersion" | "id" | "taskId" | "actionAliases" | "createdAt"
 >;
 
 /** 一次固定检查的可审计记录。 */

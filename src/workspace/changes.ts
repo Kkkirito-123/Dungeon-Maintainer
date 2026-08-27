@@ -64,7 +64,7 @@ export async function syncWorktreeChanges(
   task.reversePatchPath = null;
 
   if (evidence) {
-    await evidence.invalidatePaths(paths);
+    await evidence.invalidatePaths(paths, worktreeHash);
     const proposed = (await evidence.active("claim"))
       .filter((record) => record.metadata.finishStatus === "proposed")
       .at(-1);

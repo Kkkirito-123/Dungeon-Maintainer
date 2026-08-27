@@ -12,8 +12,8 @@ async function typescriptFiles(directory: URL): Promise<URL[]> {
   return output;
 }
 
-describe("V2 启动与 Extension 职责分区", () => {
-  it("app.ts 保持兼容门面，启动副作用归属 src/app 专用模块", async () => {
+describe("1.0 启动与 Extension 职责分区", () => {
+  it("app.ts 保持轻量公开入口，启动副作用归属 src/app 专用模块", async () => {
     const appFacade = await readFile(
       new URL("../../src/app.ts", import.meta.url),
       "utf8",

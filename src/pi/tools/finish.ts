@@ -173,6 +173,88 @@ function assertExpectedBoolean(
   }
 }
 
+function metadataText(
+  metadata: Record<string, string | number | boolean | null>,
+  key: string,
+): string | null {
+  const value = metadata[key];
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+/**
+ * 把已通过固定验证的结果保存为同项目后续任务可搜索的低敏方案。
+ *
+ * Solution 索引是诊断加速层，不是 ready_to_apply 的权威门禁；索引写入失败只记录
+ * 低敏事件，不能推翻已经通过的代码验证或重新开放写权限。
+ */
+async function saveVerifiedSolution(
+  context: FinishToolContext,
+  summary: string,
+  verification: VerificationResult,
+  terminalClaimId: string,
+): Promise<string | null> {
+  try {
+    const active = await context.evidence.active();
+    const proposal = active.filter((record) => (
+      record.kind === "claim" && record.metadata.finishStatus === "proposed"
+    )).at(-1) ?? null;
+    const reproduction = active.filter((record) => record.kind === "reproduction").at(-1) ?? null;
+    const planTitle = proposal ? metadataText(proposal.metadata, "planTitle") : null;
+    const planSteps = proposal ? metadataText(proposal.metadata, "planSteps") : null;
+    const planVerification = proposal ? metadataText(proposal.metadata, "verification") : null;
+    const relatedPaths = [...new Set(verification.changedPaths)].sort();
+    const evidenceRefs = [...new Set([
+      terminalClaimId,
+      ...(proposal ? [proposal.id] : []),
+      ...active.filter((record) => (
+        record.kind === "reproduction"
+        || (
+          (record.kind === "change"
+            || record.kind === "check"
+            || record.kind === "verification")
+          && record.worktreeHash === verification.record.worktreeHash
+        )
+      )).map((record) => record.id),
+    ])].slice(0, 32);
+    const id = createHash("sha256").update([
+      context.evidence.projectKey,
+      verification.record.worktreeHash,
+      ...relatedPaths,
+    ].join("\0")).digest("hex").slice(0, 16);
+    await context.evidence.saveSolution({
+      id,
+      taskId: context.task.id,
+      title: planTitle ?? summary,
+      symptom: reproduction?.summary ?? context.task.objective,
+      rootCause: proposal?.summary ?? summary,
+      planTitle: planTitle ?? summary,
+      steps: planSteps?.split("\n").filter(Boolean) ?? [summary],
+      verification: planVerification ?? [
+        "固定检查：" + verification.record.checkIds.join(", "),
+        "重放：" + (verification.record.replayPassed ? "通过" : "未通过"),
+      ].join("；"),
+      relatedPaths,
+      evidenceRefs,
+      buggyHashes: { ...context.task.baseHashes },
+      fixedHashes: { worktree: verification.record.worktreeHash },
+      createdAt: verification.record.verifiedAt,
+    });
+    await appendEvent(context.store, context.task.id, "evidence.solution_saved", {
+      outcome: "saved",
+      solutionId: id,
+      pathCount: relatedPaths.length,
+      evidenceCount: evidenceRefs.length,
+    }).catch(() => undefined);
+    return id;
+  } catch {
+    await appendEvent(context.store, context.task.id, "evidence.solution_saved", {
+      outcome: "failed",
+      reasonCode: "solution-index-write-failed",
+    }).catch(() => undefined);
+    return null;
+  }
+}
+
 /**
  * proposed 阶段的证据软提示。
  *
@@ -217,11 +299,11 @@ export function registerFinishTool(
     name: "finish",
     label: "提交结论",
     description: "保存诊断、提交一次性完整修复方案、记录复现；result 会自动完成固定验证，但不会执行 /apply。",
-    promptSnippet: "修改前用 proposed 提交病因和完整方案；完成后用 result 保存结果",
+    promptSnippet: "可用 proposed 预先说明多文件方案；完成后用 result 保存结果",
     promptGuidelines: [
       "运行时问题复现成功后，以 reproduced 保存语义动作及至少一项修复后应满足的结构化结果断言；不要把当前故障值当成断言。",
       "首次 query-accepted 已经证明 stageIndex 未按期望推进时立即 reproduced，不要再追加 input_sql/query 确认；阶段目标使用 minStageIndex。",
-      "用户要求修复时，定位病因后必须以 proposed 一次提交完整步骤与验证方法；批准后立即执行，不再询问。",
+      "用户要求修复时，定位病因后可直接 patch/write；首次写入会自动申请精确文件权限。只有需要提前说明多文件方案时才用 proposed。",
       "代码修改后用 result；工具会自动运行当前代码的固定检查、刷新重放和隐藏断言，失败时继续修复。",
       "确认无法继续且原因客观时才用 blocked。",
     ],
@@ -306,6 +388,7 @@ export function registerFinishTool(
       let planVerification: string | undefined;
       let planAllowedPaths: string[] | undefined;
       let evidenceWarnings: string[] = [];
+      let savedSolutionId: string | null = null;
       if (input.status === "proposed" && input.plan) {
         const title = plain(input.plan.title, 160);
         const steps = input.plan.steps.map((step) => plain(
@@ -415,18 +498,29 @@ export function registerFinishTool(
         await context.store.closeWriteScope(context.task);
       }
 
+      let terminalClaimId: string | null = null;
       if (input.status === "result" || input.status === "blocked" || input.status === "diagnosed") {
         const terminalLinks = input.status === "result"
           ? (await context.evidence.active("verification")).map((record) => record.id)
           : (await context.evidence.active())
             .filter((record) => record.kind !== "claim")
             .map((record) => record.id);
-        await context.evidence.capture(claimEvidence({
+        const terminalClaim = await context.evidence.capture(claimEvidence({
           status: input.status,
           summary,
           risk,
           links: terminalLinks,
         }));
+        terminalClaimId = terminalClaim.record.id;
+      }
+
+      if (input.status === "result" && verification && terminalClaimId) {
+        savedSolutionId = await saveVerifiedSolution(
+          context,
+          summary,
+          verification,
+          terminalClaimId,
+        );
       }
 
       if (input.status === "blocked" && context.task.state !== "blocked") {
@@ -438,6 +532,7 @@ export function registerFinishTool(
         status: input.status,
         reproductionId,
         verificationPassed: verification !== null,
+        solutionSaved: savedSolutionId !== null,
       });
       const visibleConclusion = [
         summary,
@@ -465,10 +560,12 @@ export function registerFinishTool(
             summary,
             planSummary,
             "风险：" + risk,
-            evidenceWarnings.length > 0
+            executionApproved !== true && evidenceWarnings.length > 0
               ? "证据提示：" + evidenceWarnings.join(" ")
               : "",
-            executionApproved === true ? "用户已批准方案；立即完整执行，不要再次询问。" : "",
+            executionApproved === true
+              ? "用户已批准方案，调查阶段结束；立即在 allowedPaths 内使用 patch/write 完整执行，不要再次询问或遍历 evidence。只有缺少精确 oldText/baseHash 时才定向回读对应文件一次。"
+              : "",
             executionApproved === false ? "用户未批准执行；worktree 保持不变。" : "",
             reproductionId ? "复现：" + reproductionId : "",
             context.task.state === "ready_to_apply"

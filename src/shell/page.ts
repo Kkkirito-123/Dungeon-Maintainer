@@ -554,10 +554,11 @@ export function renderShellPage(): string {
         document.getElementById('approval-title').textContent = request.title;
         document.getElementById('approval-message').textContent = request.message;
         const isExecutionPlan = request.title === '是否执行完整修复方案';
+        const isWriteApproval = request.title === '是否允许本次代码修改';
         const isReadOnlyEditor = request.kind === 'editor';
         document.getElementById('approval-cancel').hidden = isReadOnlyEditor;
-        document.getElementById('approval-cancel').textContent = isExecutionPlan ? '暂不执行' : '取消';
-        document.getElementById('approval-ok').textContent = isReadOnlyEditor ? '关闭' : isExecutionPlan ? '执行完整方案' : '确认';
+        document.getElementById('approval-cancel').textContent = isExecutionPlan || isWriteApproval ? '暂不执行' : '取消';
+        document.getElementById('approval-ok').textContent = isReadOnlyEditor ? '关闭' : isExecutionPlan ? '执行完整方案' : isWriteApproval ? '允许修改' : '确认';
         approval.showModal();
       };
       document.getElementById('approval-ok').addEventListener('click', () => {
@@ -628,7 +629,7 @@ export function renderShellPage(): string {
         else if (data.type === 'activity') showActivity(data);
         else if (data.type === 'notice') showNotice(data.level, data.text);
         else if (data.type === 'approval') showApproval(data.request);
-        else if (data.type === 'game') { gameState.textContent = data.state === 'ready' ? '游戏已就绪 · Playtest Bridge v2' : '游戏状态：' + data.state; if (data.gameUrl && frame.src !== data.gameUrl) { frame.src = data.gameUrl; frame.hidden = false; empty.hidden = true; } }
+        else if (data.type === 'game') { gameState.textContent = data.state === 'ready' ? '游戏已就绪 · Playtest Bridge' : '游戏状态：' + data.state; if (data.gameUrl && frame.src !== data.gameUrl) { frame.src = data.gameUrl; frame.hidden = false; empty.hidden = true; } }
         else if (data.type === 'closed') showNotice('info', 'Pi 会话已结束，任务证据仍保留。');
       };
       const events = new EventSource(endpoint('/events'));

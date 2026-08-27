@@ -16,6 +16,8 @@
 
 import { readdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { taskRecordIsCurrent } from "../task/store.js";
+import type { TaskRecord } from "../task/types.js";
 import { metric, scenario, type BenchmarkScenario } from "./types.js";
 
 interface SessionAggregate {
@@ -46,11 +48,11 @@ interface SessionAggregate {
 }
 
 interface TaskSummary {
-  changedPaths: unknown[];
+  changedPaths: string[];
   checks: Array<{ status?: unknown }>;
   reproductions: unknown[];
-  conclusion: unknown;
-  state: unknown;
+  conclusion: string | null;
+  state: TaskRecord["state"];
 }
 
 interface EventSummary {
@@ -408,7 +410,10 @@ async function readEvidenceSummary(taskDirectory: string): Promise<EvidenceSumma
 
 async function readTaskSummary(taskDirectory: string): Promise<TaskSummary> {
   const value: unknown = JSON.parse(await readFile(join(taskDirectory, "task.json"), "utf8"));
-  if (!isRecord(value)) throw new Error("benchmark task.json 不是对象");
+  const taskId = isRecord(value) && typeof value.id === "string" ? value.id : "";
+  if (!taskRecordIsCurrent(value, taskId)) {
+    throw new Error("benchmark task.json 不是当前任务格式");
+  }
   const evidence = await readEvidenceSummary(taskDirectory);
   const active = evidence.filter((record) => record.status === "active");
   const checks = active
@@ -423,14 +428,10 @@ async function readTaskSummary(taskDirectory: string): Promise<TaskSummary> {
     && record.metadata.finishStatus === "result"
   ));
   return {
-    changedPaths: Array.isArray(value.changedPaths) ? value.changedPaths : [],
-    checks: checks.length > 0
-      ? checks
-      : Array.isArray(value.checks) ? value.checks.filter(isRecord) : [],
-    reproductions: reproductions.length > 0
-      ? reproductions
-      : Array.isArray(value.reproductions) ? value.reproductions : [],
-    conclusion: claims.length > 0 ? "result" : value.conclusion,
+    changedPaths: value.changedPaths,
+    checks,
+    reproductions,
+    conclusion: claims.length > 0 ? "result" : null,
     state: value.state,
   };
 }

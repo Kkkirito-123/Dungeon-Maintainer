@@ -52,6 +52,102 @@ export interface ReproductionRecord {
   createdAt: string;
 }
 
+const REPRODUCTION_RECORD_KEYS = [
+  "schemaVersion",
+  "id",
+  "title",
+  "expected",
+  "actual",
+  "evidence",
+  "actions",
+  "assertions",
+  "createdAt",
+] as const;
+
+function hasExactKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+): boolean {
+  return Object.keys(value).length === keys.length
+    && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function isTraceEntry(value: unknown): value is SemanticTraceEntry {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const entry = value as Record<string, unknown>;
+  if (
+    !hasExactKeys(entry, ["sequence", "at", "action", "arguments", "ok", "summary"])
+    || !Number.isInteger(entry.sequence)
+    || (entry.sequence as number) < 1
+    || typeof entry.at !== "string"
+    || typeof entry.ok !== "boolean"
+    || typeof entry.summary !== "string"
+    || !entry.arguments
+    || typeof entry.arguments !== "object"
+    || Array.isArray(entry.arguments)
+  ) return false;
+  const argumentsRecord = entry.arguments as Record<string, unknown>;
+  if (entry.action === "look" || entry.action === "query") {
+    return hasExactKeys(argumentsRecord, []);
+  }
+  if (entry.action === "go") {
+    return hasExactKeys(argumentsRecord, ["target", "maxSteps"])
+      && (argumentsRecord.target === "objective" || argumentsRecord.target === "frontier")
+      && Number.isInteger(argumentsRecord.maxSteps)
+      && (argumentsRecord.maxSteps as number) >= 1
+      && (argumentsRecord.maxSteps as number) <= 64;
+  }
+  if (entry.action === "use") {
+    return hasExactKeys(argumentsRecord, ["actionId"])
+      && typeof argumentsRecord.actionId === "string"
+      && /^[a-zA-Z0-9:_-]{1,64}$/u.test(argumentsRecord.actionId);
+  }
+  if (entry.action === "input-sql") {
+    return hasExactKeys(argumentsRecord, ["inputLength"])
+      && Number.isInteger(argumentsRecord.inputLength)
+      && (argumentsRecord.inputLength as number) >= 1
+      && (argumentsRecord.inputLength as number) <= 16 * 1024;
+  }
+  return false;
+}
+
+function isCurrentAssertions(value: unknown): value is ReproductionAssertions {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  try {
+    const parsed = reproductionAssertions(value);
+    return Object.entries(value).every(([key, item]) => (
+      JSON.stringify(item) === JSON.stringify((parsed as Record<string, unknown>)[key])
+    ));
+  } catch {
+    return false;
+  }
+}
+
+function isReproductionRecord(
+  value: unknown,
+  reproductionId: string,
+): value is ReproductionRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return hasExactKeys(record, REPRODUCTION_RECORD_KEYS)
+    && record.schemaVersion === 2
+    && record.id === reproductionId
+    && typeof record.title === "string"
+    && Boolean(record.title)
+    && typeof record.expected === "string"
+    && Boolean(record.expected)
+    && typeof record.actual === "string"
+    && Boolean(record.actual)
+    && Array.isArray(record.evidence)
+    && record.evidence.every((item) => typeof item === "string")
+    && Array.isArray(record.actions)
+    && record.actions.length > 0
+    && record.actions.every(isTraceEntry)
+    && record.actions.some((entry) => entry.action !== "look")
+    && isCurrentAssertions(record.assertions)
+    && typeof record.createdAt === "string";
+}
+
 /** 判断复现是否依赖仅存在当前进程内存中的 SQL 正文。 */
 export function reproductionNeedsSqlRefresh(record: ReproductionRecord): boolean {
   return record.actions.some((entry) => entry.action === "input-sql");
@@ -384,18 +480,8 @@ export async function readActiveReproduction(
     throw new Error("活动复现路径已脱离当前任务目录");
   }
   const value: unknown = JSON.parse(await readFile(expectedPath, "utf8"));
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("复现记录不是有效对象");
+  if (!isReproductionRecord(value, reproductionId)) {
+    throw new Error("复现记录格式、版本或 ID 非法");
   }
-  const candidate = value as Record<string, unknown>;
-  if (candidate.schemaVersion === 1) {
-    throw new Error("旧 schema v1 复现缺少结构化断言；请重新复现");
-  }
-  if (candidate.schemaVersion !== 2 || candidate.id !== reproductionId) {
-    throw new Error("复现记录版本或 ID 非法");
-  }
-  return {
-    ...(value as ReproductionRecord),
-    assertions: reproductionAssertions(candidate.assertions),
-  };
+  return value;
 }

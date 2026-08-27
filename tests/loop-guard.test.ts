@@ -45,7 +45,7 @@ describe("领域化循环门禁", () => {
     assert.equal(guard.evaluateAction(inspectState).kind, "block");
   });
 
-  it("在尝试形成 A-B-A-B 的第四步前冻结两条路线", () => {
+  it("路线交替不影响新的调查动作", () => {
     const guard = new LoopGuard();
     const routeA = action("route-a", { query: "state" });
     const routeB = action("route-b", { path: "src/game.ts" });
@@ -54,18 +54,17 @@ describe("领域化循环门禁", () => {
     recordWithoutEvidence(guard, routeA, { result: "A2" });
 
     assert.deepEqual(guard.evaluateAction(routeB), {
-      kind: "block",
-      reason: "alternating_route",
+      kind: "allow",
       noProgressCount: 3,
     });
     assert.equal(guard.recentOutcomes.length, 3);
-    assert.equal(guard.evaluateAction(routeA).kind, "block");
-    assert.equal(guard.evaluateAction(routeB).kind, "block");
+    assert.equal(guard.evaluateAction(routeA).kind, "allow");
+    assert.equal(guard.evaluateAction(routeB).kind, "allow");
   });
 
-  it("五次无进展只触发一次策略重置，八次无进展进入硬停止", () => {
+  it("累计无进展次数只作诊断，不冻结不同动作", () => {
     const guard = new LoopGuard();
-    for (let index = 0; index < 5; index += 1) {
+    for (let index = 0; index < 12; index += 1) {
       const suffix = String(index);
       recordWithoutEvidence(
         guard,
@@ -73,31 +72,12 @@ describe("领域化循环门禁", () => {
         { result: index },
       );
     }
-
-    const sixth = action("route-5", { query: "query-5" });
-    assert.deepEqual(guard.evaluateAction(sixth), {
-      kind: "strategy_reset",
-      reason: "no_progress",
-      noProgressCount: 5,
+    assert.deepEqual(guard.evaluateAction(action("route-12", { query: "query-12" })), {
+      kind: "allow",
+      noProgressCount: 12,
     });
-    assert.equal(guard.noProgressCount, 5);
-    assert.equal(guard.recentOutcomes.length, 5);
-    recordWithoutEvidence(guard, sixth, { result: 5 });
-    recordWithoutEvidence(guard, action("route-6", { query: "query-6" }), { result: 6 });
-    recordWithoutEvidence(guard, action("route-7", { query: "query-7" }), { result: 7 });
-
-    assert.deepEqual(guard.evaluateAction(action("route-8", { query: "query-8" })), {
-      kind: "hard_stop",
-      reason: "no_progress",
-      noProgressCount: 8,
-    });
-    assert.equal(guard.noProgressCount, 8);
+    assert.equal(guard.noProgressCount, 12);
     assert.equal(guard.recentOutcomes.length, 8);
-    assert.equal(guard.evaluateAction({
-      toolName: "finish",
-      input: { status: "result" },
-      route: { status: "result" },
-    }).kind, "allow");
   });
 
   it("EvidenceStore revision 本身不算进展，只有显式领域进展会解除冻结", () => {
@@ -139,7 +119,7 @@ describe("领域化循环门禁", () => {
     assert.equal(guard.noProgressCount, 0);
   });
 
-  it("同一 worktree 和搜索路线换 query 仍在第三次执行前阻止", () => {
+  it("同一 worktree 和搜索路线换 query 仍允许模型继续调查", () => {
     const guard = new LoopGuard();
     const route = { action: "search", scope: "devtools", worktreeHash: "worktree-v1" };
     const first = {
@@ -161,8 +141,7 @@ describe("领域化循环门禁", () => {
     recordWithoutEvidence(guard, second, { matches: 12 });
 
     assert.deepEqual(guard.evaluateAction(third), {
-      kind: "block",
-      reason: "route_no_progress",
+      kind: "allow",
       noProgressCount: 2,
     });
 
@@ -191,7 +170,6 @@ describe("领域化循环门禁", () => {
         { value: index },
       );
     }
-    assert.equal(guard.evaluateAction(action("strategy-reset", { query: "reset" })).kind, "strategy_reset");
     const progress = action("progress-route", { query: "progress" });
     assert.equal(guard.evaluateAction(progress).kind, "allow");
     assert.equal(guard.recordOutcome({
@@ -217,20 +195,4 @@ describe("领域化循环门禁", () => {
     assert.equal(guard.evaluateAction(action("first-0", { query: "first-0" })).kind, "allow");
   });
 
-  it("新 Episode 清除 hard stop 计数但保留已冻结动作，强制 recover 换路线", () => {
-    const guard = new LoopGuard();
-    const repeated = { toolName: "inspect", input: { action: "status" } };
-    for (let index = 0; index < 2; index += 1) {
-      assert.equal(guard.evaluateAction(repeated).kind, "allow");
-      guard.recordOutcome({ action: repeated, result: { same: true }, evidenceRevision: 0 });
-    }
-    assert.equal(guard.evaluateAction(repeated).kind, "block");
-    guard.beginEpisode();
-    assert.equal(guard.noProgressCount, 0);
-    assert.equal(guard.evaluateAction(repeated).kind, "block");
-    assert.equal(guard.evaluateAction({
-      toolName: "inspect",
-      input: { action: "search", query: "different-route" },
-    }).kind, "allow");
-  });
 });

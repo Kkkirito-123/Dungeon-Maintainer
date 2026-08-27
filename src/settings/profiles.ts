@@ -11,7 +11,7 @@ import { join } from "node:path";
 import type { MaintainerConfig } from "../config.js";
 import { normalizeBaseUrl } from "../config.js";
 
-/** 首版唯一支持的 OpenAI-compatible 模型档案。 */
+/** 1.0 支持的 OpenAI-compatible 模型档案。 */
 export interface ModelProfile {
   id: string;
   name: string;
@@ -25,6 +25,24 @@ export interface ModelProfile {
 interface ProfileDocument {
   schemaVersion: 1;
   profiles: ModelProfile[];
+}
+
+const MODEL_PROFILE_KEYS = [
+  "id",
+  "name",
+  "baseUrl",
+  "modelId",
+  "contextWindow",
+  "maxOutputTokens",
+  "reasoning",
+] as const;
+
+function hasExactKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+): boolean {
+  return Object.keys(value).length === keys.length
+    && keys.every((key) => Object.hasOwn(value, key));
 }
 
 function boundedInteger(
@@ -45,6 +63,9 @@ export function normalizeModelProfile(value: unknown): ModelProfile {
     throw new Error("模型档案必须是 JSON 对象");
   }
   const record = value as Record<string, unknown>;
+  if (!hasExactKeys(record, MODEL_PROFILE_KEYS)) {
+    throw new Error("模型档案字段不是当前格式");
+  }
   const id = typeof record.id === "string" ? record.id.trim().toLowerCase() : "";
   const name = typeof record.name === "string" ? record.name.trim() : "";
   const modelId = typeof record.modelId === "string" ? record.modelId.trim() : "";
@@ -55,6 +76,9 @@ export function normalizeModelProfile(value: unknown): ModelProfile {
   if (!name || name.length > 80 || !modelId || modelId.length > 160) {
     throw new Error("模型档案名称或模型 ID 无效");
   }
+  if (typeof record.reasoning !== "boolean") {
+    throw new Error("模型档案 reasoning 必须是布尔值");
+  }
   return {
     id,
     name,
@@ -62,8 +86,21 @@ export function normalizeModelProfile(value: unknown): ModelProfile {
     modelId,
     contextWindow: boundedInteger(record.contextWindow, "上下文窗口", 8_000, 2_000_000),
     maxOutputTokens: boundedInteger(record.maxOutputTokens, "输出上限", 256, 64_000),
-    reasoning: record.reasoning === true,
+    reasoning: record.reasoning,
   };
+}
+
+function validateProfiles(value: unknown, requireDefault: boolean): ModelProfile[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error("模型档案列表必须是非空数组");
+  }
+  const profiles = value.map(normalizeModelProfile);
+  const ids = new Set(profiles.map((profile) => profile.id));
+  if (ids.size !== profiles.length) throw new Error("模型档案 ID 不能重复");
+  if (requireDefault && !ids.has("default")) {
+    throw new Error("模型档案文档缺少 default");
+  }
+  return profiles;
 }
 
 /** 从开发环境配置生成始终可用的默认档案。 */
@@ -79,7 +116,7 @@ export function defaultModelProfile(config: MaintainerConfig): ModelProfile {
   };
 }
 
-/** Pi Provider 使用的稳定 ID；默认档案保留原兼容 ID。 */
+/** Pi Provider 使用的稳定 ID；默认档案使用产品基础 ID。 */
 export function profileProviderId(profileId: string): string {
   return profileId === "default"
     ? "dungeon-maintainer"
@@ -120,14 +157,13 @@ export class ModelProfileStore {
       throw new Error("模型档案文档无效");
     }
     const document = raw as Record<string, unknown>;
-    if (document.schemaVersion !== 1 || !Array.isArray(document.profiles)) {
+    if (
+      !hasExactKeys(document, ["schemaVersion", "profiles"])
+      || document.schemaVersion !== 1
+    ) {
       throw new Error("模型档案 schemaVersion 无效");
     }
-    const profiles = document.profiles.map(normalizeModelProfile);
-    if (!profiles.some((profile) => profile.id === "default")) {
-      profiles.unshift(this.fallback);
-    }
-    return profiles;
+    return validateProfiles(document.profiles, true);
   }
 
   /** 新增或替换单个非敏感档案并原子保存。 */
@@ -158,7 +194,5 @@ export function profilesFromEnvironment(
   const text = environment.DUNGEON_MAINTAINER_MODEL_PROFILES?.trim();
   if (!text) return [fallback];
   const value: unknown = JSON.parse(text);
-  if (!Array.isArray(value)) throw new Error("模型档案环境不是数组");
-  const profiles = value.map(normalizeModelProfile);
-  return profiles.length > 0 ? profiles : [fallback];
+  return validateProfiles(value, false);
 }

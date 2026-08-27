@@ -18,7 +18,6 @@ import { resolvePiCliPath } from "../app/pi-process.js";
 import { PiRpcProcess } from "../pi/rpc-process.js";
 import { PI_ORIGINAL_PROVIDER_ID } from "./pi-original-extension.js";
 import { requestWithDeadline, SESSION_STATS_TIMEOUT_MS } from "./rpc-timeout.js";
-import { assertFlashBenchmarkModel } from "./model-policy.js";
 import type { TaskState } from "../task/types.js";
 
 /** 所有真实 Pi Profile 共享的低敏运行指标。 */
@@ -46,14 +45,28 @@ export interface PiRunMetrics {
   readonly inspectExecutions: number;
   /** inspect 因相同有效版本只返回短回执的次数。 */
   readonly inspectReceiptHits: number;
+  /** Inspect 执行后发现结果指纹已存在并登记 action alias 的次数。 */
+  readonly semanticEvidenceHits: number;
+  /** 每轮历史方案搜索至少命中一个候选的次数。 */
+  readonly solutionLookupHits: number;
   /** 真正执行的一次性源码 bundle 数。 */
   readonly inspectBundles: number;
   /** bundle 实际返回的源码窗口总数。 */
   readonly inspectBundleWindows: number;
   /** inspect 执行失败或被循环门禁阻止的次数。 */
   readonly inspectFailures: number;
+  /** Inspect 搜索阶段命中的不同候选文件数累计。 */
+  readonly inspectCandidateFiles: number;
+  /** Bundle 最终展示源码窗口覆盖的不同文件数累计。 */
+  readonly inspectSelectedFiles: number;
   /** 区域搜索从主区域扩展到相邻区域或仓库的次数。 */
   readonly routedSearchExpansions: number;
+  /** 实际使用功能 primary/adjacent/shared/fallback 路由的 Inspect execution 数。 */
+  readonly featureRoutedInspectCalls: number;
+  readonly featureRoutePrimaryExecutions: number;
+  readonly featureRouteAdjacentExecutions: number;
+  readonly featureRouteSharedExecutions: number;
+  readonly featureRouteFallbackExecutions: number;
   /** 实际使用楼层三级路由的 Inspect execution 数。 */
   readonly floorRoutedInspectCalls: number;
   /** 楼层路由实际访问的当前层与相邻层 scope 总数。 */
@@ -75,6 +88,12 @@ export interface PiRunMetrics {
   readonly cacheReadTokens: number;
   readonly cacheWriteTokens: number;
   readonly totalTokens: number;
+  /** 输入 Prompt 中来自缓存读取的比例，范围 0..1。 */
+  readonly cacheHitRate: number;
+  /** 未缓存输入、缓存写入与输出之和。 */
+  readonly uncachedTokens: number;
+  /** Provider 上下文整形省略的 assistant/tool 正文字符数。 */
+  readonly assistantTextOmittedCharacters: number;
   readonly contextTokens: number | null;
   readonly contextPercent: number | null;
   readonly failureCode: string | null;
@@ -115,9 +134,6 @@ export interface PiRunOutcome {
   readonly workflowClosure: PiWorkflowClosure;
   readonly diagnostics: PiRunDiagnostics;
 }
-
-/** 兼容既有调用方的原版 Pi 指标名称。 */
-export type PiOriginalRunMetrics = PiRunMetrics;
 
 /** 原版 Pi 单次运行参数。 */
 export interface PiOriginalRunOptions {
@@ -218,7 +234,6 @@ export async function runPiOriginal(
     mkdir(configDirectory, { recursive: true }),
   ]);
   const config = loadConfig();
-  assertFlashBenchmarkModel(config.model);
   const apiKey = requireApiKey(config);
   let turns = 0;
   let toolCalls = 0;
@@ -343,10 +358,19 @@ export async function runPiOriginal(
     inspectCalls: 0,
     inspectExecutions: 0,
     inspectReceiptHits: 0,
+    semanticEvidenceHits: 0,
+    solutionLookupHits: 0,
     inspectBundles: 0,
     inspectBundleWindows: 0,
     inspectFailures: 0,
+    inspectCandidateFiles: 0,
+    inspectSelectedFiles: 0,
     routedSearchExpansions: 0,
+    featureRoutedInspectCalls: 0,
+    featureRoutePrimaryExecutions: 0,
+    featureRouteAdjacentExecutions: 0,
+    featureRouteSharedExecutions: 0,
+    featureRouteFallbackExecutions: 0,
     floorRoutedInspectCalls: 0,
     floorScopesVisited: 0,
     floorRouteCurrentExecutions: 0,
@@ -366,6 +390,12 @@ export async function runPiOriginal(
     cacheReadTokens: tokens.cacheRead ?? 0,
     cacheWriteTokens: tokens.cacheWrite ?? 0,
     totalTokens: tokens.total ?? 0,
+    cacheHitRate: (tokens.input ?? 0) + (tokens.cacheRead ?? 0) + (tokens.cacheWrite ?? 0) > 0
+      ? (tokens.cacheRead ?? 0)
+        / ((tokens.input ?? 0) + (tokens.cacheRead ?? 0) + (tokens.cacheWrite ?? 0))
+      : 0,
+    uncachedTokens: (tokens.input ?? 0) + (tokens.cacheWrite ?? 0) + (tokens.output ?? 0),
+    assistantTextOmittedCharacters: 0,
     contextTokens: typeof contextUsage.tokens === "number" ? contextUsage.tokens : null,
     contextPercent: typeof contextUsage.percent === "number" ? contextUsage.percent : null,
     failureCode,

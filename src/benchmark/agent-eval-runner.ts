@@ -35,9 +35,13 @@ import {
 import { GameBrowser } from "../game/browser.js";
 import { GameDriver } from "../game/driver.js";
 import { startGameServer, type GameServer } from "../game/server.js";
+import { loadArchitectureMap, routeArchitecture } from "../inspection/architecture-map.js";
 import {
+  benchmarkRunIdentityIsCurrent,
+  collectBenchmarkRunIdentity,
   collectBenchmarkProvenance,
   type BenchmarkProvenance,
+  type BenchmarkRunIdentity,
 } from "./provenance.js";
 import {
   classifyAgentEvalPlan,
@@ -47,15 +51,16 @@ import {
 } from "./agent-eval-oracle.js";
 
 const executeFile = promisify(execFile);
-export const AGENT_EVAL_ORACLE_VERSION = "oracle-v3-exact-final-state";
+export const AGENT_EVAL_ORACLE_VERSION = "oracle-exact-final-state";
 
 /** 预检成功后可供同一矩阵正式运行复用的低敏证书。 */
 export interface AgentEvalPreflightCertificate {
-  readonly schemaVersion: number;
+  readonly schemaVersion: 2;
   readonly fixtureId: string;
   readonly buggyHead: string;
   readonly dependencyKey: string;
-  readonly oracleVersion: string;
+  readonly oracleVersion: typeof AGENT_EVAL_ORACLE_VERSION;
+  readonly runFingerprint: string;
   readonly beforeOracleMatched: boolean;
   readonly cleanAfterOracleMatched: boolean;
 }
@@ -68,8 +73,9 @@ export interface AgentEvalDependencyLease {
 
 /** 零模型预检结果；不包含 SQL、源码、模型正文或绝对临时路径。 */
 export interface AgentEvalPreflightResult {
-  readonly schemaVersion: 2;
+  readonly schemaVersion: 3;
   readonly fixtureId: string;
+  readonly runFingerprint: string | null;
   readonly status: "passed" | "failed" | "infra_error";
   readonly initialFailureMatched: boolean;
   readonly cleanBaselineMatched: boolean;
@@ -86,23 +92,27 @@ export interface AgentEvalPreflightResult {
 /** 预检参数；依赖仓库必须由调用方显式提供，避免评测期间联网安装。 */
 export interface AgentEvalPreflightOptions {
   readonly fixtureId: string;
+  /** 仅供内部 fixture 单元测试；正式 CLI 始终读取游戏 Adapter。 */
   readonly fixtureRoot?: string;
   readonly dependencyRepoRoot: string;
   readonly archiveRoot?: string;
   readonly timeoutMs?: number;
+  /** 矩阵预先冻结的运行身份；单题调用省略时由当前源码和模型配置生成。 */
+  readonly runIdentity?: BenchmarkRunIdentity;
 }
 
 /** 游戏修复 Eval 当前支持的被测 Profile。 */
 export type GameRepairEvalProfile = "pi-original" | "maintainer-current";
 
 /** 一次真实模型游戏修复 Eval 的统一低敏结果。 */
-export interface GameRepairEvalResultV5 {
+export interface GameRepairEvalResult {
   readonly schemaVersion: 5;
   readonly runId: string;
   readonly fixtureId: string;
   readonly profile: GameRepairEvalProfile;
   readonly repetition: number;
   readonly status: "passed" | "failed" | "infra_error";
+  readonly failureClass: "none" | "agent" | "oracle" | "infrastructure";
   readonly externalCorrectness: {
     readonly initialFailureMatched: boolean;
     readonly afterOracleMatched: boolean | null;
@@ -141,6 +151,7 @@ export interface GameRepairEvalResultV5 {
 /** 一次真实模型游戏修复 Eval 的参数。 */
 export interface GameRepairEvalOptions {
   readonly fixtureId: string;
+  /** 仅供内部 fixture 单元测试；正式 CLI 始终读取游戏 Adapter。 */
   readonly fixtureRoot?: string;
   readonly dependencyRepoRoot: string;
   readonly profile: GameRepairEvalProfile;
@@ -148,6 +159,8 @@ export interface GameRepairEvalOptions {
   readonly archiveRoot?: string;
   readonly timeoutMs?: number;
   readonly preflightCertificate?: AgentEvalPreflightCertificate;
+  /** 与预检证书、checkpoint 和最终矩阵汇总共享的运行身份。 */
+  readonly runIdentity?: BenchmarkRunIdentity;
   /** 仅转发当前模型的可见文本和工具名，不参与判分或归档。 */
   readonly onLiveEvent?: (event: PiMaintainerLiveEvent) => void;
 }
@@ -175,37 +188,84 @@ async function materializeConfiguredAgentEvalFixture(options: {
   readonly dependencyRepoRoot: string;
   readonly destination: string;
   readonly variant?: "broken" | "clean";
-}): Promise<void> {
+}): Promise<string> {
   if (options.fixtureRoot) {
-    await materializeAgentEvalFixture({
+    const materialized = await materializeAgentEvalFixture({
       id: options.fixtureId,
       fixtureRoot: options.fixtureRoot,
       destination: options.destination,
       ...(options.variant ? { variant: options.variant } : {}),
     });
-    return;
+    return materialized.sourceFingerprint;
   }
-  await materializeAgentEvalFixtureFromGameAdapter({
+  const materialized = await materializeAgentEvalFixtureFromGameAdapter({
     id: options.fixtureId,
     gameRepositoryRoot: options.dependencyRepoRoot,
     destination: options.destination,
     ...(options.variant ? { variant: options.variant } : {}),
   });
+  return materialized.sourceFingerprint;
 }
 
-function validPreflightCertificate(input: {
-  readonly certificate: AgentEvalPreflightCertificate;
+/** 把最终失败归入互斥低敏类别，避免通过错误正文猜测根因。 */
+export function classifyGameRepairFailure(input: {
+  readonly status: GameRepairEvalResult["status"];
+  readonly agentFailureCode: string | null;
+  readonly workflowClosurePassed: boolean | null;
+}): GameRepairEvalResult["failureClass"] {
+  if (input.status === "passed") return "none";
+  if (input.status === "infra_error") return "infrastructure";
+  if (input.agentFailureCode !== null || input.workflowClosurePassed === false) return "agent";
+  return "oracle";
+}
+
+async function resolveBenchmarkRunIdentity(
+  testCase: AgentEvalCase,
+  provided: BenchmarkRunIdentity | undefined,
+): Promise<BenchmarkRunIdentity> {
+  const gameSourceFingerprint = testCase.sourceFingerprint;
+  if (provided) {
+    if (
+      !benchmarkRunIdentityIsCurrent(provided)
+      || provided.gameSourceFingerprint !== gameSourceFingerprint
+    ) {
+      throw new Error("benchmark-run-fingerprint-mismatch");
+    }
+    return provided;
+  }
+  return await collectBenchmarkRunIdentity({
+    gameSourceFingerprint,
+    oracleVersion: AGENT_EVAL_ORACLE_VERSION,
+  });
+}
+
+function assertMaterializedSourceFingerprint(
+  testCase: AgentEvalCase,
+  materializedSourceFingerprint: string,
+): void {
+  if (materializedSourceFingerprint !== testCase.sourceFingerprint) {
+    throw new Error("game-adapter-source-fingerprint-mismatch");
+  }
+}
+
+/** 验证预检证书确实来自当前矩阵的同一运行身份。 */
+export function validAgentEvalPreflightCertificate(input: {
+  readonly certificate: unknown;
   readonly fixtureId: string;
   readonly buggyHead: string;
   readonly dependencyRepoRoot: string;
+  readonly runFingerprint: string;
 }): boolean {
-  return input.certificate.schemaVersion === 1
-    && input.certificate.fixtureId === input.fixtureId
-    && input.certificate.buggyHead === input.buggyHead
-    && input.certificate.dependencyKey === dependencyKey(input.dependencyRepoRoot)
-    && input.certificate.oracleVersion === AGENT_EVAL_ORACLE_VERSION
-    && input.certificate.beforeOracleMatched
-    && input.certificate.cleanAfterOracleMatched;
+  if (!input.certificate || typeof input.certificate !== "object") return false;
+  const certificate = input.certificate as Record<string, unknown>;
+  return certificate.schemaVersion === 2
+    && certificate.fixtureId === input.fixtureId
+    && certificate.buggyHead === input.buggyHead
+    && certificate.dependencyKey === dependencyKey(input.dependencyRepoRoot)
+    && certificate.oracleVersion === AGENT_EVAL_ORACLE_VERSION
+    && certificate.runFingerprint === input.runFingerprint
+    && certificate.beforeOracleMatched === true
+    && certificate.cleanAfterOracleMatched === true;
 }
 
 /**
@@ -236,7 +296,7 @@ export function gameRepairJudgeOutcome(input: {
   readonly infrastructureFailure: boolean;
   readonly externalCorrectnessPassed: boolean;
   readonly workflowClosurePassed: boolean | null;
-}): GameRepairEvalResultV5["judgeOutcome"] {
+}): GameRepairEvalResult["judgeOutcome"] {
   const status = input.infrastructureFailure
     ? "infra_error"
     : input.externalCorrectnessPassed ? "passed" : "failed";
@@ -472,6 +532,31 @@ async function runBrowserOracle(input: {
   };
 }
 
+/** 预检遇到瞬时页面错误时，用全新 Vite/Chromium 上下文重试一次。 */
+async function runPreflightBrowserOracle(
+  input: Parameters<typeof runBrowserOracle>[0],
+): Promise<AgentEvalOracleRun> {
+  const first = await runBrowserOracle(input);
+  return first.browserErrorCount > 0 ? await runBrowserOracle(input) : first;
+}
+
+async function assertExpectedRouteFeatures(
+  repositoryRoot: string,
+  testCase: AgentEvalCase,
+): Promise<void> {
+  if (testCase.expected.expectedRouteFeatures.length === 0) return;
+  const loaded = await loadArchitectureMap(repositoryRoot);
+  const route = routeArchitecture(
+    loaded.map,
+    testCase.publicCase.prompt,
+    testCase.publicCase.startFloor,
+  );
+  const routed = new Set(route?.primaryFeatures.map((feature) => feature.id) ?? []);
+  if (testCase.expected.expectedRouteFeatures.some((featureId) => !routed.has(featureId))) {
+    throw new Error("benchmark-route-contract-mismatch");
+  }
+}
+
 async function gitOutput(repositoryRoot: string, args: readonly string[]): Promise<string> {
   const result = await executeFile("git", [...args], {
     cwd: repositoryRoot,
@@ -531,7 +616,7 @@ async function writeArchive(
 
 async function writeGameRepairArchive(
   archiveRoot: string | undefined,
-  result: GameRepairEvalResultV5,
+  result: GameRepairEvalResult,
 ): Promise<string | null> {
   if (!archiveRoot) return null;
   const directory = resolve(archiveRoot);
@@ -555,7 +640,7 @@ async function writeGameRepairArchive(
  */
 export async function runGameRepairEval(
   options: GameRepairEvalOptions,
-): Promise<GameRepairEvalResultV5> {
+): Promise<GameRepairEvalResult> {
   const startedAt = performance.now();
   const runId = randomUUID();
   let testCase: AgentEvalCase | null = null;
@@ -596,6 +681,7 @@ export async function runGameRepairEval(
     paused: options.profile === "maintainer-current" ? false : null,
   };
   let provenance: BenchmarkProvenance | null = null;
+  let runIdentity: BenchmarkRunIdentity | null = null;
   let piMetrics: PiRunMetrics = {
     status: "infra_error",
     durationMs: 0,
@@ -613,10 +699,19 @@ export async function runGameRepairEval(
     inspectCalls: 0,
     inspectExecutions: 0,
     inspectReceiptHits: 0,
+    semanticEvidenceHits: 0,
+    solutionLookupHits: 0,
     inspectBundles: 0,
     inspectBundleWindows: 0,
     inspectFailures: 0,
+    inspectCandidateFiles: 0,
+    inspectSelectedFiles: 0,
     routedSearchExpansions: 0,
+    featureRoutedInspectCalls: 0,
+    featureRoutePrimaryExecutions: 0,
+    featureRouteAdjacentExecutions: 0,
+    featureRouteSharedExecutions: 0,
+    featureRouteFallbackExecutions: 0,
     floorRoutedInspectCalls: 0,
     floorScopesVisited: 0,
     floorRouteCurrentExecutions: 0,
@@ -636,35 +731,42 @@ export async function runGameRepairEval(
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
     totalTokens: 0,
+    cacheHitRate: 0,
+    uncachedTokens: 0,
+    assistantTextOmittedCharacters: 0,
     contextTokens: null,
     contextPercent: null,
     failureCode: null,
   };
   try {
     testCase = await readConfiguredAgentEvalCase(options);
+    runIdentity = await resolveBenchmarkRunIdentity(testCase, options.runIdentity);
     const timeoutMs = Math.min(
       options.timeoutMs ?? testCase.publicCase.timeoutMs,
       GAME_REPAIR_TIMEOUT_MAX_MS,
     );
     temporaryRoot = await mkdtemp(join(tmpdir(), "dungeon-game-repair-eval-"));
     materializedRoot = join(temporaryRoot, "repository");
-    await materializeConfiguredAgentEvalFixture({
+    const materializedSourceFingerprint = await materializeConfiguredAgentEvalFixture({
       fixtureId: testCase.publicCase.fixtureId,
       dependencyRepoRoot: options.dependencyRepoRoot,
       ...(options.fixtureRoot ? { fixtureRoot: options.fixtureRoot } : {}),
       destination: materializedRoot,
     });
+    assertMaterializedSourceFingerprint(testCase, materializedSourceFingerprint);
+    await assertExpectedRouteFeatures(materializedRoot, testCase);
     dependencyLease = await provisionAgentEvalDependencies({
       repositoryRoot: materializedRoot,
       dependencyRepoRoot: options.dependencyRepoRoot,
     });
     const baseHead = (await gitOutput(materializedRoot, ["rev-parse", "HEAD"])).trim();
     if (options.preflightCertificate) {
-      if (!validPreflightCertificate({
+      if (!validAgentEvalPreflightCertificate({
         certificate: options.preflightCertificate,
         fixtureId: testCase.publicCase.fixtureId,
         buggyHead: baseHead,
         dependencyRepoRoot: options.dependencyRepoRoot,
+        runFingerprint: runIdentity.runFingerprint,
       })) throw new Error("preflight-certificate-mismatch");
       initialFailureMatched = true;
     } else {
@@ -691,6 +793,9 @@ export async function runGameRepairEval(
       repositoryRoot: materializedRoot,
       profile: options.profile,
       publicPrompt: testCase.publicCase.prompt,
+      gameSourceFingerprint: runIdentity.gameSourceFingerprint,
+      oracleVersion: AGENT_EVAL_ORACLE_VERSION,
+      runIdentity,
     });
     agentStarted = true;
     agentStartedAt = performance.now();
@@ -787,13 +892,18 @@ export async function runGameRepairEval(
     externalCorrectnessPassed,
     workflowClosurePassed,
   });
-  const resultWithoutArchive: GameRepairEvalResultV5 = {
+  const resultWithoutArchive: GameRepairEvalResult = {
     schemaVersion: 5,
     runId,
     fixtureId: options.fixtureId,
     profile: options.profile,
     repetition: options.repetition,
     status: judgeOutcome.status,
+    failureClass: classifyGameRepairFailure({
+      status: judgeOutcome.status,
+      agentFailureCode,
+      workflowClosurePassed,
+    }),
     externalCorrectness: {
       initialFailureMatched,
       afterOracleMatched,
@@ -851,26 +961,30 @@ export async function runAgentEvalPreflight(
   let initialFailureMatched = false;
   let cleanBaselineMatched = false;
   let certificate: AgentEvalPreflightCertificate | null = null;
+  let runIdentity: BenchmarkRunIdentity | null = null;
   let beforeDiagnostic: AgentEvalOracleDiagnostic | null = null;
   let cleanDiagnostic: AgentEvalOracleDiagnostic | null = null;
   let failureCode: string | null = null;
   let browserErrorCount = 0;
   try {
     testCase = await readConfiguredAgentEvalCase(options);
+    runIdentity = await resolveBenchmarkRunIdentity(testCase, options.runIdentity);
     const timeoutMs = options.timeoutMs ?? testCase.publicCase.timeoutMs;
     temporaryRoot = await mkdtemp(join(tmpdir(), "dungeon-agent-eval-"));
     materializedRoot = join(temporaryRoot, "repository");
-    await materializeConfiguredAgentEvalFixture({
+    const materializedSourceFingerprint = await materializeConfiguredAgentEvalFixture({
       fixtureId: testCase.publicCase.fixtureId,
       dependencyRepoRoot: options.dependencyRepoRoot,
       ...(options.fixtureRoot ? { fixtureRoot: options.fixtureRoot } : {}),
       destination: materializedRoot,
     });
+    assertMaterializedSourceFingerprint(testCase, materializedSourceFingerprint);
+    await assertExpectedRouteFeatures(materializedRoot, testCase);
     dependencyLease = await provisionAgentEvalDependencies({
       repositoryRoot: materializedRoot,
       dependencyRepoRoot: options.dependencyRepoRoot,
     });
-    const oracle = await runBrowserOracle({
+    const oracle = await runPreflightBrowserOracle({
       repositoryRoot: materializedRoot,
       testCase,
       phase: "before",
@@ -883,18 +997,19 @@ export async function runAgentEvalPreflight(
     failureCode = oracle.failureCode ?? (initialFailureMatched ? null : "initial-failure-not-matched");
     if (!failureCode) {
       const cleanRoot = join(temporaryRoot, "clean-repository");
-      await materializeConfiguredAgentEvalFixture({
+      const cleanSourceFingerprint = await materializeConfiguredAgentEvalFixture({
         fixtureId: testCase.publicCase.fixtureId,
         dependencyRepoRoot: options.dependencyRepoRoot,
         ...(options.fixtureRoot ? { fixtureRoot: options.fixtureRoot } : {}),
         destination: cleanRoot,
         variant: "clean",
       });
+      assertMaterializedSourceFingerprint(testCase, cleanSourceFingerprint);
       cleanDependencyLease = await provisionAgentEvalDependencies({
         repositoryRoot: cleanRoot,
         dependencyRepoRoot: options.dependencyRepoRoot,
       });
-      const cleanOracle = await runBrowserOracle({
+      const cleanOracle = await runPreflightBrowserOracle({
         repositoryRoot: cleanRoot,
         testCase,
         phase: "after",
@@ -907,11 +1022,12 @@ export async function runAgentEvalPreflight(
       failureCode = cleanOracle.failureCode ?? (cleanBaselineMatched ? null : "clean-baseline-not-matched");
       if (!failureCode) {
         certificate = {
-          schemaVersion: 1,
+          schemaVersion: 2,
           fixtureId: testCase.publicCase.fixtureId,
           buggyHead: (await gitOutput(materializedRoot, ["rev-parse", "HEAD"])).trim(),
           dependencyKey: dependencyKey(options.dependencyRepoRoot),
           oracleVersion: AGENT_EVAL_ORACLE_VERSION,
+          runFingerprint: runIdentity.runFingerprint,
           beforeOracleMatched: true,
           cleanAfterOracleMatched: true,
         };
@@ -936,8 +1052,9 @@ export async function runAgentEvalPreflight(
     }
   }
   const resultWithoutArchive: AgentEvalPreflightResult = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     fixtureId: options.fixtureId,
+    runFingerprint: runIdentity?.runFingerprint ?? null,
     status: failureCode
       ? (
           failureCode === "initial-failure-not-matched"

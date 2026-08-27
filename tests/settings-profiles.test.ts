@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { AppController } from "../src/app/pi-process.js";
@@ -11,6 +11,7 @@ import {
   ModelProfileStore,
   profileKeyEnvironmentName,
   profileProviderId,
+  profilesFromEnvironment,
 } from "../src/settings/profiles.js";
 import { TaskStore } from "../src/task/store.js";
 import type { TaskRecord } from "../src/task/types.js";
@@ -87,7 +88,7 @@ async function createControllerHarness(
 }
 
 describe("OpenAI-compatible 模型档案与凭据边界", () => {
-  it("profiles.json 只保存非敏感字段并保留默认档案", async () => {
+  it("profiles.json 只保存当前非敏感字段并保留默认档案", async () => {
     const repository = await createTemporaryGitRepository({ "README.md": "test\n" });
     try {
       const config = loadConfig({
@@ -111,7 +112,6 @@ describe("OpenAI-compatible 模型档案与凭据边界", () => {
         contextWindow: 128_000,
         maxOutputTokens: 8_000,
         reasoning: false,
-        apiKey: "must-not-persist",
       });
 
       assert.equal(saved.baseUrl, "https://gateway.example/v1");
@@ -124,12 +124,57 @@ describe("OpenAI-compatible 模型档案与凭据边界", () => {
         join(config.dataDir, "settings", "profiles.json"),
         "utf8",
       );
-      assert.ok(!raw.includes("must-not-persist"));
       assert.ok(!raw.includes("secret-from-environment"));
       assert.deepEqual(
         (await store.list()).map((profile) => profile.id),
         ["default", "fast"],
       );
+    } finally {
+      await repository.dispose();
+    }
+  });
+
+  it("拒绝模型档案的缺字段、未知字段、空列表和缺失 default", async () => {
+    const repository = await createTemporaryGitRepository({ "README.md": "test\n" });
+    try {
+      const config = loadConfig({
+        LOCALAPPDATA: join(repository.temporaryRoot, "data"),
+        MAINTAINER_BASE_URL: "https://api.example/v1",
+        MAINTAINER_MODEL: "model-a",
+      });
+      const fallback = defaultModelProfile(config);
+      const store = new ModelProfileStore(config.dataDir, fallback);
+      await assert.rejects(store.save({
+        ...fallback,
+        apiKey: "legacy-secret",
+      }), /字段不是当前格式/u);
+      await assert.rejects(store.save({
+        id: "incomplete",
+        name: "Incomplete",
+        baseUrl: "https://api.example/v1",
+        modelId: "model-incomplete",
+        contextWindow: 32_000,
+        maxOutputTokens: 2_048,
+      }), /字段不是当前格式/u);
+
+      await store.save(fallback);
+      const profilePath = join(config.dataDir, "settings", "profiles.json");
+      for (const document of [
+        { schemaVersion: 1, profiles: [], extra: true },
+        { schemaVersion: 1, profiles: [] },
+        { schemaVersion: 1, profiles: [{ ...fallback, id: "fast" }] },
+        { schemaVersion: 1, profiles: [{ ...fallback, reasoning: undefined }] },
+      ]) {
+        await writeFile(profilePath, JSON.stringify(document), "utf8");
+        await assert.rejects(store.list());
+      }
+
+      assert.throws(() => profilesFromEnvironment({
+        DUNGEON_MAINTAINER_MODEL_PROFILES: "[]",
+      }, fallback), /非空数组/u);
+      assert.throws(() => profilesFromEnvironment({
+        DUNGEON_MAINTAINER_MODEL_PROFILES: JSON.stringify([{ ...fallback, legacy: true }]),
+      }, fallback), /字段不是当前格式/u);
     } finally {
       await repository.dispose();
     }

@@ -3,7 +3,7 @@
  * Dungeon Maintainer 基准入口。
  *
  * 默认运行零模型 Shell 基准；提供游戏仓库时再运行真实 Vite/Chromium 桥基准，提供
- * task 目录时追加真实 Pi token/自主闭环分析。输出始终为不含正文的 schema v1 JSON。
+ * task 目录时追加真实 Pi token/自主闭环分析。输出始终为不含正文的当前结果 JSON。
  */
 
 import { mkdir, writeFile } from "node:fs/promises";
@@ -38,7 +38,6 @@ export interface BenchmarkOptions {
 /** 单个游戏修复案例零模型预检的有限参数。 */
 export interface AgentEvalPreflightCliOptions {
   fixtureId: string;
-  fixtureRoot: string | null;
   dependencyRepoRoot: string;
   archiveRoot: string;
   timeoutMs: number | null;
@@ -47,7 +46,6 @@ export interface AgentEvalPreflightCliOptions {
 /** 单轮真实模型游戏修复 Eval 的有限参数。 */
 export interface GameRepairEvalCliOptions {
   fixtureId: string;
-  fixtureRoot: string | null;
   dependencyRepoRoot: string;
   archiveRoot: string;
   timeoutMs: number | null;
@@ -55,9 +53,8 @@ export interface GameRepairEvalCliOptions {
   repetition: number;
 }
 
-/** 固定 12 案例矩阵的有限参数。 */
+/** 固定 7 案例矩阵的有限参数。 */
 export interface GameRepairMatrixCliOptions {
-  fixtureRoot: string | null;
   dependencyRepoRoot: string;
   archiveRoot: string;
   timeoutMs: number | null;
@@ -67,7 +64,6 @@ export interface GameRepairMatrixCliOptions {
 }
 
 export interface BenchmarkSuiteCliOptions {
-  fixtureRoot: string | null;
   dependencyRepoRoot: string;
   archiveRoot: string;
   suite: GameRepairSuite;
@@ -92,9 +88,8 @@ const HELP = [
 /** 解析仅运行当前 Maintainer 的固定回归套件；案例、重复次数和超时不能任意注入。 */
 export function parseBenchmarkSuiteArgs(args: readonly string[]): BenchmarkSuiteCliOptions | null {
   if (args.includes("--help") || args.includes("-h")) return null;
-  let fixtureRoot: string | null = null;
   let dependencyRepoRoot: string | null = null;
-  let archiveRoot = resolve("benchmark-results", "flash-current");
+  let archiveRoot = resolve("benchmark-results", "pro-current");
   let suite: GameRepairSuite | null = null;
   let ui: "progress" | "none" = process.stdout.isTTY ? "progress" : "none";
   let resumeDirectory: string | null = null;
@@ -102,8 +97,7 @@ export function parseBenchmarkSuiteArgs(args: readonly string[]): BenchmarkSuite
     const name = args[index];
     const value = args[index + 1];
     if (!name || !value) throw new Error("benchmark-suite 参数必须成对提供");
-    if (name === "--fixture-root") fixtureRoot = resolve(value);
-    else if (name === "--dependency-repo") dependencyRepoRoot = resolve(value);
+    if (name === "--dependency-repo") dependencyRepoRoot = resolve(value);
     else if (name === "--archive-root") archiveRoot = resolve(value);
     else if (name === "--suite") {
       if (value !== "four-regressions" && value !== "full") throw new Error("未知 benchmark suite：" + value);
@@ -116,7 +110,7 @@ export function parseBenchmarkSuiteArgs(args: readonly string[]): BenchmarkSuite
   }
   if (!suite) throw new Error("benchmark-suite 缺少 --suite");
   if (!dependencyRepoRoot) throw new Error("benchmark-suite 缺少 --dependency-repo");
-  return { fixtureRoot, dependencyRepoRoot, archiveRoot, suite, ui, resumeDirectory };
+  return { dependencyRepoRoot, archiveRoot, suite, ui, resumeDirectory };
 }
 
 /** 解析不接受命令、脚本或模型提示的固定基准参数。 */
@@ -160,7 +154,6 @@ export function parseAgentEvalPreflightArgs(
 ): AgentEvalPreflightCliOptions | null {
   if (args.includes("--help") || args.includes("-h")) return null;
   let fixtureId: string | null = null;
-  let fixtureRoot: string | null = null;
   let dependencyRepoRoot: string | null = null;
   let archiveRoot = resolve("benchmark-results", "preflight");
   let timeoutMs: number | null = null;
@@ -169,7 +162,6 @@ export function parseAgentEvalPreflightArgs(
     const value = args[index + 1];
     if (!name || !value) throw new Error("preflight 参数必须成对提供");
     if (name === "--fixture") fixtureId = value;
-    else if (name === "--fixture-root") fixtureRoot = resolve(value);
     else if (name === "--dependency-repo") dependencyRepoRoot = resolve(value);
     else if (name === "--archive-root") archiveRoot = resolve(value);
     else if (name === "--timeout-ms") {
@@ -188,7 +180,6 @@ export function parseAgentEvalPreflightArgs(
   if (!dependencyRepoRoot) throw new Error("preflight 缺少 --dependency-repo");
   return {
     fixtureId,
-    fixtureRoot,
     dependencyRepoRoot,
     archiveRoot,
     timeoutMs,
@@ -207,7 +198,6 @@ export function parseGameRepairEvalArgs(
 ): GameRepairEvalCliOptions | null {
   if (args.includes("--help") || args.includes("-h")) return null;
   let fixtureId: string | null = null;
-  let fixtureRoot: string | null = null;
   let dependencyRepoRoot: string | null = null;
   let profile: GameRepairEvalProfile | null = null;
   let repetition = 1;
@@ -218,7 +208,6 @@ export function parseGameRepairEvalArgs(
     const value = args[index + 1];
     if (!name || !value) throw new Error("game-repair 参数必须成对提供");
     if (name === "--fixture") fixtureId = value;
-    else if (name === "--fixture-root") fixtureRoot = resolve(value);
     else if (name === "--dependency-repo") dependencyRepoRoot = resolve(value);
     else if (name === "--archive-root") archiveRoot = resolve(value);
     else if (name === "--profile") {
@@ -249,7 +238,6 @@ export function parseGameRepairEvalArgs(
   if (!dependencyRepoRoot) throw new Error("game-repair 缺少 --dependency-repo");
   return {
     fixtureId,
-    fixtureRoot,
     dependencyRepoRoot,
     archiveRoot,
     timeoutMs,
@@ -258,13 +246,12 @@ export function parseGameRepairEvalArgs(
   };
 }
 
-/** 解析固定 12 案例矩阵参数；不接受自定义案例清单或任意命令。 */
+/** 解析固定 7 案例矩阵参数；不接受自定义案例清单或任意命令。 */
 export function parseGameRepairMatrixArgs(
   args: readonly string[],
   defaultArchiveRoot = resolve("benchmark-results", "game-repair-final"),
 ): GameRepairMatrixCliOptions | null {
   if (args.includes("--help") || args.includes("-h")) return null;
-  let fixtureRoot: string | null = null;
   let dependencyRepoRoot: string | null = null;
   let archiveRoot = defaultArchiveRoot;
   let timeoutMs: number | null = null;
@@ -275,8 +262,7 @@ export function parseGameRepairMatrixArgs(
     const name = args[index];
     const value = args[index + 1];
     if (!name || !value) throw new Error("game-repair-matrix 参数必须成对提供");
-    if (name === "--fixture-root") fixtureRoot = resolve(value);
-    else if (name === "--dependency-repo") dependencyRepoRoot = resolve(value);
+    if (name === "--dependency-repo") dependencyRepoRoot = resolve(value);
     else if (name === "--archive-root") archiveRoot = resolve(value);
     else if (name === "--profile") {
       if (value !== "maintainer-current" && value !== "pi-original" && value !== "both") {
@@ -302,7 +288,6 @@ export function parseGameRepairMatrixArgs(
   }
   if (!dependencyRepoRoot) throw new Error("game-repair-matrix 缺少 --dependency-repo");
   return {
-    fixtureRoot,
     dependencyRepoRoot,
     archiveRoot,
     timeoutMs,
@@ -323,7 +308,7 @@ export async function runBenchmarkCli(args: readonly string[]): Promise<number> 
     const progress = suite.ui === "progress" ? await startBenchmarkProgressPage(true) : null;
     const startedAt = new Date().toISOString();
     progress?.publish({ phase: "starting", fixtureId: null, profile: "maintainer-current",
-      repetition: null, completed: 0, total: suite.suite === "four-regressions" ? 12 : 12,
+      repetition: null, completed: 0, total: suite.suite === "four-regressions" ? 12 : 7,
       status: "running", cumulativeTokens: 0, cumulativeToolCalls: 0, startedAt,
       workerId: null, workerCount: 6 });
     try {
@@ -336,7 +321,6 @@ export async function runBenchmarkCli(args: readonly string[]): Promise<number> 
         profile: "maintainer-current",
         concurrency: 6,
         ...(suite.resumeDirectory ? { resumeDirectory: suite.resumeDirectory } : {}),
-        ...(suite.fixtureRoot ? { fixtureRoot: suite.fixtureRoot } : {}),
         ...(progress ? { onProgress: (event: Parameters<typeof progress.publish>[0]) => progress.publish(event) } : {}),
       });
       process.stdout.write(JSON.stringify(result, null, 2) + "\n");
@@ -357,7 +341,6 @@ export async function runBenchmarkCli(args: readonly string[]): Promise<number> 
     const result = await runGameRepairPreflightMatrix({
       dependencyRepoRoot: matrix.dependencyRepoRoot,
       archiveRoot: matrix.archiveRoot,
-      ...(matrix.fixtureRoot ? { fixtureRoot: matrix.fixtureRoot } : {}),
       ...(matrix.timeoutMs === null ? {} : { timeoutMs: matrix.timeoutMs }),
     });
     process.stdout.write(JSON.stringify(result, null, 2) + "\n");
@@ -373,7 +356,6 @@ export async function runBenchmarkCli(args: readonly string[]): Promise<number> 
       fixtureId: preflight.fixtureId,
       dependencyRepoRoot: preflight.dependencyRepoRoot,
       archiveRoot: preflight.archiveRoot,
-      ...(preflight.fixtureRoot ? { fixtureRoot: preflight.fixtureRoot } : {}),
       ...(preflight.timeoutMs === null ? {} : { timeoutMs: preflight.timeoutMs }),
     });
     process.stdout.write(JSON.stringify(result, null, 2) + "\n");
@@ -391,7 +373,6 @@ export async function runBenchmarkCli(args: readonly string[]): Promise<number> 
       profile: gameRepair.profile,
       repetition: gameRepair.repetition,
       archiveRoot: gameRepair.archiveRoot,
-      ...(gameRepair.fixtureRoot ? { fixtureRoot: gameRepair.fixtureRoot } : {}),
       ...(gameRepair.timeoutMs === null ? {} : { timeoutMs: gameRepair.timeoutMs }),
     });
     process.stdout.write(JSON.stringify(result, null, 2) + "\n");
@@ -408,7 +389,6 @@ export async function runBenchmarkCli(args: readonly string[]): Promise<number> 
       archiveRoot: matrix.archiveRoot,
       repetitions: matrix.repetitions,
       profile: matrix.profile,
-      ...(matrix.fixtureRoot ? { fixtureRoot: matrix.fixtureRoot } : {}),
       ...(matrix.timeoutMs === null ? {} : { timeoutMs: matrix.timeoutMs }),
       ...(matrix.resumeDirectory ? { resumeDirectory: matrix.resumeDirectory } : {}),
     });

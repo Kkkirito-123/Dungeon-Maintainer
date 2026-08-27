@@ -39,7 +39,7 @@ export interface MaintainerToolContext {
   currentDriver(): GameDriver | null;
   requireDriver(): GameDriver;
   ensureGame(): Promise<GameDriver>;
-  /** 用户确认具体完整方案后，开放本轮 Pi 原生写入和精确 patch。 */
+  /** 首次精确 write/patch 获用户确认后，开放当前文件范围内的写入。 */
   approveExecution(): void;
   /** 方案完成、拒绝或本轮结束时恢复只读诊断工具。 */
   completeExecution(): void;
@@ -52,7 +52,7 @@ export interface MaintainerToolContext {
 }
 
 /**
- * 注册 V1 的全部模型工具。
+ * 注册 1.0 的全部模型工具。
  *
  * @param pi 当前 Extension API。
  * @param context 与一个 taskId/worktree 绑定的运行依赖。

@@ -1,7 +1,5 @@
 # Dungeon Maintainer Benchmark
 
-历史真实模型结果与原始归档校验值见 [BENCHMARK-HISTORY.md](./BENCHMARK-HISTORY.md)。
-
 这个基准回答三个问题：用户是否立刻收到反馈、专用游戏控制面能否自主闭环、真实 Pi
 会话是否在缓存和 token 预算内完成修复。报告只包含数值和布尔结果，不包含提示正文、
 模型回复、源码、SQL、地图、存档或密钥。
@@ -86,7 +84,7 @@ test-fixtures/
 └─ smoke-tasks/       # 已脱敏的 task/events/Pi JSONL 回归样本
 ```
 
-`agent-evals/_bases/game-repair-v1/` 保存一份 521 文件共享正常基线；
+`agent-evals/_bases/game-repair/` 保存一份 521 文件共享正常基线；
 `agent-evals/terminal-action-bug/` 只保存一行 Bug Patch，并在 `fixture.json` 中记录共享基线 ID、
 唯一脏路径和补丁 SHA-256。这样既能复现真实 Git 修复语义，又不会为每道题复制整个游戏，
 也不会把个人绝对路径、`.git` 目录或外部 `node_modules` Junction 带进仓库。需要物化时由
@@ -133,7 +131,7 @@ pnpm benchmark -- game-repair `
 控制更新无需新增 Profile：
 
 ```powershell
-$env:MAINTAINER_MODEL='deepseek-v4-flash'
+$env:MAINTAINER_MODEL='deepseek-v4-pro'
 pnpm benchmark -- game-repair `
   --profile maintainer-current `
   --fixture terminal-action-bug `
@@ -144,11 +142,11 @@ pnpm benchmark -- game-repair `
 
 自动 Benchmark 默认使用无头 Chromium，避免每例关闭、重开可见窗口；生产 `start/resume`
 仍使用可见界面。正式矩阵使用 `600000` 毫秒硬上限，并应在同一进程显式设置
-`MAINTAINER_MODEL`。归档会保存非敏感 `modelId` 明文与模型配置哈希，不保存密钥或模型地址
-明文。若只验证当前优化版，可把矩阵 Profile 固定为 `maintainer-current`：
+`MAINTAINER_MODEL`。Benchmark 不限制模型档位，归档会保存非敏感 `modelId` 明文与模型配置哈希，
+不保存密钥或模型地址明文。若只验证当前优化版，可把矩阵 Profile 固定为 `maintainer-current`：
 
 ```powershell
-$env:MAINTAINER_MODEL='deepseek-v4-flash'
+$env:MAINTAINER_MODEL='deepseek-v4-pro'
 pnpm benchmark -- game-repair-matrix `
   --profile maintainer-current `
   --dependency-repo "C:\path\to\select-from-dungeon" `
@@ -157,14 +155,13 @@ pnpm benchmark -- game-repair-matrix `
   --timeout-ms 600000
 ```
 
-当前矩阵包含 12 个可实机复现案例：
+当前 1.0 矩阵只包含 7 个可实机复现案例：
 
 | 类别 | 案例 |
 |---|---|
-| 战斗与 SQL 状态 | `terminal-action-bug`、`admin-answer-hint-rejected`、`accepted-query-without-progress`、`final-stage-boss-stuck-at-one-hp`、`boss-hp-reset-after-death` |
-| 奖励与地图门禁 | `lesson-complete-reward-missing`、`dead-area-boss-still-blocks-portal` |
+| 战斗与 SQL 状态 | `terminal-action-bug`、`accepted-query-without-progress`、`final-stage-boss-stuck-at-one-hp` |
 | 传送、死亡与持久化 | `admin-floor-transition-deadlock`、`transition-lost-after-reload` |
-| 高级 SQL 与终局 | `transaction-sandbox-state-leak`、`stale-query-plan-evidence`、`duplicate-final-victory-commit` |
+| 高级 SQL 与终局 | `stale-query-plan-evidence`、`duplicate-final-victory-commit` |
 
 游戏修复 Benchmark 的主成功条件对两个 Profile 完全相同：初始故障 Oracle 命中、修复后 Oracle 命中、
 禁止路径未修改且 Git HEAD 未变化。`proposed/executed/verified/ready_to_apply`、暂停和超时独立报告，
@@ -172,16 +169,17 @@ pnpm benchmark -- game-repair-matrix `
 `game-test`、`game-architecture` 或 `game-build`；Maintainer 自身的 `finish(result)` 仍会按真实产品流程执行
 这些验证。三项固定检查应作为代码修改后的独立质量门禁运行一次，不计入单案例任务成功与否。
 
-矩阵规模由 `--profile` 和 `--repetitions` 决定：当前优化版单次运行是 `12 × 1 = 12` 次；
-公平对比时使用 `--profile both`，每次重复是 `12 × 2 = 24` 次。正式对比可提高 repetitions，
+矩阵规模由 `--profile` 和 `--repetitions` 决定：当前优化版单次运行是 `7 × 1 = 7` 次；
+公平对比时使用 `--profile both`，每次重复是 `7 × 2 = 14` 次。正式对比可提高 repetitions，
 但 Token 与工具均值只统计成功运行；基础设施失败、超时和暂停单独报告，不能稀释 Agent 失败率。
 
 真实任务报告还会输出隐藏续跑创建/准入/过期丢弃、终态后模型回合/工具调用/token、重复完成提交、
 语义重复结果、到方案前 inspect 次数和诊断耗时。单 Agent Loop 中前三项续跑指标应恒为零；其它指标
 只用于发现重复搜索和收尾回归，不反馈控制 Agent，也不需要把提示词或工具正文写进报告。
 
-V2 结果另外输出 `inspectBundles / inspectBundleWindows / inspectFailures`、写入尝试五类结果、
-`loopGuardBlocks` 和 `telemetryParseErrors`。每次结果必须满足：
+1.0 结果输出 `inspectBundles / inspectBundleWindows / inspectFailures`、写入尝试五类结果、
+`loopGuardBlocks` 和 `telemetryParseErrors`。LoopGuard 只在同一动作得到同一结果连续重复两次后阻止
+第三次调用，不按累计调用次数冻结 Agent，也不终止 Agent。`evidence` 回读和 `finish` 收尾始终可用。
 
 ```text
 inspectCalls = inspectExecutions + inspectReceiptHits + inspectFailures
@@ -192,7 +190,7 @@ writeAttempts = writeRejected + writeFailures + writeNoops + writeMutations
 mutation，而不是第一次被拒绝、失败或无变化的写入尝试。`workflowClosure.executed` 同样只由
 真实 mutation 决定。
 
-V3 另外输出 `floorRoutedInspectCalls / floorScopesVisited` 和
+1.0 的楼层路由遥测输出 `floorRoutedInspectCalls / floorScopesVisited` 和
 `floorRouteCurrentExecutions / floorRouteAdjacentExecutions / floorRouteSharedExecutions /
 floorRouteFallbackExecutions`。它们只聚合顶层 Inspect execution 的路由级别和访问 scope 数量，
 用于发现不必要的跨层或 area/repository 扩展；不改变上述 Inspect/写入分类等式，也不记录 query、
@@ -204,11 +202,24 @@ floorRoutedInspectCalls
 + floorRouteSharedExecutions + floorRouteFallbackExecutions
 ```
 
-V4 不增加一个与游戏源码绑定的 Benchmark 分支。游戏仓库拥有 schema v4 架构表和 Adapter，
-维护器按 feature primary/adjacent/shared/fallback 搜索，并把楼层作为可选上下文；旧 v1-v3 地图仍
-规范化读取，非法核心地图回退普通安全搜索。案例继续由当前游戏的 `catalog/describe/materialize`
+游戏仓库拥有唯一现行 schema v4 架构表和 Adapter，维护器按
+feature primary/adjacent/shared/fallback 搜索，并把楼层作为可选上下文；旧地图格式直接拒绝。
+案例继续由当前游戏的 `catalog/describe/materialize`
 安全能力物化，因此游戏目录重组后只需更新游戏拥有的稳定路由边界和故障 Patch，维护器无需复制
-游戏文件清单。
+游戏文件清单。多代码符号搜索整串零命中时会在同一路由内按有限字面符号回退，避免多个已知符号被误当成
+一个必须连续出现的正则；获批方案的最近一条 `finish` 结果、最近一条源码证据和当前工具批次会共同
+保留在上下文预算内。已缓存读取的回执只引用真正覆盖目标区间的证据 ID，不能把同文件其它窗口误作目标。
+
+路由和证据复用遥测输出 `inspectCandidateFiles / inspectSelectedFiles`、
+`featureRoutedInspectCalls` 及四个 feature 层级计数、`semanticEvidenceHits / solutionLookupHits`。
+其中 semantic hit 已执行当前 Inspect，但因结果指纹已存在而只向模型返回短回执；下一次同动作会
+通过 alias 成为不执行外部读取的 exact receipt。必须满足：
+
+```text
+featureRoutedInspectCalls
+= featureRoutePrimaryExecutions + featureRouteAdjacentExecutions
++ featureRouteSharedExecutions + featureRouteFallbackExecutions
+```
 
 ## 推荐固定用例
 

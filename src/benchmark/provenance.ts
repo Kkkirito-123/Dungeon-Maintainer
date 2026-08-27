@@ -44,10 +44,23 @@ export interface BenchmarkModelFingerprint {
   readonly modelConfigHash: string;
 }
 
-/** 公开报告保存的运行来源指纹。 */
-export interface BenchmarkProvenance extends BenchmarkModelFingerprint {
+/** 一次矩阵从预检到最终汇总共享的低敏运行身份。 */
+export interface BenchmarkRunIdentity extends BenchmarkModelFingerprint {
+  readonly schemaVersion: 1;
+  readonly runFingerprint: string;
   readonly benchmarkCommit: string;
   readonly benchmarkWorktreeHash: string;
+  readonly gameSourceFingerprint: string;
+  readonly oracleVersion: string;
+}
+
+/** 公开报告保存的运行来源指纹。 */
+export interface BenchmarkProvenance extends BenchmarkModelFingerprint {
+  readonly runFingerprint: string;
+  readonly benchmarkCommit: string;
+  readonly benchmarkWorktreeHash: string;
+  readonly gameSourceFingerprint: string;
+  readonly oracleVersion: string;
   readonly piSourceRepository: string;
   readonly piSourceTag: string;
   readonly piSourceCommit: string;
@@ -76,6 +89,94 @@ export function benchmarkModelFingerprint(config: MaintainerConfig): BenchmarkMo
       baseUrl: model.baseUrl,
     })),
   };
+}
+
+/**
+ * 从显式组成项生成稳定运行身份；任一源码、游戏合同、模型配置或 Oracle 变化都会失效。
+ *
+ * @param input 已经去敏的维护器、游戏、模型和 Oracle 指纹。
+ * @returns 可写入预检证书、checkpoint 和汇总的同一 SHA-256 身份。
+ */
+export function createBenchmarkRunIdentity(input: {
+  readonly benchmarkCommit: string;
+  readonly benchmarkWorktreeHash: string;
+  readonly gameSourceFingerprint: string;
+  readonly oracleVersion: string;
+  readonly modelId: string;
+  readonly modelConfigHash: string;
+}): BenchmarkRunIdentity {
+  const components = {
+    benchmarkCommit: input.benchmarkCommit,
+    benchmarkWorktreeHash: input.benchmarkWorktreeHash,
+    gameSourceFingerprint: input.gameSourceFingerprint,
+    oracleVersion: input.oracleVersion,
+    modelId: input.modelId,
+    modelConfigHash: input.modelConfigHash,
+  };
+  return {
+    schemaVersion: 1,
+    runFingerprint: digest(JSON.stringify(components)),
+    ...components,
+  };
+}
+
+/** 校验运行身份是唯一现行 schema，且指纹与各组成项一致。 */
+export function benchmarkRunIdentityIsCurrent(
+  value: unknown,
+): value is BenchmarkRunIdentity {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const identity = value as Record<string, unknown>;
+  const expectedKeys = [
+    "benchmarkCommit",
+    "benchmarkWorktreeHash",
+    "gameSourceFingerprint",
+    "modelConfigHash",
+    "modelId",
+    "oracleVersion",
+    "runFingerprint",
+    "schemaVersion",
+  ];
+  if (Object.keys(identity).sort().join("\n") !== expectedKeys.join("\n")) return false;
+  if (
+    identity.schemaVersion !== 1
+    || typeof identity.benchmarkCommit !== "string"
+    || !/^[0-9a-f]{40}$/u.test(identity.benchmarkCommit)
+    || typeof identity.benchmarkWorktreeHash !== "string"
+    || !/^[0-9a-f]{64}$/u.test(identity.benchmarkWorktreeHash)
+    || typeof identity.gameSourceFingerprint !== "string"
+    || !/^[0-9a-f]{64}$/u.test(identity.gameSourceFingerprint)
+    || typeof identity.modelConfigHash !== "string"
+    || !/^[0-9a-f]{64}$/u.test(identity.modelConfigHash)
+    || typeof identity.modelId !== "string"
+    || !identity.modelId
+    || typeof identity.oracleVersion !== "string"
+    || !identity.oracleVersion
+    || typeof identity.runFingerprint !== "string"
+  ) return false;
+  return createBenchmarkRunIdentity({
+    benchmarkCommit: identity.benchmarkCommit,
+    benchmarkWorktreeHash: identity.benchmarkWorktreeHash,
+    gameSourceFingerprint: identity.gameSourceFingerprint,
+    oracleVersion: identity.oracleVersion,
+    modelId: identity.modelId,
+    modelConfigHash: identity.modelConfigHash,
+  }).runFingerprint === identity.runFingerprint;
+}
+
+/** 收集当前维护器与模型配置，并和游戏 Adapter 指纹合成为矩阵运行身份。 */
+export async function collectBenchmarkRunIdentity(input: {
+  readonly gameSourceFingerprint: string;
+  readonly oracleVersion: string;
+}): Promise<BenchmarkRunIdentity> {
+  const projectRoot = benchmarkProjectRoot();
+  const model = benchmarkModelFingerprint(loadConfig());
+  return createBenchmarkRunIdentity({
+    benchmarkCommit: (await runGitRaw(projectRoot, ["rev-parse", "HEAD"])).trim(),
+    benchmarkWorktreeHash: await hashWorktree(projectRoot),
+    gameSourceFingerprint: input.gameSourceFingerprint,
+    oracleVersion: input.oracleVersion,
+    ...model,
+  });
 }
 
 /** 项目 AGENTS 与 Skill 清单的低敏指纹，供双 Profile 启动公平性测试复用。 */
@@ -114,10 +215,22 @@ export async function collectBenchmarkProvenance(input: {
   readonly repositoryRoot: string;
   readonly profile: GameRepairEvalProfile;
   readonly publicPrompt: string;
+  readonly gameSourceFingerprint: string;
+  readonly oracleVersion: string;
+  readonly runIdentity?: BenchmarkRunIdentity;
 }): Promise<BenchmarkProvenance> {
   const projectRoot = benchmarkProjectRoot();
-  const config = loadConfig();
-  const modelFingerprint = benchmarkModelFingerprint(config);
+  const runIdentity = input.runIdentity ?? await collectBenchmarkRunIdentity({
+    gameSourceFingerprint: input.gameSourceFingerprint,
+    oracleVersion: input.oracleVersion,
+  });
+  if (
+    !benchmarkRunIdentityIsCurrent(runIdentity)
+    || runIdentity.gameSourceFingerprint !== input.gameSourceFingerprint
+    || runIdentity.oracleVersion !== input.oracleVersion
+  ) {
+    throw new Error("Benchmark 运行身份与当前游戏或 Oracle 不一致");
+  }
   const context = await collectProjectContextFingerprint(input.repositoryRoot);
   const source = await verifyPiBaselineSource(projectRoot);
   const version = source.packageVersion;
@@ -128,8 +241,11 @@ export async function collectBenchmarkProvenance(input: {
     ? "pi-default-system-prompt@" + version
     : buildDungeonMaintainerPrompt();
   return {
-    benchmarkCommit: (await runGitRaw(projectRoot, ["rev-parse", "HEAD"])).trim(),
-    benchmarkWorktreeHash: await hashWorktree(projectRoot),
+    runFingerprint: runIdentity.runFingerprint,
+    benchmarkCommit: runIdentity.benchmarkCommit,
+    benchmarkWorktreeHash: runIdentity.benchmarkWorktreeHash,
+    gameSourceFingerprint: runIdentity.gameSourceFingerprint,
+    oracleVersion: runIdentity.oracleVersion,
     piSourceRepository: source.repository,
     piSourceTag: source.tag,
     piSourceCommit: source.commit,
@@ -148,6 +264,7 @@ export async function collectBenchmarkProvenance(input: {
       profileRules,
     })),
     toolsetHash: digest(JSON.stringify(toolset)),
-    ...modelFingerprint,
+    modelId: runIdentity.modelId,
+    modelConfigHash: runIdentity.modelConfigHash,
   };
 }

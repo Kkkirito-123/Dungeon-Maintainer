@@ -662,6 +662,8 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
             ? "只读内容已就绪，关闭查看器后继续…"
             : approvalTitle === "是否执行完整修复方案"
             ? "等待你确认完整修复方案…"
+            : approvalTitle === "是否允许本次代码修改"
+            ? "等待你确认本次代码修改…"
             : "等待你的选择：" + approvalTitle,
         );
         const request: ShellApprovalRequest = {

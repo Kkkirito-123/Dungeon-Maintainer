@@ -67,6 +67,53 @@ function lineCost(oldText: string, newText: string): number {
   return count(oldText) + count(newText);
 }
 
+interface NormalizedTextView {
+  readonly text: string;
+  /** 规范化文本每个边界对应的原始 UTF-16 偏移。 */
+  readonly offsets: readonly number[];
+}
+
+/**
+ * 构造可安全回写的换行规范化视图。
+ *
+ * @remarks 仅把 CRLF/CR 视为 LF 用于匹配；offsets 让替换仍保留未触及区域的原始字节。
+ */
+function normalizedTextView(value: string): NormalizedTextView {
+  const characters: string[] = [];
+  const offsets: number[] = [0];
+  let index = 0;
+  while (index < value.length) {
+    const start = index;
+    if (value[index] === "\r") {
+      index += value[index + 1] === "\n" ? 2 : 1;
+      characters.push("\n");
+    } else {
+      index += 1;
+      characters.push(value.slice(start, index));
+    }
+    offsets.push(index);
+  }
+  return { text: characters.join(""), offsets };
+}
+
+/** 在原始匹配片段的换行风格下渲染模型替换正文。 */
+function replacementWithLocalNewlines(
+  newText: string,
+  originalMatch: string,
+  surroundingText: string,
+): string {
+  let newline = "\n";
+  if (originalMatch.includes("\r\n")) {
+    newline = "\r\n";
+  } else if (surroundingText.includes("\r\n")) {
+    // oldText 常常只包含一行；优先采用匹配片段之后的行尾，混合换行文件
+    // 才能保留目标行自身风格，而不是被上一行的 CRLF 带偏。
+    const after = surroundingText.slice(surroundingText.indexOf(originalMatch) + originalMatch.length);
+    newline = after.startsWith("\r\n") ? "\r\n" : "\n";
+  }
+  return newText.replace(/\r\n|\r|\n/gu, newline);
+}
+
 function patchDigest(
   task: TaskRecord,
   edits: readonly PreciseEdit[],
@@ -175,18 +222,30 @@ export async function applyPrecisePatch(
     if (!edit.oldText || edit.oldText === edit.newText) {
       throw new Error("替换必须提供不同的非空 oldText");
     }
-    const first = current.indexOf(edit.oldText);
+    const currentView = normalizedTextView(current);
+    const oldView = normalizedTextView(edit.oldText);
+    const first = currentView.text.indexOf(oldView.text);
     if (
       first < 0
-      || current.indexOf(edit.oldText, first + edit.oldText.length) >= 0
+      || currentView.text.indexOf(oldView.text, first + oldView.text.length) >= 0
     ) {
       throw new Error("oldText 必须唯一匹配：" + target.relative);
     }
+    const originalStart = currentView.offsets[first];
+    const originalEnd = currentView.offsets[first + oldView.text.length];
+    if (originalStart === undefined || originalEnd === undefined) {
+      throw new Error("oldText 匹配范围无效：" + target.relative);
+    }
+    const originalMatch = current.slice(originalStart, originalEnd);
     staged.push({
       ...target,
-      content: current.slice(0, first)
-        + edit.newText
-        + current.slice(first + edit.oldText.length),
+      content: current.slice(0, originalStart)
+        + replacementWithLocalNewlines(
+          edit.newText,
+          originalMatch,
+          current.slice(Math.max(0, originalStart - 2), Math.min(current.length, originalEnd + 2)),
+        )
+        + current.slice(originalEnd),
     });
   }
 
@@ -236,7 +295,10 @@ export async function applyPrecisePatch(
   ]));
   if (context.evidence) {
     const worktreeHash = await hashWorktree(task.worktreeRoot);
-    await context.evidence.invalidatePaths(staged.map((item) => item.relative));
+    await context.evidence.invalidatePaths(
+      staged.map((item) => item.relative),
+      worktreeHash,
+    );
     const proposed = (await context.evidence.active("claim"))
       .filter((record) => record.metadata.finishStatus === "proposed")
       .at(-1);

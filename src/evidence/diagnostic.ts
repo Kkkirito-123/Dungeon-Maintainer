@@ -10,7 +10,7 @@
 import type { EvidenceStore } from "./store.js";
 import type { EvidenceRecord } from "./types.js";
 
-/** Extension、队列闭环和测试共用的低敏诊断状态。 */
+/** Extension、finish 门禁和测试共用的低敏诊断状态。 */
 export interface DiagnosticEvidenceState {
   hasFailure: boolean;
   hasSourceRead: boolean;

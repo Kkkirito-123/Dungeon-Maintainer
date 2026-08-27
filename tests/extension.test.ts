@@ -89,15 +89,15 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
   it("相同失败写入只执行两次，第三次由真实 Extension 门禁阻止", async () => {
     const repository = await createTemporaryGitRepository({ "README.md": "baseline\n" });
     try {
-      const dataDir = join(repository.temporaryRoot, "data-loop-v2");
+      const dataDir = join(repository.temporaryRoot, "data-loop");
       const store = new TaskStore(dataDir);
       const task = await store.create({
-        id: "task-loop-v2",
+        id: "task-loop",
         objective: "修复重复写入",
         repoRoot: repository.repoRoot,
         baseHead: repository.baseHead,
         worktreeRoot: repository.repoRoot,
-        piSessionDir: join(store.taskDir("task-loop-v2"), "pi"),
+        piSessionDir: join(store.taskDir("task-loop"), "pi"),
       });
       const pi = new RecordingExtensionApi();
       const driver = {} as GameDriver;
@@ -115,7 +115,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       const finish = pi.toolDefinitions.get("finish");
       assert.ok(finish?.execute);
       await finish.execute(
-        "approve-loop-v2",
+        "approve-loop",
         {
           status: "proposed",
           summary: "定位到 README 测试问题。",
@@ -303,6 +303,304 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
         && event.detail.outcome === "rejected"
         && event.detail.reasonCode === "loop-guard-pending_action"
       )).length, 1);
+    } finally {
+      await repository.dispose();
+    }
+  });
+
+  it("累计无进展不冻结正常流程，evidence 与 finish 始终可用", async () => {
+    const repository = await createTemporaryGitRepository({ "README.md": "baseline\n" });
+    try {
+      const dataDir = join(repository.temporaryRoot, "data-light-loop-guard");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "task-light-loop-guard",
+        objective: "修复持续无进展后的正常流程",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(store.taskDir("task-light-loop-guard"), "pi"),
+      });
+      const pi = new RecordingExtensionApi();
+      const driver = {} as GameDriver;
+      installDungeonMaintainerExtension(pi as unknown as ExtensionAPI, {
+        config: loadConfig({ LOCALAPPDATA: dataDir, MAINTAINER_API_KEY: "provider-secret" }),
+        store,
+        task,
+        gameRuntime: {
+          currentDriver: () => null,
+          requireDriver: () => driver,
+          ensure: async () => driver,
+          close: async () => undefined,
+        },
+      });
+      const call = requireHook(pi, "tool_call");
+      const result = requireHook(pi, "tool_result");
+      const context = { ui: { notify: () => undefined } };
+      const completeEvidenceRead = async (
+        evidenceId: string,
+        toolCallId: string,
+      ): Promise<void> => {
+        const input = { action: "get", evidenceId };
+        assert.equal(await call({
+          type: "tool_call",
+          toolCallId,
+          toolName: "evidence",
+          input,
+        }, context), undefined);
+        await result({
+          type: "tool_result",
+          toolCallId,
+          toolName: "evidence",
+          input,
+          content: [{ type: "text", text: "existing evidence" }],
+          details: { action: "get" },
+          isError: false,
+        }, context);
+      };
+      await completeEvidenceRead("aaaaaaaaaaaaaaaa", "alternating-a-1");
+      await completeEvidenceRead("bbbbbbbbbbbbbbbb", "alternating-b-1");
+      await completeEvidenceRead("aaaaaaaaaaaaaaaa", "alternating-a-2");
+      const alternating = await call({
+        type: "tool_call",
+        toolCallId: "alternating-b-2",
+        toolName: "evidence",
+        input: { action: "get", evidenceId: "bbbbbbbbbbbbbbbb" },
+      }, context) as { block: boolean; terminate: boolean };
+      assert.equal(alternating, undefined);
+
+      let completedCalls = 3;
+      let attempts = 0;
+      while (completedCalls < 12) {
+        const input = {
+          action: "get",
+          evidenceId: completedCalls.toString(16).padStart(16, "0"),
+        };
+        const toolCallId = "no-progress-" + String(attempts);
+        attempts += 1;
+        assert.equal(await call({
+          type: "tool_call",
+          toolCallId,
+          toolName: "evidence",
+          input,
+        }, context), undefined);
+        await result({
+          type: "tool_result",
+          toolCallId,
+          toolName: "evidence",
+          input,
+          content: [{ type: "text", text: "existing evidence" }],
+          details: { action: "get" },
+          isError: false,
+        }, context);
+        completedCalls += 1;
+      }
+
+      const proposedInput = {
+        status: "proposed",
+        summary: "现有检查持续返回缓存结果，已定位 README.md 中需要修正的测试内容。",
+        risk: "仅修改已定位的测试内容。",
+        plan: {
+          title: "修正已定位的测试内容",
+          steps: ["修改 README.md 中已定位的测试内容。"],
+          verification: "再次运行聚焦检查。",
+          allowedPaths: ["README.md"],
+        },
+      };
+      assert.equal(await call({
+        type: "tool_call",
+        toolCallId: "finish-after-no-progress",
+        toolName: "finish",
+        input: proposedInput,
+      }, context), undefined);
+      const finish = pi.toolDefinitions.get("finish");
+      assert.ok(finish?.execute);
+      const finishResult = await finish.execute(
+        "finish-after-no-progress",
+        proposedInput,
+        undefined,
+        undefined,
+        {
+          ui: {
+            confirm: async () => true,
+            notify: () => undefined,
+          },
+        },
+      ) as {
+        content: Array<{ type: "text"; text: string }>;
+        details: { executionApproved: boolean; status: string };
+      };
+      assert.equal(finishResult.details.executionApproved, true);
+      const approvedText = finishResult.content.map((item) => item.text).join("\n");
+      assert.match(approvedText, /调查阶段结束/u);
+      assert.match(approvedText, /patch\/write/u);
+      assert.doesNotMatch(approvedText, /证据提示/u);
+      await result({
+        type: "tool_result",
+        toolCallId: "finish-after-no-progress",
+        toolName: "finish",
+        input: proposedInput,
+        content: finishResult.content,
+        details: finishResult.details,
+        isError: false,
+      }, context);
+      const evidenceInput = { action: "get", evidenceId: "dddddddddddddddd" };
+      assert.equal(await call({
+        type: "tool_call",
+        toolCallId: "evidence-after-approval",
+        toolName: "evidence",
+        input: evidenceInput,
+      }, context), undefined);
+      await result({
+        type: "tool_result",
+        toolCallId: "evidence-after-approval",
+        toolName: "evidence",
+        input: evidenceInput,
+        content: [{ type: "text", text: "existing evidence" }],
+        details: { action: "get" },
+        isError: false,
+      }, context);
+
+      const searchInput = { action: "search", query: "baseline" };
+      assert.equal(await call({
+        type: "tool_call",
+        toolCallId: "search-after-approval",
+        toolName: "inspect",
+        input: searchInput,
+      }, context), undefined);
+      await result({
+        type: "tool_result",
+        toolCallId: "search-after-approval",
+        toolName: "inspect",
+        input: searchInput,
+        content: [{ type: "text", text: "baseline" }],
+        details: { action: "search", lines: 1, cacheKind: "none" },
+        isError: false,
+      }, context);
+
+      const checkInput = { id: "guard-check-after-proposal" };
+      assert.equal(await call({
+        type: "tool_call",
+        toolCallId: "check-after-proposal",
+        toolName: "check",
+        input: checkInput,
+      }, context), undefined);
+      await result({
+        type: "tool_result",
+        toolCallId: "check-after-proposal",
+        toolName: "check",
+        input: checkInput,
+        content: [{ type: "text", text: "check passed" }],
+        details: { cached: false },
+        isError: false,
+      }, context);
+
+      const patchInput = {
+        edits: [{
+          path: "README.md",
+          baseHash: "deadbeef",
+          oldText: "baseline",
+          newText: "changed",
+        }],
+      };
+      assert.equal(await call({
+        type: "tool_call",
+        toolCallId: "patch-after-approval",
+        toolName: "patch",
+        input: patchInput,
+      }, context), undefined);
+      await result({
+        type: "tool_result",
+        toolCallId: "patch-after-approval",
+        toolName: "patch",
+        input: patchInput,
+        content: [{ type: "text", text: "baseHash conflict" }],
+        details: undefined,
+        isError: true,
+      }, context);
+
+      const events = (await readFile(join(store.taskDir(task.id), "events.jsonl"), "utf8"))
+        .split(/\r?\n/u)
+        .filter(Boolean)
+        .map((row) => JSON.parse(row) as { type: string; detail: Record<string, unknown> });
+      assert.equal(events.some((event) => event.type === "tool.loop_guard"), false);
+    } finally {
+      await repository.dispose();
+    }
+  });
+
+  it("每轮注入同项目历史方案的低敏候选并记录命中事件", async () => {
+    const repository = await createTemporaryGitRepository({ "README.md": "baseline\n" });
+    try {
+      const dataDir = join(repository.temporaryRoot, "data-solution-context");
+      const store = new TaskStore(dataDir);
+      const historicalTask = await store.create({
+        id: "task-solution-history",
+        objective: "修复首领后传送门卡住",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(store.taskDir("task-solution-history"), "pi"),
+      });
+      const historicalEvidence = new EvidenceStore(dataDir, historicalTask);
+      await historicalEvidence.saveSolution({
+        id: "1111111111111111",
+        taskId: historicalTask.id,
+        title: "修复传送门推进状态",
+        symptom: "击败首领后仍停留在原楼层",
+        rootCause: "结算分支没有恢复传送门状态",
+        planTitle: "恢复传送门状态",
+        steps: ["在结算分支写入 ready 状态"],
+        verification: "运行聚焦测试并重放传送动作",
+        relatedPaths: ["game/src/domain/portal.ts"],
+        evidenceRefs: ["2222222222222222"],
+        buggyHashes: { "game/src/domain/portal.ts": "old-hash" },
+        fixedHashes: { worktree: "fixed-hash" },
+        createdAt: "2026-08-26T00:00:00.000Z",
+      });
+      const task = await store.create({
+        id: "task-solution-current",
+        objective: "击败首领后传送门卡住，请检查并修复",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(store.taskDir("task-solution-current"), "pi"),
+      });
+      const pi = new RecordingExtensionApi();
+      const driver = {} as GameDriver;
+      installDungeonMaintainerExtension(pi as unknown as ExtensionAPI, {
+        config: loadConfig({ LOCALAPPDATA: dataDir, MAINTAINER_API_KEY: "provider-secret" }),
+        store,
+        task,
+        gameRuntime: {
+          currentDriver: () => null,
+          requireDriver: () => driver,
+          ensure: async () => driver,
+          close: async () => undefined,
+        },
+      });
+
+      const dynamic = await requireHook(pi, "before_agent_start")(
+        {
+          prompt: task.objective,
+          systemPrompt: "PROJECT AGENTS SENTINEL",
+        },
+        { getContextUsage: () => undefined },
+      ) as { message?: unknown };
+      const text = JSON.stringify(dynamic.message);
+      assert.match(text, /同项目历史解决方案候选/u);
+      assert.match(text, /修复传送门推进状态/u);
+      assert.match(text, /game\/src\/domain\/portal\.ts/u);
+      assert.doesNotMatch(text, /1111111111111111|2222222222222222|old-hash|fixed-hash/u);
+      const events = (await readFile(join(store.taskDir(task.id), "events.jsonl"), "utf8"))
+        .split(/\r?\n/u)
+        .filter(Boolean)
+        .map((row) => JSON.parse(row) as { type: string; detail: Record<string, unknown> });
+      assert.equal(events.some((event) => (
+        event.type === "evidence.solution_lookup"
+        && event.detail.outcome === "hit"
+        && event.detail.matchCount === 1
+      )), true);
     } finally {
       await repository.dispose();
     }
@@ -499,7 +797,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       assert.equal(boundedTexts.length, 32);
       assert.ok(boundedTexts.reduce((sum, text) => sum + text.length, 0) <= 16_384);
       assert.ok(boundedTexts.some((text) => text.includes("TOOL_RESULT_RECEIPT")));
-      assert.equal(boundedTexts.at(-1)?.length, 2_048);
+      assert.equal(boundedTexts.at(-1)?.length, 4_096);
       assert.match(boundedTexts.at(-1) ?? "", /工具结果稳定截断/u);
       assert.match(boundedTexts.at(-1) ?? "", /^31-/u);
       assert.match(boundedTexts.at(0) ?? "", /TOOL_RESULT_RECEIPT/u);
@@ -556,7 +854,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       assert.match(promptResult.systemPrompt, /PROJECT AGENTS SENTINEL/u);
       assert.match(promptResult.systemPrompt, /一个 Pi Agent Loop/u);
       assert.match(promptResult.systemPrompt, /finish\(status=proposed\)/u);
-      assert.match(promptResult.systemPrompt, /用户批准.*前，write\/patch 都会被拒绝/u);
+      assert.match(promptResult.systemPrompt, /第一次调用 write\/patch 时.*写入批准/u);
       assert.match(promptResult.systemPrompt, /结构化断言/u);
       assert.match(JSON.stringify(promptResult.message), /本轮最高优先级请求/u);
       assert.match(JSON.stringify(promptResult.message), /当前在哪一层/u);
@@ -884,7 +1182,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       await inputHook({ source: "rpc", text: repairRequest });
       assert.equal(task.objective, repairRequest);
       assert.equal(pi.hooks.has("agent_start"), false);
-      assert.equal(pi.hooks.has("agent_settled"), false);
+      assert.equal(pi.hooks.has("agent_settled"), true);
 
       const dynamic = await requireHook(pi, "before_agent_start")(
         { prompt: repairRequest, systemPrompt: "PROJECT AGENTS SENTINEL" },
@@ -912,7 +1210,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       }, hookContext) as { block: boolean; terminate: boolean; reason: string };
       assert.equal(unapprovedWrite.block, true);
       assert.equal(unapprovedWrite.terminate, false);
-      assert.match(unapprovedWrite.reason, /finish\(status=proposed\)/u);
+      assert.match(unapprovedWrite.reason, /用户未批准本次代码修改/u);
 
       const finishTool = pi.toolDefinitions.get("finish");
       assert.ok(finishTool?.execute);
@@ -1461,6 +1759,71 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       await repository.dispose();
     }
   });
+  it("首次 write 直接触发一次批准并继续原调用", async () => {
+    const repository = await createTemporaryGitRepository({ "README.md": "baseline\n" });
+    try {
+      const dataDir = join(repository.temporaryRoot, "data-first-write");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "task-first-write",
+        objective: "直接修复",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(store.taskDir("task-first-write"), "pi"),
+      });
+      const pi = new RecordingExtensionApi();
+      installDungeonMaintainerExtension(pi as unknown as ExtensionAPI, {
+        config: loadConfig({ LOCALAPPDATA: dataDir, MAINTAINER_API_KEY: "provider-secret" }),
+        store,
+        task,
+        gameRuntime: {
+          currentDriver: () => null,
+          requireDriver: () => ({} as GameDriver),
+          ensure: async () => ({} as GameDriver),
+          close: async () => undefined,
+        },
+      });
+      let confirmations = 0;
+      const context = {
+        hasUI: true,
+        ui: {
+          confirm: async (title: string, message: string) => {
+            confirmations += 1;
+            assert.equal(title, "是否允许本次代码修改");
+            assert.match(message, /README\.md/u);
+            return true;
+          },
+          notify: () => undefined,
+        },
+      };
+      const call = requireHook(pi, "tool_call");
+      const result = requireHook(pi, "tool_result");
+      const input = { path: "README.md", content: "fixed\n" };
+      assert.equal(await call({
+        type: "tool_call",
+        toolCallId: "first-write",
+        toolName: "write",
+        input,
+      }, context), undefined);
+      assert.equal(confirmations, 1);
+      assert.equal(task.writeScope.state, "approved");
+      await writeFile(join(task.worktreeRoot, "README.md"), "fixed\n", "utf8");
+      await result({
+        type: "tool_result",
+        toolCallId: "first-write",
+        toolName: "write",
+        input,
+        content: [{ type: "text", text: "written" }],
+        details: undefined,
+        isError: false,
+      }, context);
+      assert.equal(await readFile(join(task.worktreeRoot, "README.md"), "utf8"), "fixed\n");
+    } finally {
+      await repository.dispose();
+    }
+  });
+
   it("长 SQL 输入不会挤掉最新终端状态", () => {
     const view: PlayView = {
       floor: 1,

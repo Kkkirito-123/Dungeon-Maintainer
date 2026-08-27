@@ -29,7 +29,7 @@ export interface MaintainerCommandContext {
 }
 
 /**
- * 注册 V1 的全部用户命令。
+ * 注册 1.0 的全部用户命令。
  *
  * @param pi 当前 Pi Extension API。
  * @param context 与 taskId、worktree 和浏览器会话固定绑定的依赖。

@@ -76,8 +76,8 @@ export interface ArchitectureFeature {
 /** 游戏声明的安全运行时入口元数据；命令仍由维护器白名单拥有。 */
 export interface ArchitectureRuntimeContract {
   sourceRoot: string;
-  bridgeProtocol: number;
-  adapterVersion: number;
+  bridgeProtocol: 3;
+  adapterVersion: 2;
   supportedCapabilities: string[];
 }
 
@@ -99,9 +99,9 @@ export interface ArchitectureBoundary {
 
 /** 已验证并规范化的游戏架构地图。 */
 export interface ArchitectureMap {
-  schemaVersion: 1 | 2 | 3 | 4;
+  schemaVersion: 4;
   projectRoot: string;
-  contractId: string | null;
+  contractId: string;
   contractVersion: number;
   boundaryRevision: number;
   layers: ArchitectureLayer[];
@@ -111,7 +111,7 @@ export interface ArchitectureMap {
   features: ArchitectureFeature[];
   runtime: ArchitectureRuntimeContract;
   maintenancePolicy: ArchitectureMaintenancePolicy;
-  boundary: ArchitectureBoundary | null;
+  boundary: ArchitectureBoundary;
 }
 
 /** 当前自然语言请求的确定性路由结果。 */
@@ -145,18 +145,13 @@ function validateShape(
   value: unknown,
   expected: readonly string[],
   label: string,
-  allowUnknown: boolean,
-  warnings: string[],
 ): asserts value is Record<string, unknown> {
   if (!plainObject(value) || expected.some((key) => !(key in value))) {
     throw new Error(label + " 缺少必需字段");
   }
   const unknown = Object.keys(value).filter((key) => !expected.includes(key));
-  if (!allowUnknown && unknown.length > 0) {
-    throw new Error(label + " 字段非法");
-  }
   if (unknown.length > 0) {
-    warnings.push(label + " 忽略未知字段：" + unknown.slice(0, 8).join(","));
+    throw new Error(label + " 包含未知字段：" + unknown.slice(0, 8).join(","));
   }
 }
 
@@ -227,39 +222,18 @@ function isWithinRoot(parent: string, child: string): boolean {
   return fromParent === "" || (fromParent !== ".." && !fromParent.startsWith("../"));
 }
 
-function defaultMaintenancePolicy(): ArchitectureMaintenancePolicy {
-  return {
-    ordinaryFile: "no-update",
-    internalDirectory: "no-update",
-    rootMoveOrRename: "update",
-    areaPartitionChange: "update",
-    responsibilityOrRouteChange: "update",
-    invalidCore: "fallback",
-  };
-}
-
-interface ParsedArchitectureMap {
-  map: ArchitectureMap;
-  warnings: string[];
-}
-
 async function parseArchitectureMap(
   repositoryRoot: string,
   value: unknown,
-): Promise<ParsedArchitectureMap> {
+): Promise<ArchitectureMap> {
   if (!plainObject(value)) throw new Error("架构地图必须是对象");
   const schemaVersion = value.schemaVersion;
-  if (
-    schemaVersion !== 1
-    && schemaVersion !== 2
-    && schemaVersion !== 3
-    && schemaVersion !== 4
-  ) {
-    throw new Error("架构地图不是受支持的 schema v1/v2/v3/v4");
+  if (schemaVersion !== 4) {
+    throw new Error("架构地图只接受当前 schema v4");
   }
-  const warnings: string[] = [];
-  const expectedTopLevel = schemaVersion === 4
-    ? [
+  validateShape(
+    value,
+    [
       "schemaVersion",
       "contractId",
       "contractVersion",
@@ -273,13 +247,9 @@ async function parseArchitectureMap(
       "runtime",
       "maintenancePolicy",
       "boundary",
-    ]
-    : schemaVersion === 3
-      ? ["schemaVersion", "projectRoot", "layers", "areas", "partitions", "floorScopes"]
-      : schemaVersion === 2
-        ? ["schemaVersion", "projectRoot", "layers", "areas", "partitions"]
-        : ["schemaVersion", "projectRoot", "layers", "areas"];
-  validateShape(value, expectedTopLevel, "architecture-map", schemaVersion === 4, warnings);
+    ],
+    "architecture-map",
+  );
 
   if (
     !Array.isArray(value.layers)
@@ -288,9 +258,12 @@ async function parseArchitectureMap(
     || value.layers.length > 16
     || value.areas.length === 0
     || value.areas.length > 64
-    || (schemaVersion >= 2 && (!Array.isArray(value.partitions) || value.partitions.length > 64))
-    || (schemaVersion >= 3 && (!Array.isArray(value.floorScopes) || value.floorScopes.length > 64))
-    || (schemaVersion === 4 && (!Array.isArray(value.features) || value.features.length > 32))
+    || !Array.isArray(value.partitions)
+    || value.partitions.length > 64
+    || !Array.isArray(value.floorScopes)
+    || value.floorScopes.length > 64
+    || !Array.isArray(value.features)
+    || value.features.length > 32
   ) {
     throw new Error("架构地图核心集合非法");
   }
@@ -300,7 +273,6 @@ async function parseArchitectureMap(
     value.projectRoot,
     "projectRoot",
   );
-  const allowUnknown = schemaVersion === 4;
   const layerIds = new Set<string>();
   const layerRoots = new Map<string, string>();
   const layers: ArchitectureLayer[] = [];
@@ -309,8 +281,6 @@ async function parseArchitectureMap(
       entry,
       ["id", "root", "responsibility"],
       "layers[" + String(index) + "]",
-      allowUnknown,
-      warnings,
     );
     const id = boundedLine(entry.id, "layer.id", 40);
     if (!ID_PATTERN.test(id) || layerIds.has(id)) throw new Error("layer.id 非法或重复");
@@ -340,8 +310,6 @@ async function parseArchitectureMap(
         "neighbors",
       ],
       "areas[" + String(index) + "]",
-      allowUnknown,
-      warnings,
     );
     const id = boundedLine(entry.id, "area.id", 80);
     const parentId = boundedLine(entry.parentId, "area.parentId", 40);
@@ -376,9 +344,7 @@ async function parseArchitectureMap(
   const rawPartitions: ArchitecturePartition[] = [];
   const partitionIds = new Set<string>();
   const partitionRoots = new Set<string>();
-  const partitionEntries = schemaVersion >= 2 && Array.isArray(value.partitions)
-    ? value.partitions
-    : [];
+  const partitionEntries = value.partitions;
   for (const [index, entry] of partitionEntries.entries()) {
     validateShape(
       entry,
@@ -392,8 +358,6 @@ async function parseArchitectureMap(
         "neighbors",
       ],
       "partitions[" + String(index) + "]",
-      allowUnknown,
-      warnings,
     );
     const id = boundedLine(entry.id, "partition.id", 100);
     const parentId = boundedLine(entry.parentId, "partition.parentId", 80);
@@ -431,12 +395,11 @@ async function parseArchitectureMap(
   const floorScopeIds = new Set<string>();
   const floorNumbers = new Set<number>();
   const floorRoots = new Set<string>();
-  const floorScopeEntries = schemaVersion >= 3 && Array.isArray(value.floorScopes)
-    ? value.floorScopes
-    : [];
+  const floorScopeEntries = value.floorScopes;
   for (const [index, entry] of floorScopeEntries.entries()) {
-    const expected = schemaVersion === 4
-      ? [
+    validateShape(
+      entry,
+      [
         "id",
         "floor",
         "roots",
@@ -447,22 +410,8 @@ async function parseArchitectureMap(
         "contentRefs",
         "serviceRefs",
         "featureRefs",
-      ]
-      : [
-        "id",
-        "floor",
-        "roots",
-        "responsibility",
-        "signals",
-        "neighbors",
-        "sharedPartitions",
-      ];
-    validateShape(
-      entry,
-      expected,
+      ],
       "floorScopes[" + String(index) + "]",
-      allowUnknown,
-      warnings,
     );
     const id = boundedLine(entry.id, "floorScope.id", 40);
     const idMatch = FLOOR_SCOPE_ID_PATTERN.exec(id);
@@ -518,15 +467,9 @@ async function parseArchitectureMap(
         12,
         100,
       ),
-      contentRefs: schemaVersion === 4
-        ? boundedLines(entry.contentRefs, "floorScope.contentRefs", 12, 100)
-        : [],
-      serviceRefs: schemaVersion === 4
-        ? boundedLines(entry.serviceRefs, "floorScope.serviceRefs", 12, 100)
-        : [],
-      featureRefs: schemaVersion === 4
-        ? boundedLines(entry.featureRefs, "floorScope.featureRefs", 12, 100)
-        : [],
+      contentRefs: boundedLines(entry.contentRefs, "floorScope.contentRefs", 12, 100),
+      serviceRefs: boundedLines(entry.serviceRefs, "floorScope.serviceRefs", 12, 100),
+      featureRefs: boundedLines(entry.featureRefs, "floorScope.featureRefs", 12, 100),
     });
   }
 
@@ -566,258 +509,214 @@ async function parseArchitectureMap(
   ]);
   const rawFeatures: ArchitectureFeature[] = [];
   const featureIds = new Set<string>();
-  const featureEntries = schemaVersion === 4 && Array.isArray(value.features)
-    ? value.features
-    : [];
+  const featureEntries = value.features;
   for (const [index, rawFeature] of featureEntries.entries()) {
-    try {
-      validateShape(
-        rawFeature,
-        [
-          "id",
-          "roots",
-          "responsibility",
-          "notResponsibleFor",
-          "signals",
-          "negativeSignals",
-          "neighbors",
-          "route",
-          "contentRefs",
-          "serviceProviders",
-        ],
-        "features[" + String(index) + "]",
-        true,
-        warnings,
-      );
-      const id = boundedLine(rawFeature.id, "feature.id", 100);
-      if (!FEATURE_ID_PATTERN.test(id) || featureIds.has(id)) {
-        throw new Error("feature.id 非法或重复");
-      }
-      const roots = boundedLines(rawFeature.roots, "feature.roots", 12, 100);
-      if (roots.length === 0 || roots.some((reference) => !stableReferences.has(reference))) {
-        throw new Error("feature.roots 包含未知引用");
-      }
-      if (!plainObject(rawFeature.route)) throw new Error("feature.route 必须是对象");
-      validateShape(
-        rawFeature.route,
-        ["primary", "adjacent", "shared", "fallback"],
-        "feature.route",
-        true,
-        warnings,
-      );
-      const route: ArchitectureFeatureRoute = {
-        primary: boundedLines(rawFeature.route.primary, "feature.route.primary", 8, 100),
-        adjacent: boundedLines(rawFeature.route.adjacent, "feature.route.adjacent", 8, 100),
-        shared: boundedLines(rawFeature.route.shared, "feature.route.shared", 8, 100),
-        fallback: boundedLines(rawFeature.route.fallback, "feature.route.fallback", 8, 100),
-      };
-      const routeReferences = [
-        ...route.primary,
-        ...route.adjacent,
-        ...route.shared,
-        ...route.fallback,
-      ];
-      if (
-        route.primary.length === 0
-        || routeReferences.some((reference) => !stableReferences.has(reference))
-        || routeReferences.some((reference) => !roots.includes(reference))
-      ) {
-        throw new Error("feature.route 必须引用自身 roots 中的有效稳定 ID");
-      }
-      const neighbors = boundedLines(rawFeature.neighbors, "feature.neighbors", 8, 100);
-      const contentRefs = boundedLines(rawFeature.contentRefs, "feature.contentRefs", 8, 100);
-      const serviceProviders = boundedLines(
-        rawFeature.serviceProviders,
-        "feature.serviceProviders",
-        8,
-        100,
-      );
-      if (
-        neighbors.some((reference) => !stableReferences.has(reference))
-        || contentRefs.some((reference) => !stableAreaReferences.has(reference))
-        || serviceProviders.some((reference) => !stableAreaReferences.has(reference))
-      ) {
-        throw new Error("feature 邻接、内容或服务引用未知稳定 ID");
-      }
-      const signals = boundedLines(rawFeature.signals, "feature.signals", 16, 60);
-      if (signals.length === 0) throw new Error("feature.signals 不能为空");
-      featureIds.add(id);
-      rawFeatures.push({
-        id,
-        roots,
-        responsibility: boundedLine(rawFeature.responsibility, "feature.responsibility", 160),
-        notResponsibleFor: boundedLines(
-          rawFeature.notResponsibleFor,
-          "feature.notResponsibleFor",
-          8,
-          80,
-        ),
-        signals,
-        negativeSignals: boundedLines(
-          rawFeature.negativeSignals,
-          "feature.negativeSignals",
-          8,
-          60,
-        ),
-        neighbors,
-        route,
-        contentRefs,
-        serviceProviders,
-      });
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : "未知错误";
-      warnings.push("features[" + String(index) + "] 已忽略：" + reason.slice(0, 160));
-    }
-  }
-  for (const floorScope of rawFloorScopes) {
-    const validFeatureRefs = floorScope.featureRefs.filter((featureId) => featureIds.has(featureId));
-    if (validFeatureRefs.length !== floorScope.featureRefs.length) {
-      warnings.push(floorScope.id + " 已忽略未知 featureRefs");
-      floorScope.featureRefs = validFeatureRefs;
-    }
-  }
-
-  let contractId: string | null = null;
-  let contractVersion = 0;
-  let boundaryRevision = 0;
-  let runtime: ArchitectureRuntimeContract = {
-    sourceRoot: projectRoot,
-    bridgeProtocol: 2,
-    adapterVersion: 0,
-    supportedCapabilities: [],
-  };
-  let maintenancePolicy = defaultMaintenancePolicy();
-  let boundary: ArchitectureBoundary | null = null;
-  if (schemaVersion === 4) {
-    contractId = boundedLine(value.contractId, "contractId", 100);
-    if (!/^[a-z][a-z0-9.-]+$/u.test(contractId)) throw new Error("contractId 非法");
-    if (
-      typeof value.contractVersion !== "number"
-      || !Number.isInteger(value.contractVersion)
-      || value.contractVersion < 1
-      || typeof value.boundaryRevision !== "number"
-      || !Number.isInteger(value.boundaryRevision)
-      || value.boundaryRevision < 1
-    ) {
-      throw new Error("contractVersion/boundaryRevision 非法");
-    }
-    contractVersion = value.contractVersion;
-    boundaryRevision = value.boundaryRevision;
-
     validateShape(
-      value.runtime,
-      ["sourceRoot", "bridgeProtocol", "adapterVersion", "supportedCapabilities"],
-      "runtime",
-      true,
-      warnings,
+      rawFeature,
+      [
+        "id",
+        "roots",
+        "responsibility",
+        "notResponsibleFor",
+        "signals",
+        "negativeSignals",
+        "neighbors",
+        "route",
+        "contentRefs",
+        "serviceProviders",
+      ],
+      "features[" + String(index) + "]",
     );
-    const sourceRoot = await safeExistingDirectory(
-      repositoryRoot,
-      value.runtime.sourceRoot,
-      "runtime.sourceRoot",
-    );
-    if (!isWithinRoot(projectRoot, sourceRoot)) {
-      throw new Error("runtime.sourceRoot 必须位于 projectRoot 内");
+    const id = boundedLine(rawFeature.id, "feature.id", 100);
+    if (!FEATURE_ID_PATTERN.test(id) || featureIds.has(id)) {
+      throw new Error("feature.id 非法或重复");
     }
+    const roots = boundedLines(rawFeature.roots, "feature.roots", 12, 100);
+    if (roots.length === 0 || roots.some((reference) => !stableReferences.has(reference))) {
+      throw new Error("feature.roots 包含未知引用");
+    }
+    validateShape(
+      rawFeature.route,
+      ["primary", "adjacent", "shared", "fallback"],
+      "feature.route",
+    );
+    const route: ArchitectureFeatureRoute = {
+      primary: boundedLines(rawFeature.route.primary, "feature.route.primary", 8, 100),
+      adjacent: boundedLines(rawFeature.route.adjacent, "feature.route.adjacent", 8, 100),
+      shared: boundedLines(rawFeature.route.shared, "feature.route.shared", 8, 100),
+      fallback: boundedLines(rawFeature.route.fallback, "feature.route.fallback", 8, 100),
+    };
+    const routeReferences = [
+      ...route.primary,
+      ...route.adjacent,
+      ...route.shared,
+      ...route.fallback,
+    ];
     if (
-      typeof value.runtime.bridgeProtocol !== "number"
-      || !Number.isInteger(value.runtime.bridgeProtocol)
-      || value.runtime.bridgeProtocol < 1
-      || value.runtime.bridgeProtocol > 16
-      || typeof value.runtime.adapterVersion !== "number"
-      || !Number.isInteger(value.runtime.adapterVersion)
-      || value.runtime.adapterVersion < 1
-      || value.runtime.adapterVersion > 16
+      route.primary.length === 0
+      || routeReferences.some((reference) => !stableReferences.has(reference))
+      || routeReferences.some((reference) => !roots.includes(reference))
     ) {
-      throw new Error("runtime 版本非法");
+      throw new Error("feature.route 必须引用自身 roots 中的有效稳定 ID");
     }
-    runtime = {
-      sourceRoot,
-      bridgeProtocol: value.runtime.bridgeProtocol,
-      adapterVersion: value.runtime.adapterVersion,
-      supportedCapabilities: boundedLines(
-        value.runtime.supportedCapabilities,
-        "runtime.supportedCapabilities",
-        16,
+    const neighbors = boundedLines(rawFeature.neighbors, "feature.neighbors", 8, 100);
+    const contentRefs = boundedLines(rawFeature.contentRefs, "feature.contentRefs", 8, 100);
+    const serviceProviders = boundedLines(
+      rawFeature.serviceProviders,
+      "feature.serviceProviders",
+      8,
+      100,
+    );
+    if (
+      neighbors.some((reference) => !stableReferences.has(reference))
+      || contentRefs.some((reference) => !stableAreaReferences.has(reference))
+      || serviceProviders.some((reference) => !stableAreaReferences.has(reference))
+    ) {
+      throw new Error("feature 邻接、内容或服务引用未知稳定 ID");
+    }
+    const signals = boundedLines(rawFeature.signals, "feature.signals", 16, 60);
+    if (signals.length === 0) throw new Error("feature.signals 不能为空");
+    featureIds.add(id);
+    rawFeatures.push({
+      id,
+      roots,
+      responsibility: boundedLine(rawFeature.responsibility, "feature.responsibility", 160),
+      notResponsibleFor: boundedLines(
+        rawFeature.notResponsibleFor,
+        "feature.notResponsibleFor",
+        8,
+        80,
+      ),
+      signals,
+      negativeSignals: boundedLines(
+        rawFeature.negativeSignals,
+        "feature.negativeSignals",
+        8,
         60,
       ),
-    };
-
-    validateShape(
-      value.maintenancePolicy,
-      [
-        "ordinaryFile",
-        "internalDirectory",
-        "rootMoveOrRename",
-        "areaPartitionChange",
-        "responsibilityOrRouteChange",
-        "invalidCore",
-      ],
-      "maintenancePolicy",
-      true,
-      warnings,
-    );
-    maintenancePolicy = {
-      ordinaryFile: value.maintenancePolicy.ordinaryFile === "no-update"
-        ? "no-update" : (() => { throw new Error("maintenancePolicy.ordinaryFile 非法"); })(),
-      internalDirectory: value.maintenancePolicy.internalDirectory === "no-update"
-        ? "no-update" : (() => { throw new Error("maintenancePolicy.internalDirectory 非法"); })(),
-      rootMoveOrRename: value.maintenancePolicy.rootMoveOrRename === "update"
-        ? "update" : (() => { throw new Error("maintenancePolicy.rootMoveOrRename 非法"); })(),
-      areaPartitionChange: value.maintenancePolicy.areaPartitionChange === "update"
-        ? "update" : (() => { throw new Error("maintenancePolicy.areaPartitionChange 非法"); })(),
-      responsibilityOrRouteChange: value.maintenancePolicy.responsibilityOrRouteChange === "update"
-        ? "update" : (() => {
-          throw new Error("maintenancePolicy.responsibilityOrRouteChange 非法");
-        })(),
-      invalidCore: value.maintenancePolicy.invalidCore === "fallback"
-        ? "fallback" : (() => { throw new Error("maintenancePolicy.invalidCore 非法"); })(),
-    };
-
-    validateShape(
-      value.boundary,
-      ["algorithm", "signature"],
-      "boundary",
-      true,
-      warnings,
-    );
-    if (
-      value.boundary.algorithm !== "direct-child-v1"
-      || typeof value.boundary.signature !== "string"
-      || !/^[a-f0-9]{64}$/u.test(value.boundary.signature)
-    ) {
-      throw new Error("boundary 非法");
+      neighbors,
+      route,
+      contentRefs,
+      serviceProviders,
+    });
+  }
+  for (const floorScope of rawFloorScopes) {
+    if (floorScope.featureRefs.some((featureId) => !featureIds.has(featureId))) {
+      throw new Error("floorScope.featureRefs 包含未知 feature：" + floorScope.id);
     }
-    boundary = {
-      algorithm: "direct-child-v1",
-      signature: value.boundary.signature,
-    };
   }
 
+  const contractId = boundedLine(value.contractId, "contractId", 100);
+  if (!/^[a-z][a-z0-9.-]+$/u.test(contractId)) throw new Error("contractId 非法");
+  if (
+    typeof value.contractVersion !== "number"
+    || !Number.isInteger(value.contractVersion)
+    || value.contractVersion < 1
+    || typeof value.boundaryRevision !== "number"
+    || !Number.isInteger(value.boundaryRevision)
+    || value.boundaryRevision < 1
+  ) {
+    throw new Error("contractVersion/boundaryRevision 非法");
+  }
+
+  validateShape(
+    value.runtime,
+    ["sourceRoot", "bridgeProtocol", "adapterVersion", "supportedCapabilities"],
+    "runtime",
+  );
+  const sourceRoot = await safeExistingDirectory(
+    repositoryRoot,
+    value.runtime.sourceRoot,
+    "runtime.sourceRoot",
+  );
+  if (!isWithinRoot(projectRoot, sourceRoot)) {
+    throw new Error("runtime.sourceRoot 必须位于 projectRoot 内");
+  }
+  if (
+    value.runtime.bridgeProtocol !== 3
+    || value.runtime.adapterVersion !== 2
+  ) {
+    throw new Error("runtime 只接受 bridgeProtocol 3 和 adapterVersion 2");
+  }
+  const runtime: ArchitectureRuntimeContract = {
+    sourceRoot,
+    bridgeProtocol: 3,
+    adapterVersion: 2,
+    supportedCapabilities: boundedLines(
+      value.runtime.supportedCapabilities,
+      "runtime.supportedCapabilities",
+      16,
+      60,
+    ),
+  };
+
+  validateShape(
+    value.maintenancePolicy,
+    [
+      "ordinaryFile",
+      "internalDirectory",
+      "rootMoveOrRename",
+      "areaPartitionChange",
+      "responsibilityOrRouteChange",
+      "invalidCore",
+    ],
+    "maintenancePolicy",
+  );
+  const maintenancePolicy: ArchitectureMaintenancePolicy = {
+    ordinaryFile: value.maintenancePolicy.ordinaryFile === "no-update"
+      ? "no-update" : (() => { throw new Error("maintenancePolicy.ordinaryFile 非法"); })(),
+    internalDirectory: value.maintenancePolicy.internalDirectory === "no-update"
+      ? "no-update" : (() => { throw new Error("maintenancePolicy.internalDirectory 非法"); })(),
+    rootMoveOrRename: value.maintenancePolicy.rootMoveOrRename === "update"
+      ? "update" : (() => { throw new Error("maintenancePolicy.rootMoveOrRename 非法"); })(),
+    areaPartitionChange: value.maintenancePolicy.areaPartitionChange === "update"
+      ? "update" : (() => { throw new Error("maintenancePolicy.areaPartitionChange 非法"); })(),
+    responsibilityOrRouteChange: value.maintenancePolicy.responsibilityOrRouteChange === "update"
+      ? "update" : (() => {
+        throw new Error("maintenancePolicy.responsibilityOrRouteChange 非法");
+      })(),
+    invalidCore: value.maintenancePolicy.invalidCore === "fallback"
+      ? "fallback" : (() => { throw new Error("maintenancePolicy.invalidCore 非法"); })(),
+  };
+
+  validateShape(
+    value.boundary,
+    ["algorithm", "signature"],
+    "boundary",
+  );
+  if (
+    value.boundary.algorithm !== "direct-child-v1"
+    || typeof value.boundary.signature !== "string"
+    || !/^[a-f0-9]{64}$/u.test(value.boundary.signature)
+  ) {
+    throw new Error("boundary 非法");
+  }
+  const boundary: ArchitectureBoundary = {
+    algorithm: "direct-child-v1",
+    signature: value.boundary.signature,
+  };
+
   return {
-    map: {
-      schemaVersion,
-      projectRoot,
-      contractId,
-      contractVersion,
-      boundaryRevision,
-      layers,
-      areas: rawAreas,
-      partitions: rawPartitions,
-      floorScopes: rawFloorScopes,
-      features: rawFeatures,
-      runtime,
-      maintenancePolicy,
-      boundary,
-    },
-    warnings,
+    schemaVersion,
+    projectRoot,
+    contractId,
+    contractVersion: value.contractVersion,
+    boundaryRevision: value.boundaryRevision,
+    layers,
+    areas: rawAreas,
+    partitions: rawPartitions,
+    floorScopes: rawFloorScopes,
+    features: rawFeatures,
+    runtime,
+    maintenancePolicy,
+    boundary,
   };
 }
 
 /**
  * 读取固定地图。
  *
- * 地图核心错误转换为可显示警告，不阻止旧仓库启动；v4 单个无效 feature 只被丢弃。
+ * 任意 schema 错误转换为可显示警告并回退普通搜索。
  */
 export async function loadArchitectureMap(
   repositoryRoot: string,
@@ -838,12 +737,10 @@ export async function loadArchitectureMap(
       throw new Error("architecture-map.json 已脱离仓库");
     }
     const raw: unknown = JSON.parse(await readFile(mapRealPath, "utf8"));
-    const parsed = await parseArchitectureMap(repositoryRoot, raw);
+    const map = await parseArchitectureMap(repositoryRoot, raw);
     return {
-      map: parsed.map,
-      warning: parsed.warnings.length > 0
-        ? "区域职责地图已兼容加载：" + parsed.warnings.slice(0, 4).join("；").slice(0, 480)
-        : null,
+      map,
+      warning: null,
     };
   } catch (error) {
     const reason = error instanceof Error ? error.message : "未知错误";
@@ -957,10 +854,14 @@ export function routeArchitecture(
 
   const rankedFeatures = rankEntries(map.features, normalized);
   const strongestFeatureScore = rankedFeatures[0]?.score ?? 0;
-  const primaryFeatures = rankedFeatures
-    .filter((entry) => entry.score >= strongestFeatureScore - 2)
-    .slice(0, 2)
-    .map((entry) => entry.entry);
+  // 没有任何正向信号时不能把所有 feature 当作同分主路由，否则一次普通请求会
+  // 展开整张地图并抵消分区路由的 Token/时间收益。
+  const primaryFeatures = strongestFeatureScore > 0
+    ? rankedFeatures
+      .filter((entry) => entry.score >= strongestFeatureScore - 2 && entry.score > 0)
+      .slice(0, 2)
+      .map((entry) => entry.entry)
+    : [];
   const rankedFloorScopes = rankEntries(map.floorScopes, normalized);
   const rankedPartitions = rankEntries(map.partitions, normalized);
   const rankedAreas = rankEntries(map.areas, normalized);
@@ -1076,6 +977,7 @@ export function architectureRouteCard(route: ArchitectureRoute | null): string |
       primaryRoots: route.featurePrimaryRoots,
       adjacentRoots: route.featureAdjacentRoots,
       sharedRoots: route.featureSharedRoots,
+      fallbackRoots: route.featureFallbackRoots,
     })),
     currentFloor: route.currentFloorScope ? {
       id: route.currentFloorScope.id,

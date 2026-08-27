@@ -1,17 +1,45 @@
 {
+  "schemaVersion": 4,
+  "id": "stale-follow-up-after-result",
+  "displayName": "旧续跑审计",
+  "objective": "验证 result 后的过期续跑统计",
+  "repoRoot": "C:/smoke/repository",
+  "baseHead": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "sourceBranch": "main",
+  "sourceDirtyFiles": 0,
+  "sourceSnapshotHash": null,
+  "worktreeRoot": "C:/smoke/worktree",
+  "piSessionDir": "C:/smoke/pi",
+  "modelProfileId": "default",
+  "thinkingLevel": "off",
+  "writeScope": {
+    "state": "closed",
+    "allowedPaths": [
+      "game/src/example.ts"
+    ],
+    "digest": "plan-digest",
+    "approvedAt": "1970-01-01T00:00:02.000Z",
+    "closedAt": "1970-01-01T00:00:05.000Z"
+  },
+  "state": "ready_to_apply",
+  "createdAt": "1970-01-01T00:00:00.000Z",
+  "updatedAt": "1970-01-01T00:00:05.000Z",
   "changedPaths": [
     "game/src/example.ts"
   ],
-  "checks": [
-    {
-      "status": "passed"
-    }
-  ],
-  "reproductions": [
-    {
-      "id": "synthetic-reproduction"
-    }
-  ],
-  "conclusion": "合成任务已完成验证",
-  "state": "ready_to_apply"
+  "patchLines": 1,
+  "baseHashes": {},
+  "verification": {
+    "worktreeHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "checkIds": [
+      "game-test"
+    ],
+    "reproductionId": "synthetic-reproduction",
+    "replayPassed": true,
+    "verifiedAt": "1970-01-01T00:00:04.000Z"
+  },
+  "approval": null,
+  "patchPath": null,
+  "reversePatchPath": null,
+  "appliedHashes": {}
 }

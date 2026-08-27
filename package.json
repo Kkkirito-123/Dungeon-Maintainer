@@ -1,6 +1,6 @@
 {
   "name": "dungeon-maintainer",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "description": "基于 Pi CLI Extension 的 SQL Dungeon 专用受限 Coding Agent",

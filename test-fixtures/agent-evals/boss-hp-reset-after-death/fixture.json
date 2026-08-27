@@ -1,8 +1,0 @@
-{
-  "schemaVersion": 2,
-  "id": "boss-hp-reset-after-death",
-  "base": "game-repair-v1",
-  "sourcePatch": "source.patch",
-  "patchSha256": "413694a58dde6c13400427e93c50e9ab1314551c5bc5b50fe5be02d7795c8c1f",
-  "dirtyPaths": ["game/src/domain/session/GameSession.ts"]
-}

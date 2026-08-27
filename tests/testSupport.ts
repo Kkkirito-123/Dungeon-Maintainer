@@ -1,5 +1,5 @@
 /**
- * V1 测试使用的真实临时 Git 仓库和任务夹具。
+ * 1.0 测试使用的真实临时 Git 仓库和任务夹具。
  *
  * 本文件只在系统临时目录创建可删除的数据，不访问用户游戏仓库。Git 命令全部通过
  * execFile 参数数组执行；每个调用方负责在测试结束时调用 dispose，避免残留 worktree。
@@ -56,7 +56,7 @@ export async function runTestGit(
 export async function createTemporaryGitRepository(
   files: Readonly<Record<string, string>>,
 ): Promise<TemporaryGitRepository> {
-  const temporaryRoot = await mkdtemp(join(tmpdir(), "dungeon-maintainer-v1-"));
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "dungeon-maintainer-"));
   const repoRoot = join(temporaryRoot, "repo");
   await mkdir(repoRoot, { recursive: true });
   await runTestGit(repoRoot, ["init"]);

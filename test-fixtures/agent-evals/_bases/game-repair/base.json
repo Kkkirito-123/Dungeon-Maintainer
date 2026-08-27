@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "id": "game-repair",
+  "sourceCommit": "c0d263c6baab9a02a979ed078117545a43d2fafe",
+  "sourceFingerprint": "5207ba4b79b7e28816360258f7d5df6612aaf3f0bdfc3a9094ec77efa3ea245e",
+  "baselineFileCount": 521,
+  "repositoryDir": "repository"
+}

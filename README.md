@@ -1,4 +1,4 @@
-# Dungeon Maintainer V1
+# Dungeon Maintainer 1.0
 
 Dungeon Maintainer 是 SQL Dungeon（`SELECT * FROM DUNGEON`）专用的本地 Coding Agent。
 它复用 Pi RPC 作为 Agent 内核，在一个本地 Chromium Shell 中同时展示 Pi 风格聊天 CLI 和
@@ -21,16 +21,16 @@ Pi RPC + Dungeon Maintainer Extension
   正式游戏工作区（不自动提交）
 ```
 
-维护器与游戏保持两个独立仓库。V1 固定为单 Agent、单 Pi、单活动 worktree、单 Vite 和单浏览器会话；
+维护器与游戏保持两个独立仓库。1.0 固定为单 Agent、单 Pi、单活动 worktree、单 Vite 和单浏览器会话；
 历史任务和其他合法 worktree 可持久化并在 Shell 中切换，切换时旧 Pi 会先停止，不会后台继续调用模型。
 不提供公网 Dashboard、Electron、面向用户的任意终端、多 Agent、自动提交、推送、PR、部署或长期记忆。
 任意 Bash 不加载；方案确认后只开放隔离 worktree 内的 `edit/write` 和受限 `patch`。
 
-核心代码按单一职责分区：`src/app.ts` 只保留稳定导出，`src/app/` 分别拥有仓库事实、Pi 进程、
+核心代码按单一职责分区：`src/app.ts` 是公开入口，`src/app/` 分别拥有仓库事实、Pi 进程、
 任务生命周期与 start/resume；`src/pi/extension.ts` 只做 Pi 装配，会话安全策略和游戏运行时分别
 位于 `session-policy.ts` 与 `game-runtime.ts`。游戏开发桥也将投影、导航、固定动作和查询执行拆开，
 `bridge.ts` 只组合协议生命周期。外部命令和 Pi 工具/命令不因内部拆分改变；浏览器驱动优先消费
-协议 v3，同时保留协议 v2 兼容。
+当前协议 v3，不接受旧桥协议。
 
 ## 环境要求
 
@@ -149,9 +149,9 @@ Shell 与后端仅通过本机 HTTP/SSE 通信，API Key 不进入浏览器。
 2. Agent 在只读阶段使用 `inspect` 和 `look/go/use/input_sql/query` 定位并复现。
 3. 运行时问题通过 `finish(status=reproduced)` 保存检查点后的语义动作、期望、实际、证据和结构化结果断言；
    构建、类型或测试问题以失败的固定检查作为复现证据。
-4. Agent 形成唯一病因后，用 `finish(status=proposed)` 一次提交完整修复方案、验证方式和风险；Shell
-   询问是否执行。拒绝时不开放任何写入能力。
-5. 用户确认后，本轮开放 Pi 原生 `edit/write` 和精确 `patch`，Agent 一次完成方案，不重复询问。
+4. Agent 形成唯一病因后直接使用精确 `patch` 或 Pi 原生 `write`；第一次写入时 Shell 按目标文件询问一次是否允许修改。
+   需要提前说明多文件方案时仍可用 `finish(status=proposed)`；拒绝时不开放写入能力。
+5. 用户确认后，原始写入调用继续执行，本轮在批准范围内自然完成修改，不重复询问同一文件。
    原生编辑后的实际 Git 增量会同步到任务记录，旧验证立即失效。
 6. 第一字节写入前保存临时浏览器检查点。写入 worktree 后等待 Vite 更新，刷新页面、消费检查点，
    重新建立同一起点检查点并重放相同语义动作。
@@ -185,11 +185,11 @@ tasks/<task-id>/
 worktrees/<task-id>/
 ```
 
-schema v2 任务会在 `resume`/读取时自动迁移到 v3；旧 schema v1 任务不会迁移，`resume` 会给出明确错误。
+任务只接受当前 schema v4。旧任务不迁移，`resume` 会要求使用 `start` 创建 1.0 任务。
 
 ## 游戏开发桥
 
-目标游戏仓库需要实现协议 v2 或 v3 的开发桥。当前游戏使用 v3，维护器保留 v2 兼容。桥只有在以下条件同时成立时安装：
+目标游戏仓库必须实现当前协议 v3 的开发桥。桥只有在以下条件同时成立时安装：
 
 - `import.meta.env.DEV`
 - 页面主机为 `127.0.0.1`、`localhost` 或 `[::1]`
@@ -230,11 +230,14 @@ pnpm test
 pnpm build
 ```
 
-详细设计见 [docs/MAINTAINER_V1_DESIGN.md](docs/MAINTAINER_V1_DESIGN.md)。
+Dungeon Maintainer 现在只有一条产品线：1.0。三级路由、区域归档和 Evidence Graph 均属于
+1.0 的内置能力；生产代码只接受当前任务、架构图、游戏桥和 Benchmark 格式，不提供旧版本迁移。
+详细设计见
+[docs/MAINTAINER_DESIGN.md](docs/MAINTAINER_DESIGN.md)。
 
 ## 统一 Chromium Shell
 
-当前 V1 使用一个本地 Chromium Shell，不再把聊天和游戏分成两个窗口：
+当前 1.0 使用一个本地 Chromium Shell，不再把聊天和游戏分成两个窗口：
 
     单个 Chromium 窗口
     ├─ 左侧：Pi RPC 驱动的聊天 CLI
@@ -264,6 +267,35 @@ Shell 只展示低敏摘要，不传输 API Key、完整 Prompt、thinking、SQL
 驱动，修改后执行检查点、刷新、恢复和语义重放。
 
 ## Benchmark 与 Token 门禁
+
+### 2026-08-27 · 7 案例工程对比
+
+Dungeon Maintainer 1.0 将三级路由、游戏内容区域归档与 Evidence Graph 合并进同一条维护流程。
+下面使用同一组 7 个游戏修复 fixture，对比 `maintainer-current`（DeepSeek Pro）与 Pi Original；
+结果按外部功能 Oracle、禁止路径和 Git HEAD 不变量判定，时间为每次运行的端到端总用时；
+时间变化按 `(Pro / Pi) - 1` 计算，负值表示 Pro 更快。
+
+| 故障内容 | DeepSeek Pro | Pi Original | Pro 总用时 | Pi 总用时 | 时间变化 |
+|---|---:|---:|---:|---:|---:|
+| 首个终端动作点击后不可用 | 通过 | 通过 | 1:17 | 10:18 | -87.4% |
+| 查询通过但战斗阶段不推进 | 通过 | 通过 | 11:14 | 4:49 | +132.7% |
+| 最终阶段 Boss 卡在 1 HP | 通过 | 通过 | 18:50 | 4:17 | +338.2% |
+| 管理员试玩击败层主后不自动传送 | 通过 | 通过 | 16:18 | 13:12 | +23.4% |
+| 传送动画结束后不加载下一层 | 通过 | 通过 | 7:27 | 30:47 | -75.8% |
+| 点查结果正确但执行计划仍显示 SCAN | 通过 | 失败 | 6:14 | 13:01 | -52.1% |
+| 最终胜利被重复结算 | 通过 | 通过 | 7:10 | 21:25 | -66.5% |
+| **7 例合计** | **7/7** | **6/7** | **1:08:33** | **1:37:54** | **-30.0%** |
+
+| 汇总指标 | DeepSeek Pro | Pi Original | 变化 |
+|---|---:|---:|---:|
+| 任务通过 | 7/7 | 6/7 | +1 例 |
+| 总运行时间 | 4,113,498 ms | 5,874,055 ms | -30.0% |
+| 总处理 Token | 3,442,936 | 12,038,611 | -71.4% |
+| 工具调用 | 297 | 362 | -18.0% |
+
+这是 2026-08-27 的单次工程对比，不代表统计显著性，也不表示每个案例都更快：其中 3 个案例
+耗时增加，另外 4 个案例的缩短使 7 例合计时间下降 30.0%。原始数据来自本地归档中的 Pro matrix
+`summary.json` 与 Pi Original `pi-original-summary.json`，公开文档不包含模型正文、SQL、答案或密钥。
 
 `pnpm benchmark` 默认使用真实 HTTP/SSE Shell 和受控 Pi 事件，不调用模型；传入
 `--repo` 后再启动真实 Vite 与无头 Chromium，验证首个终端的玩家可见投影、一次空输入拒绝，以及

@@ -250,4 +250,73 @@ describe("baseHash 精确补丁与一次性核心审批", () => {
       await repository.dispose();
     }
   });
+
+  it("允许 LF 补丁匹配 CRLF 与混合换行，并保留未修改字节", async () => {
+    const repository = await createTemporaryGitRepository({
+      "game/src/presentation/crlf.ts": "const before = 1;\r\nconst target = 2;\r\nconst after = 3;\r\n",
+      "game/src/presentation/mixed.ts": "const before = 1;\r\nconst target = 2;\nconst after = 3;\r\n",
+    });
+    const dataDir = join(repository.temporaryRoot, "data");
+    const worktreesDir = join(dataDir, "worktrees");
+    let worktreeRoot: string | null = null;
+    try {
+      worktreeRoot = await createTaskWorktree(
+        "task-newline",
+        repository.repoRoot,
+        repository.baseHead,
+        worktreesDir,
+      );
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "task-newline",
+        objective: "测试换行兼容",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot,
+        piSessionDir: join(store.taskDir("task-newline"), "pi"),
+      });
+      await store.transition(task, "active");
+      await store.approveWriteScope(task, [
+        "game/src/presentation/crlf.ts",
+        "game/src/presentation/mixed.ts",
+      ], "scope-task-newline");
+      const context = {
+        task,
+        store,
+        confirmCore: async () => true,
+        beforePatch: async () => undefined,
+        afterPatch: async () => undefined,
+      };
+      const crlfPath = "game/src/presentation/crlf.ts";
+      const mixedPath = "game/src/presentation/mixed.ts";
+      const crlfHash = await hashFile(worktreeRoot, crlfPath);
+      await applyPrecisePatch(context, { edits: [{
+        path: crlfPath,
+        baseHash: crlfHash,
+        oldText: "const target = 2;",
+        newText: "const target = 20;\nconst inserted = 21;",
+      }] });
+      assert.equal(
+        await readFile(join(worktreeRoot, crlfPath), "utf8"),
+        "const before = 1;\r\nconst target = 20;\r\nconst inserted = 21;\r\nconst after = 3;\r\n",
+      );
+      const mixedHash = await hashFile(worktreeRoot, mixedPath);
+      await applyPrecisePatch(context, { edits: [{
+        path: mixedPath,
+        baseHash: mixedHash,
+        oldText: "const target = 2;",
+        newText: "const target = 20;\nconst inserted = 21;",
+      }] });
+      assert.equal(
+        await readFile(join(worktreeRoot, mixedPath), "utf8"),
+        "const before = 1;\r\nconst target = 20;\nconst inserted = 21;\nconst after = 3;\r\n",
+      );
+    } finally {
+      if (worktreeRoot) {
+        await removeTaskWorktree(repository.repoRoot, worktreeRoot, worktreesDir)
+          .catch(() => undefined);
+      }
+      await repository.dispose();
+    }
+  });
 });

@@ -1,5 +1,5 @@
 /**
- * Playwright Chromium 与协议 v2/v3 页面客户端。
+ * Playwright Chromium 与协议 v3 页面客户端。
  *
  * 浏览器使用全新临时 Context，不读取用户 Chrome Profile。所有页面调用都固定为
  * look/go/use/inputSql/query/judge/checkpoint，不接受模型 JavaScript、CSS 选择器或坐标；
@@ -206,14 +206,14 @@ export class GameBrowser {
     );
   }
 
-  /** 返回已通过兼容门禁的桥协议版本。 */
-  async protocolVersion(): Promise<2 | 3> {
+  /** 返回已通过门禁的当前桥协议版本。 */
+  async protocolVersion(): Promise<3> {
     const version = await this.needGameFrame().then((frame) => frame.evaluate(() => (
       (window as unknown as {
         __DUNGEON_PLAYTEST__?: { version?: number };
       }).__DUNGEON_PLAYTEST__?.version
     )));
-    if (version !== 2 && version !== 3) throw new GameBrowserError("游戏桥协议版本不受支持");
+    if (version !== 3) throw new GameBrowserError("游戏桥协议版本不受支持");
     return version;
   }
 
@@ -223,7 +223,7 @@ export class GameBrowser {
       const version = (window as unknown as {
         __DUNGEON_PLAYTEST__?: { version?: number };
       }).__DUNGEON_PLAYTEST__?.version;
-      return version === 2 || version === 3;
+      return version === 3;
     });
     await currentFrame.waitForFunction(() => (
       document.querySelector("#app")?.getAttribute("data-runtime-state")

@@ -11,6 +11,50 @@ import type { AgentEvalReproductionStep } from "./agent-eval-case.js";
 
 export type AgentEvalPlanClass = "scan" | "search" | "placeholder" | "none";
 
+const BEFORE_ORACLES = [
+  "terminal-action-unavailable",
+  "combat-stalled",
+  "boss-stuck-one-hp",
+  "floor-transition-stuck",
+  "transition-stuck",
+  "stale-query-plan",
+  "victory-count-duplicated",
+] as const;
+
+const AFTER_ORACLES = [
+  "terminal-action-available",
+  "combat-progressed",
+  "boss-defeated",
+  "floor-advanced",
+  "query-plan-current",
+  "victory-count-once",
+] as const;
+
+/** 当前 7 个案例允许的故障态 Oracle ID。 */
+export type AgentEvalBeforeOracle = typeof BEFORE_ORACLES[number];
+
+/** 当前 7 个案例允许的修复态 Oracle ID。 */
+export type AgentEvalAfterOracle = typeof AFTER_ORACLES[number];
+
+const BEFORE_ORACLE_SET = new Set<string>(BEFORE_ORACLES);
+const AFTER_ORACLE_SET = new Set<string>(AFTER_ORACLES);
+
+/** 严格读取当前故障态 Oracle ID，旧别名直接拒绝。 */
+export function parseAgentEvalBeforeOracle(value: unknown): AgentEvalBeforeOracle {
+  if (typeof value !== "string" || !BEFORE_ORACLE_SET.has(value)) {
+    throw new Error("expected.json beforeOracle 不受支持");
+  }
+  return value as AgentEvalBeforeOracle;
+}
+
+/** 严格读取当前修复态 Oracle ID，旧别名直接拒绝。 */
+export function parseAgentEvalAfterOracle(value: unknown): AgentEvalAfterOracle {
+  if (typeof value !== "string" || !AFTER_ORACLE_SET.has(value)) {
+    throw new Error("expected.json afterOracle 不受支持");
+  }
+  return value as AgentEvalAfterOracle;
+}
+
 /** 单个复现步骤完成后的低敏 Oracle 观测。 */
 export interface AgentEvalOracleObservation {
   readonly stepIndex: number;
@@ -30,12 +74,6 @@ function finalObservation(
   return observations.find((entry) => entry.isFinal) ?? observations.at(-1) ?? null;
 }
 
-function queryEvents(observations: readonly AgentEvalOracleObservation[]): string[] {
-  return observations
-    .filter((entry) => entry.op === "query")
-    .map((entry) => entry.event);
-}
-
 /** 把玩家可见执行计划压缩为不含正文的稳定类别。 */
 export function classifyAgentEvalPlan(view: PlayView): AgentEvalPlanClass {
   const text = view.terminal?.plan.join("\n").toUpperCase() ?? "";
@@ -47,22 +85,16 @@ export function classifyAgentEvalPlan(view: PlayView): AgentEvalPlanClass {
 
 /** 匹配注入故障版本必须呈现的公开失败。 */
 export function matchesBeforeOracle(
-  oracle: string,
+  oracle: AgentEvalBeforeOracle,
   observations: readonly AgentEvalOracleObservation[],
 ): boolean {
   if (oracle === "terminal-action-unavailable") {
     return observations.some((entry) => !entry.ok && entry.event === "action-not-available");
   }
-  if (oracle === "no-failure") return observations.every((entry) => entry.ok);
-  if (oracle === "query-rejected") return observations.some((entry) => entry.event === "query-rejected");
   if (oracle === "combat-stalled") return observations.some((entry) => (
     entry.event === "query-accepted" && (entry.judge.stageIndex ?? 0) === 0
   ));
   if (oracle === "boss-stuck-one-hp") return observations.some((entry) => entry.judge.bossHp === 1);
-  if (oracle === "reward-missing") return observations.some((entry) => (entry.judge.claimableReward ?? null) === null);
-  if (oracle === "portal-blocked") return observations.some((entry) => (
-    entry.event !== "query-accepted" && entry.view.mode === "explore" && !entry.judge.advanced
-  ));
   if (oracle === "floor-transition-stuck") {
     const final = finalObservation(observations);
     return Boolean(final
@@ -73,81 +105,36 @@ export function matchesBeforeOracle(
   if (oracle === "transition-stuck") return observations.some((entry) => (
     entry.view.mode === "transition" && !entry.judge.advanced
   ));
-  if (oracle === "boss-hp-reset") return observations.some((entry) => (
-    entry.event === "query-accepted"
-    && entry.judge.lessons === entry.judge.requiredLessons
-    && !entry.judge.bossDefeated
-    && (entry.judge.bossHp ?? 0) > 0
-  ));
-  if (oracle === "transition-lost") {
-    const final = finalObservation(observations);
-    return Boolean(final
-      && final.reloadObserved
-      && final.view.mode === "explore"
-      && !final.judge.advanced);
-  }
-  if (oracle === "sandbox-state-leaked") {
-    return queryEvents(observations).join("\n") === "query-accepted\nquery-rejected";
-  }
   if (oracle === "stale-query-plan") {
     const queries = observations.filter((entry) => entry.op === "query");
     return queries.length === 1
       && (queries[0]?.planClass === "scan" || queries[0]?.event === "query-rejected");
   }
-  if (oracle === "plan-placeholder") return observations.some((entry) => entry.planClass === "placeholder");
-  if (oracle === "plan-missing") return observations.some((entry) => (
-    entry.op === "query" && entry.event === "query-accepted" && entry.planClass === "none"
-  ));
-  if (oracle === "guidance-route-missing") return observations.some((entry) => (
-    entry.judge.lessons < entry.judge.requiredLessons && entry.judge.guidanceDistance === null
-  ));
-  if (oracle === "victory-count-duplicated") return observations.some((entry) => (entry.judge.victories ?? 0) > 1);
-  if (oracle === "victory-not-committed") return observations.some((entry) => entry.view.mode !== "victory");
-  throw new Error("不支持的 beforeOracle：" + oracle);
+  return observations.some((entry) => (entry.judge.victories ?? 0) > 1);
 }
 
 /** 匹配修复版本最终必须满足的公开结果。 */
 export function matchesAfterOracle(
-  oracle: string,
+  oracle: AgentEvalAfterOracle,
   observations: readonly AgentEvalOracleObservation[],
 ): boolean {
   if (oracle === "terminal-action-available") {
     return observations.some((entry) => entry.ok && entry.event === "action:terminal");
   }
-  if (oracle === "no-failure") return observations.every((entry) => entry.ok);
-  if (oracle === "query-accepted") return observations.some((entry) => entry.event === "query-accepted");
   if (oracle === "combat-progressed") return observations.some((entry) => (
     entry.event === "query-accepted" && (entry.judge.stageIndex ?? 0) > 0
   ));
   if (oracle === "boss-defeated") return observations.some((entry) => entry.judge.bossDefeated);
-  if (oracle === "reward-available") return observations.some((entry) => (entry.judge.claimableReward ?? null) !== null);
-  if (oracle === "portal-unlocked") return observations.some((entry) => entry.view.mode === "combat");
   if (oracle === "floor-advanced") {
     const final = finalObservation(observations);
     return Boolean(final && (final.judge.advanced || final.view.floor > final.judge.floor));
-  }
-  if (oracle === "boss-hp-zero") {
-    const defeatedAt = observations.findIndex((entry) => entry.judge.bossDefeated);
-    return defeatedAt >= 0 && observations.slice(defeatedAt).every((entry) => entry.judge.bossDefeated || entry.judge.advanced);
-  }
-  if (oracle === "transition-restored") {
-    const final = finalObservation(observations);
-    return Boolean(final
-      && final.reloadObserved
-      && (final.view.mode === "transition" || final.judge.advanced));
-  }
-  if (oracle === "sandbox-isolated") {
-    return queryEvents(observations).join("\n") === "query-accepted\nquery-accepted";
   }
   if (oracle === "query-plan-current") {
     const queries = observations.filter((entry) => entry.op === "query");
     return queries.length === 1
       && (queries[0]?.planClass === "search" || queries[0]?.event === "query-accepted");
   }
-  if (oracle === "guidance-route-available") return observations.some((entry) => (
-    typeof entry.judge.guidanceDistance === "number"
+  return observations.some((entry) => (
+    entry.view.mode === "victory" && (entry.judge.victories ?? 0) === 1
   ));
-  if (oracle === "victory-count-once") return observations.some((entry) => entry.view.mode === "victory" && (entry.judge.victories ?? 0) === 1);
-  if (oracle === "victory-committed") return observations.some((entry) => entry.view.mode === "victory");
-  throw new Error("不支持的 afterOracle：" + oracle);
 }

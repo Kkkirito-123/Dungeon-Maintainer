@@ -15,9 +15,34 @@ import { registerInspectTool } from "../src/pi/tools/inspect.js";
 import { TaskStore } from "../src/task/store.js";
 import { createTemporaryGitRepository } from "./testSupport.js";
 
-const architectureMap = JSON.stringify({
-  schemaVersion: 1,
+const currentArchitectureContract = {
+  schemaVersion: 4,
+  contractId: "dungeon.game.architecture",
+  contractVersion: 1,
   projectRoot: "game",
+  boundaryRevision: 1,
+  runtime: {
+    sourceRoot: "game",
+    bridgeProtocol: 3,
+    adapterVersion: 2,
+    supportedCapabilities: ["catalog", "describe", "materialize"],
+  },
+  maintenancePolicy: {
+    ordinaryFile: "no-update",
+    internalDirectory: "no-update",
+    rootMoveOrRename: "update",
+    areaPartitionChange: "update",
+    responsibilityOrRouteChange: "update",
+    invalidCore: "fallback",
+  },
+  boundary: {
+    algorithm: "direct-child-v1",
+    signature: "0".repeat(64),
+  },
+};
+
+const areaArchitectureMap = JSON.stringify({
+  ...currentArchitectureContract,
   layers: [
     { id: "domain", root: "game/src/domain", responsibility: "游戏领域规则" },
   ],
@@ -41,11 +66,13 @@ const architectureMap = JSON.stringify({
       neighbors: ["domain.combat"],
     },
   ],
+  partitions: [],
+  floorScopes: [],
+  features: [],
 }, null, 2);
 
-const architectureMapV2 = JSON.stringify({
-  schemaVersion: 2,
-  projectRoot: "game",
+const partitionArchitectureMap = JSON.stringify({
+  ...currentArchitectureContract,
   layers: [
     { id: "presentation", root: "game/src/presentation", responsibility: "游戏展示" },
   ],
@@ -71,11 +98,12 @@ const architectureMapV2 = JSON.stringify({
       neighbors: [],
     },
   ],
+  floorScopes: [],
+  features: [],
 }, null, 2);
 
-const architectureMapV3 = JSON.stringify({
-  schemaVersion: 3,
-  projectRoot: "game",
+const floorArchitectureMap = JSON.stringify({
+  ...currentArchitectureContract,
   layers: [
     { id: "content", root: "game/src/content", responsibility: "游戏内容" },
     { id: "devtools", root: "game/src/devtools", responsibility: "开发维护桥" },
@@ -120,6 +148,9 @@ const architectureMapV3 = JSON.stringify({
       signals: ["第二层", "2层"],
       neighbors: ["floor.03"],
       sharedPartitions: ["content.world.shared"],
+      contentRefs: ["content.world"],
+      serviceRefs: ["content.world.shared"],
+      featureRefs: [],
     },
     {
       id: "floor.03",
@@ -129,6 +160,9 @@ const architectureMapV3 = JSON.stringify({
       signals: ["第三层", "3层"],
       neighbors: ["floor.02", "floor.04"],
       sharedPartitions: ["content.world.shared"],
+      contentRefs: ["content.world"],
+      serviceRefs: ["content.world.shared"],
+      featureRefs: [],
     },
     {
       id: "floor.04",
@@ -138,16 +172,16 @@ const architectureMapV3 = JSON.stringify({
       signals: ["第四层", "4层"],
       neighbors: ["floor.03"],
       sharedPartitions: ["content.world.shared"],
+      contentRefs: ["content.world"],
+      serviceRefs: ["content.world.shared"],
+      featureRefs: [],
     },
   ],
+  features: [],
 }, null, 2);
 
-const architectureMapV4Value = {
-  schemaVersion: 4,
-  contractId: "dungeon.game.architecture",
-  contractVersion: 1,
-  projectRoot: "game",
-  boundaryRevision: 1,
+const featureArchitectureMapValue = {
+  ...currentArchitectureContract,
   layers: [
     { id: "content", root: "game/src/content", responsibility: "游戏内容" },
     { id: "domain", root: "game/src/domain", responsibility: "游戏规则" },
@@ -225,32 +259,14 @@ const architectureMapV4Value = {
       serviceProviders: ["domain.session"],
     },
   ],
-  runtime: {
-    sourceRoot: "game",
-    bridgeProtocol: 3,
-    adapterVersion: 1,
-    supportedCapabilities: ["catalog", "describe", "materialize"],
-  },
-  maintenancePolicy: {
-    ordinaryFile: "no-update",
-    internalDirectory: "no-update",
-    rootMoveOrRename: "update",
-    areaPartitionChange: "update",
-    responsibilityOrRouteChange: "update",
-    invalidCore: "fallback",
-  },
-  boundary: {
-    algorithm: "direct-child-v1",
-    signature: "0".repeat(64),
-  },
 };
 
-const architectureMapV4 = JSON.stringify(architectureMapV4Value, null, 2);
+const featureArchitectureMap = JSON.stringify(featureArchitectureMapValue, null, 2);
 
 describe("游戏区域职责路由", () => {
-  it("schema v4 先按跨层 feature 路由，再保留楼层上下文", async () => {
+  it("当前架构表先按跨层 feature 路由，再保留楼层上下文", async () => {
     const repository = await createTemporaryGitRepository({
-      ".maintainer/architecture-map.json": architectureMapV4,
+      ".maintainer/architecture-map.json": featureArchitectureMap,
       "game/src/content/world/floors/floor01/content.ts": "export const floorNeedle = 'floor-only';\n",
       "game/src/domain/combat/damage.ts": "export const damageRule = true;\n",
       "game/src/domain/session/combat/finalBoss.ts": "export const minimumHp = 'final-needle';\n",
@@ -262,6 +278,7 @@ describe("游戏区域职责路由", () => {
       assert.equal(loaded.map?.schemaVersion, 4);
       assert.ok(loaded.map);
       assert.equal(loaded.map.runtime.bridgeProtocol, 3);
+      assert.equal(loaded.map.runtime.adapterVersion, 2);
       const route = routeArchitecture(
         loaded.map,
         "第一层区域层主最终阶段生命下限错误，永远剩余 1 HP",
@@ -273,15 +290,15 @@ describe("游戏区域职责路由", () => {
       assert.equal(route.featurePrimaryRoots[0], "game/src/domain/session/combat");
       assert.match(architectureRouteCard(route) ?? "", /feature\.combat-resolution/u);
 
-      const dataDir = join(repository.temporaryRoot, "data-v4");
+      const dataDir = join(repository.temporaryRoot, "data-current-feature");
       const store = new TaskStore(dataDir);
       const task = await store.create({
-        id: "architecture-routing-v4",
+        id: "architecture-routing-current-feature",
         objective: "修复最终阶段生命下限",
         repoRoot: repository.repoRoot,
         baseHead: repository.baseHead,
         worktreeRoot: repository.repoRoot,
-        piSessionDir: join(dataDir, "tasks", "architecture-routing-v4", "pi"),
+        piSessionDir: join(dataDir, "tasks", "architecture-routing-current-feature", "pi"),
       });
       await store.transition(task, "active");
       const evidence = new EvidenceStore(dataDir, task);
@@ -294,9 +311,15 @@ describe("游戏区域职责路由", () => {
       };
       const bundle = await inspectTask(context, { action: "bundle", query: "final-needle" });
       assert.equal(bundle.details.expansionLevel, "feature-primary");
+      assert.equal(bundle.details.featureRouteLevel, "primary");
       assert.equal(bundle.details.expanded, false);
       assert.match(bundle.text, /domain\/session\/combat\/finalBoss\.ts/u);
       assert.doesNotMatch(bundle.text, /content\/world\/floors/u);
+
+      const floorFallback = await inspectTask(context, { action: "search", query: "floor-only" });
+      assert.equal(floorFallback.details.featureRouteLevel, "none");
+      assert.equal(floorFallback.details.expansionLevel, "floor-context");
+      assert.match(floorFallback.text, /content\/world\/floors\/floor01\/content\.ts/u);
 
       const explicit = await inspectTask(context, {
         action: "bundle",
@@ -304,6 +327,7 @@ describe("游戏区域职责路由", () => {
         featureId: "feature.combat-resolution",
       });
       assert.equal(explicit.details.expansionLevel, "explicit-feature");
+      assert.equal(explicit.details.featureRouteLevel, "none");
     } finally {
       await repository.dispose();
     }
@@ -311,7 +335,7 @@ describe("游戏区域职责路由", () => {
 
   it("feature bundle 字面症状零命中时只在同一职责范围使用概念词补搜", async () => {
     const repository = await createTemporaryGitRepository({
-      ".maintainer/architecture-map.json": architectureMapV4,
+      ".maintainer/architecture-map.json": featureArchitectureMap,
       "game/src/content/world/floors/floor01/content.ts": "export const floorOnly = true;\n",
       "game/src/domain/combat/damage.ts": "export const unrelated = true;\n",
       "game/src/domain/session/combat/resolveHit.ts": [
@@ -324,15 +348,20 @@ describe("游戏区域职责路由", () => {
     try {
       const loaded = await loadArchitectureMap(repository.repoRoot);
       assert.ok(loaded.map);
-      const dataDir = join(repository.temporaryRoot, "data-v4-concept-bundle");
+      const dataDir = join(repository.temporaryRoot, "data-current-concept-bundle");
       const store = new TaskStore(dataDir);
       const task = await store.create({
-        id: "architecture-routing-v4-concept-bundle",
+        id: "architecture-routing-current-concept-bundle",
         objective: "验证 feature 概念补搜",
         repoRoot: repository.repoRoot,
         baseHead: "a".repeat(40),
         worktreeRoot: repository.repoRoot,
-        piSessionDir: join(dataDir, "tasks", "architecture-routing-v4-concept-bundle", "pi"),
+        piSessionDir: join(
+          dataDir,
+          "tasks",
+          "architecture-routing-current-concept-bundle",
+          "pi",
+        ),
       });
       await store.transition(task, "active");
       const evidence = new EvidenceStore(dataDir, task);
@@ -361,43 +390,105 @@ describe("游戏区域职责路由", () => {
     }
   });
 
-  it("schema v4 忽略未来元数据并丢弃单个非法 feature，不使核心地图失效", async () => {
-    const compatible = structuredClone(architectureMapV4Value) as Record<string, unknown> & {
+  it("当前架构表严格拒绝未知字段、非法 feature 和未知 featureRef", async () => {
+    const unknownFieldMap = JSON.parse(featureArchitectureMap) as Record<string, unknown>;
+    unknownFieldMap.futureMetadata = { version: 5 };
+
+    const invalidFeatureMap = JSON.parse(featureArchitectureMap) as Record<string, unknown> & {
       features: Array<Record<string, unknown>>;
     };
-    compatible.futureMetadata = { version: 5 };
-    compatible.features.push({
-      ...compatible.features[0],
-      id: "feature.invalid-route",
-      roots: ["domain.missing"],
-    });
-    const repository = await createTemporaryGitRepository({
-      ".maintainer/architecture-map.json": JSON.stringify(compatible),
-      "game/src/content/world/floors/floor01/content.ts": "export const floor = 1;\n",
-      "game/src/domain/combat/damage.ts": "export const damage = 1;\n",
-      "game/src/domain/session/combat/finalBoss.ts": "export const boss = 1;\n",
-      "game/src/domain/session/GameSession.ts": "export const session = 1;\n",
-    });
-    try {
-      const loaded = await loadArchitectureMap(repository.repoRoot);
-      assert.ok(loaded.map);
-      assert.deepEqual(loaded.map.features.map((feature) => feature.id), [
-        "feature.combat-resolution",
-      ]);
-      assert.match(loaded.warning ?? "", /futureMetadata/u);
-      assert.match(loaded.warning ?? "", /已忽略/u);
-    } finally {
-      await repository.dispose();
+    const invalidFeature = invalidFeatureMap.features[0];
+    assert.ok(invalidFeature);
+    invalidFeature.roots = ["domain.missing"];
+
+    const unknownFeatureRefMap = JSON.parse(featureArchitectureMap) as Record<string, unknown> & {
+      floorScopes: Array<Record<string, unknown> & { featureRefs: string[] }>;
+    };
+    const floorScope = unknownFeatureRefMap.floorScopes[0];
+    assert.ok(floorScope);
+    floorScope.featureRefs = ["feature.missing"];
+
+    const invalidMaps = [
+      { map: unknownFieldMap, reason: /architecture-map 包含未知字段：futureMetadata/u },
+      { map: invalidFeatureMap, reason: /feature\.roots 包含未知引用/u },
+      { map: unknownFeatureRefMap, reason: /featureRefs 包含未知 feature/u },
+    ];
+    for (const invalid of invalidMaps) {
+      const repository = await createTemporaryGitRepository({
+        ".maintainer/architecture-map.json": JSON.stringify(invalid.map),
+        "game/src/content/world/floors/floor01/content.ts": "export const floor = 1;\n",
+        "game/src/domain/combat/damage.ts": "export const damage = 1;\n",
+        "game/src/domain/session/combat/finalBoss.ts": "export const boss = 1;\n",
+        "game/src/domain/session/GameSession.ts": "export const session = 1;\n",
+      });
+      try {
+        const loaded = await loadArchitectureMap(repository.repoRoot);
+        assert.equal(loaded.map, null);
+        assert.match(loaded.warning ?? "", /已回退普通搜索/u);
+        assert.match(loaded.warning ?? "", invalid.reason);
+      } finally {
+        await repository.dispose();
+      }
     }
   });
 
-  it("旧 schema 的 projectRoot 不再硬编码为 game", async () => {
-    const portable = JSON.parse(architectureMap) as {
+  it("只接受唯一当前 schema 4，旧 schema 直接回退普通搜索", async () => {
+    for (const schemaVersion of [1, 2, 3]) {
+      const oldMap = JSON.parse(areaArchitectureMap) as { schemaVersion: number };
+      oldMap.schemaVersion = schemaVersion;
+      const repository = await createTemporaryGitRepository({
+        ".maintainer/architecture-map.json": JSON.stringify(oldMap),
+        "game/src/domain/combat/damage.ts": "export const damage = 1;\n",
+        "game/src/domain/session/state.ts": "export const state = 1;\n",
+      });
+      try {
+        const loaded = await loadArchitectureMap(repository.repoRoot);
+        assert.equal(loaded.map, null);
+        assert.match(loaded.warning ?? "", /只接受当前 schema v4/u);
+      } finally {
+        await repository.dispose();
+      }
+    }
+  });
+
+  it("当前架构表只接受现行 runtime 契约", async () => {
+    const invalidRuntimeValues = [
+      { bridgeProtocol: 2, adapterVersion: 2 },
+      { bridgeProtocol: 3, adapterVersion: 1 },
+    ];
+    for (const runtime of invalidRuntimeValues) {
+      const invalid = JSON.parse(areaArchitectureMap) as {
+        runtime: { bridgeProtocol: number; adapterVersion: number };
+      };
+      invalid.runtime.bridgeProtocol = runtime.bridgeProtocol;
+      invalid.runtime.adapterVersion = runtime.adapterVersion;
+      const repository = await createTemporaryGitRepository({
+        ".maintainer/architecture-map.json": JSON.stringify(invalid),
+        "game/src/domain/combat/damage.ts": "export const damage = 1;\n",
+        "game/src/domain/session/state.ts": "export const state = 1;\n",
+      });
+      try {
+        const loaded = await loadArchitectureMap(repository.repoRoot);
+        assert.equal(loaded.map, null);
+        assert.match(
+          loaded.warning ?? "",
+          /只接受 bridgeProtocol 3 和 adapterVersion 2/u,
+        );
+      } finally {
+        await repository.dispose();
+      }
+    }
+  });
+
+  it("当前架构表的 projectRoot 不硬编码为 game", async () => {
+    const portable = JSON.parse(areaArchitectureMap) as {
       projectRoot: string;
       layers: Array<{ root: string }>;
       areas: Array<{ root: string }>;
+      runtime: { sourceRoot: string };
     };
     portable.projectRoot = "client";
+    portable.runtime.sourceRoot = "client";
     const [domainLayer] = portable.layers;
     const [combatArea, sessionArea] = portable.areas;
     assert.ok(domainLayer);
@@ -428,7 +519,7 @@ describe("游戏区域职责路由", () => {
       "test-fixtures",
       "agent-evals",
       "_bases",
-      "game-repair-v1",
+      "game-repair",
       "repository",
     );
     const loaded = await loadArchitectureMap(fixtureRoot);
@@ -446,7 +537,7 @@ describe("游戏区域职责路由", () => {
 
   it("只按稳定区域选择搜索根，不把地图当成文件索引", async () => {
     const repository = await createTemporaryGitRepository({
-      ".maintainer/architecture-map.json": architectureMap,
+      ".maintainer/architecture-map.json": areaArchitectureMap,
       "game/src/domain/combat/damage.ts": "export const bossFloor = 1;\nexport const target = 'needle';\n",
       "game/src/domain/session/state.ts": "export const state = 'ready';\n",
       "game/src/domain/other.ts": "export const unrelated = 'needle';\n",
@@ -486,7 +577,7 @@ describe("游戏区域职责路由", () => {
       assert.equal(firstSearch.details.expanded, false);
 
       const repeatedSearch = await inspectTask(context, { action: "search", query: "needle" });
-      assert.equal(repeatedSearch.details.receiptOnly, true);
+      assert.equal(repeatedSearch.details.cacheKind, "exact");
       assert.match(repeatedSearch.text, /ALREADY_SEEN/u);
 
       const firstRead = await inspectTask(context, {
@@ -495,7 +586,7 @@ describe("游戏区域职责路由", () => {
         startLine: 1,
         lineCount: 2,
       });
-      assert.equal(firstRead.details.receiptOnly, false);
+      assert.equal(firstRead.details.cacheKind, "none");
       const overlappingRead = await inspectTask(context, {
         action: "read",
         path: "game/src/domain/combat/damage.ts",
@@ -520,9 +611,52 @@ describe("游戏区域职责路由", () => {
     }
   });
 
-  it("schema v3 按当前楼层、相邻楼层、共享父级服务三级扩展", async () => {
+  it("多词查询零命中时按字面词项回退并优先返回具体符号", async () => {
     const repository = await createTemporaryGitRepository({
-      ".maintainer/architecture-map.json": architectureMapV3,
+      "game/src/domain/generic.ts": "export const sync = () => true;\n",
+      "game/src/presentation/dom/AppShell.ts": [
+        "const advanceFromFloorTransition = true;",
+        "const shouldScheduleAdvance = advanceFromFloorTransition;",
+        "floorTransitionCoordinator.sync(shouldScheduleAdvance, 1_500);",
+        "",
+      ].join("\n"),
+    });
+    try {
+      const dataDir = join(repository.temporaryRoot, "data-literal-fallback");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "architecture-literal-fallback",
+        objective: "修复传送调度",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(dataDir, "tasks", "architecture-literal-fallback", "pi"),
+      });
+      await store.transition(task, "active");
+      const evidence = new EvidenceStore(dataDir, task);
+      const bundle = await inspectTask({
+        task,
+        store,
+        evidence,
+        architectureMap: () => null,
+        architectureRoute: () => null,
+      }, {
+        action: "bundle",
+        query: "advanceFromFloorTransition sync floorTransitionCoordinator shouldScheduleAdvance",
+      });
+
+      assert.equal(bundle.details.bundleWindows, 1);
+      assert.match(bundle.text, /presentation\/dom\/AppShell\.ts/u);
+      assert.match(bundle.text, /shouldScheduleAdvance/u);
+      assert.doesNotMatch(bundle.text, /domain\/generic\.ts/u);
+    } finally {
+      await repository.dispose();
+    }
+  });
+
+  it("当前架构表按当前楼层、相邻楼层、共享父级服务三级扩展", async () => {
+    const repository = await createTemporaryGitRepository({
+      ".maintainer/architecture-map.json": floorArchitectureMap,
       "game/src/content/world/floors/floor02/content.ts": "export const floor02 = 'other';\n",
       "game/src/content/world/floors/floor03/content.ts": "export const currentNeedle = 'current-needle';\n",
       "game/src/content/world/floors/floor03/imports.ts": "import { sharedProviderNeedle } from '../../shared/service.js';\nexport const provider = 1;\n",
@@ -535,7 +669,7 @@ describe("游戏区域职责路由", () => {
     try {
       const loaded = await loadArchitectureMap(repository.repoRoot);
       assert.equal(loaded.warning, null);
-      assert.equal(loaded.map?.schemaVersion, 3);
+      assert.equal(loaded.map?.schemaVersion, 4);
       const route = routeArchitecture(loaded.map, "没有显式楼层的故障", 3);
       assert.equal(route?.currentFloorScope?.id, "floor.03");
       assert.deepEqual(
@@ -556,15 +690,15 @@ describe("游戏区域职责路由", () => {
       assert.equal(terminalRoute.currentFloorScope, null);
       assert.equal(terminalRoute.primaryAreas[0]?.id, "devtools.dungeon-agent");
 
-      const dataDir = join(repository.temporaryRoot, "data-v3");
+      const dataDir = join(repository.temporaryRoot, "data-current-floor");
       const store = new TaskStore(dataDir);
       const task = await store.create({
-        id: "architecture-routing-v3",
+        id: "architecture-routing-current-floor",
         objective: "修复第三层",
         repoRoot: repository.repoRoot,
         baseHead: repository.baseHead,
         worktreeRoot: repository.repoRoot,
-        piSessionDir: join(dataDir, "tasks", "architecture-routing-v3", "pi"),
+        piSessionDir: join(dataDir, "tasks", "architecture-routing-current-floor", "pi"),
       });
       await store.transition(task, "active");
       const evidence = new EvidenceStore(dataDir, task);
@@ -612,13 +746,13 @@ describe("游戏区域职责路由", () => {
         floorId: "floor.04",
       });
       assert.equal(explicitFloor.details.floorRouteLevel, "current");
-      assert.equal(explicitFloor.details.receiptOnly, false);
+      assert.equal(explicitFloor.details.cacheKind, "none");
       const repeated = await inspectTask(context, {
         action: "bundle",
         query: "  ADJACENT-NEEDLE  ",
         floorId: "floor.04",
       });
-      assert.equal(repeated.details.receiptOnly, true);
+      assert.equal(repeated.details.cacheKind, "exact");
       assert.match(repeated.text, /floorRouteLevel=current/u);
 
       assert.notEqual(
@@ -645,8 +779,8 @@ describe("游戏区域职责路由", () => {
     }
   });
 
-  it("schema v3 拒绝跨层邻接", async () => {
-    const invalid = JSON.parse(architectureMapV3) as {
+  it("当前架构表拒绝跨层邻接", async () => {
+    const invalid = JSON.parse(floorArchitectureMap) as {
       floorScopes: Array<{ neighbors: string[]; sharedPartitions: string[] }>;
     };
     const first = invalid.floorScopes[0];
@@ -669,8 +803,8 @@ describe("游戏区域职责路由", () => {
     }
   });
 
-  it("schema v3 拒绝未知共享 partition", async () => {
-    const invalid = JSON.parse(architectureMapV3) as {
+  it("当前架构表拒绝未知共享 partition", async () => {
+    const invalid = JSON.parse(floorArchitectureMap) as {
       floorScopes: Array<{ sharedPartitions: string[] }>;
     };
     const first = invalid.floorScopes[0];
@@ -693,33 +827,33 @@ describe("游戏区域职责路由", () => {
     }
   });
 
-  it("schema v2 优先路由稳定 partition，并一次返回多个不重叠源码窗口", async () => {
+  it("当前架构表优先路由稳定 partition，并一次返回多个不重叠源码窗口", async () => {
     const actorSource = Array.from({ length: 150 }, (_, index) => (
       index === 20 || index === 110
         ? "export const actorNeedle" + String(index) + " = 'needle';"
         : "// actor line " + String(index)
     )).join("\n") + "\n";
     const repository = await createTemporaryGitRepository({
-      ".maintainer/architecture-map.json": architectureMapV2,
+      ".maintainer/architecture-map.json": partitionArchitectureMap,
       "game/src/presentation/phaser/actors/ActorView.ts": actorSource,
       "game/src/presentation/phaser/other.ts": "export const unrelated = 'needle';\n",
     });
     try {
       const loaded = await loadArchitectureMap(repository.repoRoot);
       assert.equal(loaded.warning, null);
-      assert.equal(loaded.map?.schemaVersion, 2);
+      assert.equal(loaded.map?.schemaVersion, 4);
       const route = routeArchitecture(loaded.map, "角色显示 actor 错误");
       assert.equal(route?.primaryPartitions[0]?.id, "presentation.phaser.actors");
 
-      const dataDir = join(repository.temporaryRoot, "data-v2");
+      const dataDir = join(repository.temporaryRoot, "data-current-partition");
       const store = new TaskStore(dataDir);
       const task = await store.create({
-        id: "architecture-routing-v2",
+        id: "architecture-routing-current-partition",
         objective: "修复角色显示",
         repoRoot: repository.repoRoot,
         baseHead: repository.baseHead,
         worktreeRoot: repository.repoRoot,
-        piSessionDir: join(dataDir, "tasks", "architecture-routing-v2", "pi"),
+        piSessionDir: join(dataDir, "tasks", "architecture-routing-current-partition", "pi"),
       });
       await store.transition(task, "active");
       const evidence = new EvidenceStore(dataDir, task);
@@ -734,6 +868,8 @@ describe("游戏区域职责路由", () => {
       assert.equal(bundle.details.expansionLevel, "primary-partition");
       assert.equal(bundle.details.expanded, false);
       assert.equal(bundle.details.bundleWindows, 2);
+      assert.equal(bundle.details.candidateFiles, 1);
+      assert.equal(bundle.details.selectedFiles, 1);
       assert.equal(bundle.details.items?.length, 2);
       assert.doesNotMatch(bundle.text, /phaser\/other\.ts/u);
       assert.match(bundle.text, /baseHash=/u);
@@ -743,7 +879,7 @@ describe("游戏区域职责路由", () => {
         action: "bundle",
         query: "  NEEDLE  ",
       });
-      assert.equal(repeated.details.receiptOnly, true);
+      assert.equal(repeated.details.cacheKind, "exact");
     } finally {
       await repository.dispose();
     }
@@ -757,7 +893,7 @@ describe("游戏区域职责路由", () => {
         : "// " + label + " padded source " + "x".repeat(20) + " " + String(index + 1),
     ).join("\n") + "\n";
     const repository = await createTemporaryGitRepository({
-      ".maintainer/architecture-map.json": architectureMapV2,
+      ".maintainer/architecture-map.json": partitionArchitectureMap,
       "game/src/presentation/phaser/actors/Alpha.ts": padded("alpha", 20),
       "game/src/presentation/phaser/actors/Beta.ts": padded("beta", 20),
     });
@@ -796,7 +932,7 @@ describe("游戏区域职责路由", () => {
         startLine: 20,
         lineCount: 1,
       });
-      assert.equal(preciseRead.details.receiptOnly, false);
+      assert.equal(preciseRead.details.cacheKind, "none");
       assert.match(preciseRead.text, /budget-needle/u);
     } finally {
       await repository.dispose();
@@ -806,7 +942,7 @@ describe("游戏区域职责路由", () => {
   it("bundle 遇到长行源码仍保留一个可展示窗口", async () => {
     const longLine = "x".repeat(6_000);
     const repository = await createTemporaryGitRepository({
-      ".maintainer/architecture-map.json": architectureMapV2,
+      ".maintainer/architecture-map.json": partitionArchitectureMap,
       "game/src/presentation/phaser/actors/LongLine.ts": [
         `export const longNeedle = '${longLine}';`,
         "export const stable = true;",
@@ -886,7 +1022,7 @@ describe("游戏区域职责路由", () => {
         startLine: 1,
         lineCount: 1,
       });
-      assert.equal(preciseRead.details.receiptOnly, false);
+      assert.equal(preciseRead.details.cacheKind, "none");
       assert.match(preciseRead.text, /source/u);
     } finally {
       await repository.dispose();
@@ -901,7 +1037,7 @@ describe("游戏区域职责路由", () => {
         : "// source line " + String(index + 1),
     ).join("\n") + "\n";
     const repository = await createTemporaryGitRepository({
-      ".maintainer/architecture-map.json": architectureMapV2,
+      ".maintainer/architecture-map.json": partitionArchitectureMap,
       "game/src/presentation/phaser/actors/Split.ts": source("split-needle"),
       "game/src/presentation/phaser/actors/Covered.ts": source("covered-needle"),
     });
@@ -981,7 +1117,7 @@ describe("游戏区域职责路由", () => {
         startLine: 1,
         lineCount: 1,
       });
-      assert.equal(first.details.receiptOnly, false);
+      assert.equal(first.details.cacheKind, "none");
       const repeatedPath = process.platform === "win32"
         ? "GAME/SRC/DOMAIN/SESSION/state.ts"
         : canonicalPath;
@@ -991,7 +1127,7 @@ describe("游戏区域职责路由", () => {
         startLine: 1,
         lineCount: 1,
       });
-      assert.equal(repeated.details.receiptOnly, true);
+      assert.equal(repeated.details.cacheKind, "exact");
       assert.equal(
         inspectActionKey({ action: "read", path: ".\\A\\B.ts" }),
         inspectActionKey({ action: "read", path: "a/b.ts", startLine: 1, lineCount: 80 }),
@@ -1001,9 +1137,60 @@ describe("游戏区域职责路由", () => {
     }
   });
 
+  it("已缓存读取返回真正覆盖目标区间的证据 ID", async () => {
+    const path = "game/src/presentation/dom/AppShell.ts";
+    const repository = await createTemporaryGitRepository({
+      [path]: Array.from({ length: 100 }, (_, index) => (
+        "line-" + String(index + 1).padStart(3, "0")
+      )).join("\n") + "\n",
+    });
+    try {
+      const dataDir = join(repository.temporaryRoot, "data-read-coverage-index");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "architecture-read-coverage-index",
+        objective: "验证读取覆盖证据索引",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(dataDir, "tasks", "architecture-read-coverage-index", "pi"),
+      });
+      await store.transition(task, "active");
+      const context = { task, store, evidence: new EvidenceStore(dataDir, task) };
+      const unrelated = await inspectTask(context, {
+        action: "read",
+        path,
+        startLine: 1,
+        lineCount: 10,
+      });
+      const target = await inspectTask(context, {
+        action: "read",
+        path,
+        startLine: 50,
+        lineCount: 10,
+      });
+      const repeated = await inspectTask(context, {
+        action: "read",
+        path,
+        startLine: 50,
+        lineCount: 10,
+      });
+
+      assert.equal(repeated.details.cacheKind, "exact");
+      assert.match(repeated.text, new RegExp("evidence=" + target.details.evidenceId, "u"));
+      assert.match(repeated.text, new RegExp(
+        "coveringEvidence=" + target.details.evidenceId + ":50\\+10",
+        "u",
+      ));
+      assert.doesNotMatch(repeated.text, new RegExp("evidence=" + unrelated.details.evidenceId, "u"));
+    } finally {
+      await repository.dispose();
+    }
+  });
+
   it("Extension 提供的预计算 worktree Hash 在一次 Inspect 中只消费一次", async () => {
     const repository = await createTemporaryGitRepository({
-      ".maintainer/architecture-map.json": architectureMapV2,
+      ".maintainer/architecture-map.json": partitionArchitectureMap,
       "game/src/presentation/phaser/actors/ActorView.ts": "export const needle = true;\n",
     });
     try {
@@ -1046,7 +1233,7 @@ describe("游戏区域职责路由", () => {
     }
   });
 
-  it("地图非法时警告并回退，不阻止旧仓库", async () => {
+  it("地图非法时警告并回退普通安全搜索", async () => {
     const repository = await createTemporaryGitRepository({
       ".maintainer/architecture-map.json": "{}",
       "game/src/domain/combat/damage.ts": "export const value = 1;\n",

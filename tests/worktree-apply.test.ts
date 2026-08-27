@@ -192,11 +192,18 @@ describe("detached worktree 与显式 apply", () => {
         baseHead: repository.baseHead,
         sourceBranch: "main",
         sourceDirtyFiles: 0,
-        sourceSnapshotHash: null,
+        sourceSnapshotHash: await hashWorktree(repository.repoRoot),
         worktreeRoot,
         piSessionDir: join(store.taskDir("task-apply"), "pi"),
       });
       await store.transition(task, "active");
+      const sourceSnapshotHash = task.sourceSnapshotHash;
+      task.sourceSnapshotHash = null;
+      await assert.rejects(
+        capturePatch(task, store.taskDir(task.id)),
+        /缺少来源工作树快照/u,
+      );
+      task.sourceSnapshotHash = sourceSnapshotHash;
       await store.approveWriteScope(task, [path], "scope-task-apply");
       await verifyTaskWorktree(task);
       await applyPrecisePatch({
@@ -285,7 +292,7 @@ describe("detached worktree 与显式 apply", () => {
         baseHead: repository.baseHead,
         sourceBranch: "main",
         sourceDirtyFiles: 0,
-        sourceSnapshotHash: null,
+        sourceSnapshotHash: await hashWorktree(repository.repoRoot),
         worktreeRoot,
         piSessionDir: join(store.taskDir("task-drift"), "pi"),
       });
@@ -314,7 +321,7 @@ describe("detached worktree 与显式 apply", () => {
       await writeFile(join(worktreeRoot, path), "export const status = 'after';\n", "utf8");
       task.verification.worktreeHash = await hashWorktree(worktreeRoot);
       await writeFile(join(repository.repoRoot, path), "export const status = 'user edit';\n", "utf8");
-      await assert.rejects(applyTaskPatch(task), /未提交修改/u);
+      await assert.rejects(applyTaskPatch(task), /来源工作树已偏离任务启动快照/u);
     } finally {
       if (worktreeRoot) {
         await removeTaskWorktree(

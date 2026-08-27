@@ -4,6 +4,8 @@ import {
   classifyAgentEvalPlan,
   matchesAfterOracle,
   matchesBeforeOracle,
+  parseAgentEvalAfterOracle,
+  parseAgentEvalBeforeOracle,
   type AgentEvalOracleObservation,
 } from "../src/benchmark/agent-eval-oracle.js";
 import type { PlayJudge, PlayView } from "../src/game/protocol.js";
@@ -75,32 +77,27 @@ describe("Agent Eval 精确 Oracle", () => {
     assert.equal(matchesAfterOracle("floor-advanced", [stuck]), false);
   });
 
-  it("transition reload 案例必须实际经过 reload", () => {
-    const lostWithoutReload = observation({
-      view: view({ mode: "explore" }),
-      judge: judge({ advanced: false }),
-    });
-    assert.equal(matchesBeforeOracle("transition-lost", [lostWithoutReload]), false);
-
-    const lostAfterReload = observation({ ...lostWithoutReload, reloadObserved: true });
-    assert.equal(matchesBeforeOracle("transition-lost", [lostAfterReload]), true);
-    assert.equal(matchesAfterOracle("transition-restored", [lostAfterReload]), false);
-
-    const restored = observation({
+  it("transition reload 案例只使用现行过渡卡住和楼层推进 Oracle", () => {
+    const stuck = observation({
       reloadObserved: true,
       view: view({ mode: "transition" }),
-      judge: judge({ mode: "transition" }),
+      judge: judge({ mode: "transition", advanced: false }),
     });
-    assert.equal(matchesAfterOracle("transition-restored", [restored]), true);
+    assert.equal(matchesBeforeOracle("transition-stuck", [stuck]), true);
+    assert.equal(matchesAfterOracle("floor-advanced", [stuck]), false);
+
+    const advanced = observation({
+      reloadObserved: true,
+      view: view({ floor: 2, mode: "explore" }),
+      judge: judge({ advanced: true }),
+    });
+    assert.equal(matchesBeforeOracle("transition-stuck", [advanced]), false);
+    assert.equal(matchesAfterOracle("floor-advanced", [advanced]), true);
   });
 
-  it("事务隔离精确比较两次 query 的数量、顺序和结果", () => {
-    const accepted = observation({ op: "query", event: "query-accepted" });
-    const rejected = observation({ stepIndex: 1, op: "query", event: "query-rejected" });
-    assert.equal(matchesBeforeOracle("sandbox-state-leaked", [accepted, rejected]), true);
-    assert.equal(matchesBeforeOracle("sandbox-state-leaked", [rejected, accepted]), false);
-    assert.equal(matchesAfterOracle("sandbox-isolated", [accepted, accepted]), true);
-    assert.equal(matchesAfterOracle("sandbox-isolated", [accepted, accepted, accepted]), false);
+  it("旧 Oracle 别名不再解析", () => {
+    assert.throws(() => parseAgentEvalBeforeOracle("transition-lost"), /不受支持/u);
+    assert.throws(() => parseAgentEvalAfterOracle("transition-restored"), /不受支持/u);
   });
 
   it("计划 Oracle 只读取 query 后的 SCAN/SEARCH 分类", () => {
