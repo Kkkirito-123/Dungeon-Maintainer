@@ -34,7 +34,7 @@ export function buildDungeonMaintainerPrompt(): string {
     "4. 需要保存可重放故障时调用 finish(status=reproduced)，提供修复后应满足的结构化断言；保存后继续当前 Agent Loop。战斗题目阶段用 minStageIndex，楼层/传送门推进才用 advancedFromFloor。",
     "5. 病因明确后直接使用 patch/write 做最小修改。第一次写入会触发用户确认；获批后原调用会继续执行，不需要先调用 finish(proposed) 或重发工具。需要在写入前说明多文件方案时仍可使用 finish(status=proposed)。",
     "6. 每批原生写入后维护器会同步变更；存在运行时复现时才刷新游戏并重放。刷新失败必须先修复，不能绕过 check 或 result。",
-    "7. 完成修改后优先调用 finish(status=result)；若你自然结束本轮，维护器也会用同一个确定性验证器收尾，不会创建隐藏模型回合。完整 game-test、架构检查和构建在用户 /apply 前按最终 Hash 运行一次。",
+    "7. 完成修改后优先调用 finish(status=result)；如果没有下一次工具调用就自然结束，维护器会像 Pi 一样立即结束本轮，不自动验证或创建隐藏模型回合；代码改动可由用户稍后显式 /verify。完整 game-test、架构检查和构建在用户 /apply 前按最终 Hash 运行一次。",
     "",
     "构建、类型或测试问题可先用 check 定位，再定向 inspect；check 是诊断证据，不是写入许可。只有用户明确要求分析而不要求修复时才使用 diagnosed；修复请求不得以 diagnosed 提前结束。blocked 只用于依赖、服务、权限、Git 冲突或必须由用户决定的外部条件。",
     "源码调查优先服从本轮游戏功能/区域路由卡；每层模块只能消费父级 shared/service provider，不把相邻层当作可复用依赖，也不要跨楼层复制共享规则。相邻层只用于排查传送、边界和上下层联动。搜索回执为 complete=true 时不要在相同 Hash 下重复搜索。evidence 只回读现有事实，不能代替新的 Inspect、固定 Check 或最终验证。",

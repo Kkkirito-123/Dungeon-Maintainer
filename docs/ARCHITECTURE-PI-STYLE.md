@@ -30,7 +30,7 @@ Task / Workspace / Repair / Game / Logging
 - Pi 自主选择调查顺序，并在同一个 Agent turn 内完成复现、诊断、获批写入和验证。
 - Extension 不在 `agent_settled` 后发送 `triggerTurn: true`，不创建
   reproduce/diagnose/propose/execute/verify/recover 队列，也不自动进入 paused。
-- `finish(reproduced)` 和获批的 `finish(proposed)` 返回当前 Agent 继续执行；
+- `finish(reproduced)` 和获批的 `finish(proposed)` 返回当前 Agent 继续执行；没有下一次工具调用时按 Pi 原生语义自然结束本轮。
   拒绝、diagnosed、blocked 和最终 result 才结束请求。
 - 证据记录只能服务任务内 Hash 缓存、复现、检查和审计，不能规定模型必须读取哪些文件，
   也不能因为遥测或索引写入失败推翻已经通过的验证。
@@ -62,7 +62,8 @@ Task / Workspace / Repair / Game / Logging
 - 过长 tool result 使用内容确定的首尾截断，旧结果再按 16 KiB 总预算替换为短的低敏索引回执；
   最新一条 `finish` 控制结果、最近一条源码证据与当前工具批次优先保留，使获批方案、
   allowedPaths 和可用于精确 patch 的源码能在执行阶段同时可见。
-- `finish(result)` 只运行相关测试和必要重放；完整游戏测试、架构检查和构建在显式 `/apply`
+- `finish(result)` 只运行相关测试和必要重放；自然 `agent_settled` 不自动验证或创建隐藏回合，
+  未显式 result 的修改由用户用 `/verify` 检查。完整游戏测试、架构检查和构建在显式 `/apply`
   写回前按最终 worktree Hash 运行一次。
 
 ## Benchmark 边界

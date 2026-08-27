@@ -440,7 +440,7 @@ export function buildPiMaintainerArguments(
   task: Parameters<typeof buildPiArguments>[0],
   config: Parameters<typeof buildPiArguments>[1],
 ): string[] {
-  return [...buildPiArguments(task, config), "--thinking", "off"];
+  return buildPiArguments(task, config);
 }
 
 /**
@@ -509,34 +509,34 @@ export async function runPiMaintainer(
     failureCode: null,
     infrastructureFailureCode: null,
   };
-  let settleCheck = 0;
   let resolveCompleted: () => void = () => undefined;
   const completedPromise = new Promise<void>((resolvePromise) => {
     resolveCompleted = resolvePromise;
   });
   let rpc: PiRpcProcess | null = null;
   let shell: ShellHandle | null = null;
+  let settledClassification: Promise<void> = Promise.resolve();
 
-  const scheduleSettledCheck = (): void => {
-    const check = ++settleCheck;
-    setTimeout(() => {
-      void (async () => {
-        if (check !== settleCheck || runState.completed) return;
-        const currentTask = await store.read(task.id);
-        const decision = benchmarkSettledDecision({
-          taskState: currentTask.state,
-          queueActive: 0,
-        });
-        if (!decision) return;
-        runState.failureCode ??= decision.failureCode;
-        runState.completed = true;
-        resolveCompleted();
-      })().catch(() => {
-        runState.infrastructureFailureCode ??= "maintainer-state-read-failed";
-        runState.completed = true;
-        resolveCompleted();
-      });
-    }, 50);
+  const markAgentSettled = (): void => {
+    if (runState.completed) return;
+    runState.completed = true;
+    resolveCompleted();
+    settledClassification = new Promise<void>((resolveClassification) => {
+      setTimeout(() => {
+        void (async () => {
+          // Pi 的 agent_settled 是唯一回合终点；这里仅异步读取任务状态，补充低敏失败码，
+          // 不能再把状态判断作为等待 Agent 结束的门槛。
+          const currentTask = await store.read(task.id);
+          const decision = benchmarkSettledDecision({
+            taskState: currentTask.state,
+            queueActive: 0,
+          });
+          if (decision) runState.failureCode ??= decision.failureCode;
+        })().catch(() => {
+          runState.infrastructureFailureCode ??= "maintainer-state-read-failed";
+        }).finally(resolveClassification);
+      }, 50);
+    });
   };
 
   let stats: SessionStatsRecord = {};
@@ -660,7 +660,7 @@ export async function runPiMaintainer(
             runState.firstWriteAt ??= performance.now();
           }
         }
-        if (eventRecord.type === "agent_settled") scheduleSettledCheck();
+        if (eventRecord.type === "agent_settled") markAgentSettled();
         if (eventRecord.type === "agent_settled" || eventRecord.type === "compaction_end") {
           void activeShell?.syncPiState().catch(() => undefined);
         }
@@ -676,10 +676,6 @@ export async function runPiMaintainer(
       },
     );
     await rpc.start();
-    await rpc.send({
-      type: "set_thinking_level",
-      level: profile.reasoning ? "max" : "off",
-    });
     await shell.syncPiState();
     const promptResponse = await fetch(benchmarkShellEndpoint(shell.url, "/api/input"), {
       method: "POST",
@@ -700,6 +696,7 @@ export async function runPiMaintainer(
       runState.failureCode = "agent-timeout";
       await rpc.send({ type: "abort" }).catch(() => undefined);
     }
+    await settledClassification;
     const statsRpc = requireBenchmarkRpc(rpc);
     const statsResult = await requestWithDeadline(
       () => statsRpc.send({ type: "get_session_stats" }),

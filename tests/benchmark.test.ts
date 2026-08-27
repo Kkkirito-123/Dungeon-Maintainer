@@ -30,6 +30,7 @@ import {
   benchmarkGameStartEnvironment,
   benchmarkSettledDecision,
   benchmarkShellEndpoint,
+  buildPiMaintainerArguments,
   buildMaintainerWorkflowClosure,
   classifyMaintainerRunStatus,
   isBenchmarkExecutionApproval,
@@ -51,6 +52,7 @@ import { analyzeTaskBenchmark } from "../src/benchmark/task.js";
 import { metric, type BenchmarkScenario } from "../src/benchmark/types.js";
 import { resolveGameRuntimeStart } from "../src/pi/game-runtime.js";
 import { shapeModelContext } from "../src/pi/context-shaping.js";
+import { loadConfig } from "../src/config.js";
 import { createTaskRecordFixture } from "./testSupport.js";
 
 function metricValue(
@@ -462,6 +464,19 @@ describe("Dungeon Maintainer Benchmark", () => {
     assert.equal(originalArguments.includes("--no-context-files"), false);
     assert.equal(originalArguments.includes("--no-skills"), false);
     assert.equal(originalArguments.includes("../src/pi/extension.js"), false);
+    const maintainerTask = createTaskRecordFixture({ thinkingLevel: "off" });
+    const maintainerArguments = buildPiMaintainerArguments(
+      maintainerTask,
+      loadConfig({ LOCALAPPDATA: resolve("benchmark-data") }),
+    );
+    assert.equal(
+      maintainerArguments.filter((argument) => argument === "--thinking").length,
+      1,
+    );
+    assert.equal(
+      maintainerArguments[maintainerArguments.indexOf("--thinking") + 1],
+      "off",
+    );
   });
 
   it("矩阵以外部结果为主评分，并把暂停和超时独立诊断", () => {

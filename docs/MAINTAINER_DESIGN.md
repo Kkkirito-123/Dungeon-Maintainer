@@ -13,7 +13,7 @@ Pi RPC 驱动的聊天 CLI 协作，右侧 iframe 运行 detached worktree 中�
        -> 浏览器语义复现
        -> detached worktree 精确修改
        -> 刷新、恢复、重放
-  -> finish(result) 自动验证 -> /apply -> 正式游戏工作区（无提交）
+  -> finish(result) 验证（或自然结束后由用户 /verify） -> /apply -> 正式游戏工作区（无提交）
 ```
 
 1.0 非目标：多 Agent、Dashboard、Electron、面向用户的任意终端、任意浏览器脚本、自建模型循环、长期记忆、
