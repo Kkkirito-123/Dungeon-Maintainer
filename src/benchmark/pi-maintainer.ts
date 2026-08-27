@@ -21,7 +21,7 @@ import { createTaskWorktreeSnapshot } from "../workspace/worktree.js";
 import type { PiRunMetrics, PiRunOutcome } from "./pi-original.js";
 import { requestWithDeadline, SESSION_STATS_TIMEOUT_MS } from "./rpc-timeout.js";
 import { EvidenceStore } from "../evidence/store.js";
-import { assertFlashBenchmarkModel } from "./model-policy.js";
+import { buildEvidenceSnapshot } from "../evidence/view.js";
 
 /** 当前实现单次运行参数；与原版 Profile 使用完全相同的公开输入。 */
 export interface PiMaintainerRunOptions {
@@ -124,10 +124,19 @@ function safeFailureCode(error: unknown): string {
 export interface MaintainerTelemetry {
   executions: number;
   receiptHits: number;
+  semanticEvidenceHits: number;
+  solutionLookupHits: number;
   expansions: number;
   bundles: number;
   bundleWindows: number;
+  inspectCandidateFiles: number;
+  inspectSelectedFiles: number;
   inspectFailures: number;
+  featureRoutedInspectCalls: number;
+  featureRoutePrimaryExecutions: number;
+  featureRouteAdjacentExecutions: number;
+  featureRouteSharedExecutions: number;
+  featureRouteFallbackExecutions: number;
   floorRoutedInspectCalls: number;
   floorScopesVisited: number;
   floorRouteCurrentExecutions: number;
@@ -140,6 +149,7 @@ export interface MaintainerTelemetry {
   writeMutations: number;
   writeReplayFailures: number;
   loopGuardBlocks: number;
+  assistantTextOmittedCharacters: number;
   parseErrors: number;
   firstMutationAt: number | null;
 }
@@ -177,10 +187,19 @@ function emptyTelemetry(): MaintainerTelemetry {
   return {
     executions: 0,
     receiptHits: 0,
+    semanticEvidenceHits: 0,
+    solutionLookupHits: 0,
     expansions: 0,
     bundles: 0,
     bundleWindows: 0,
+    inspectCandidateFiles: 0,
+    inspectSelectedFiles: 0,
     inspectFailures: 0,
+    featureRoutedInspectCalls: 0,
+    featureRoutePrimaryExecutions: 0,
+    featureRouteAdjacentExecutions: 0,
+    featureRouteSharedExecutions: 0,
+    featureRouteFallbackExecutions: 0,
     floorRoutedInspectCalls: 0,
     floorScopesVisited: 0,
     floorRouteCurrentExecutions: 0,
@@ -193,6 +212,7 @@ function emptyTelemetry(): MaintainerTelemetry {
     writeMutations: 0,
     writeReplayFailures: 0,
     loopGuardBlocks: 0,
+    assistantTextOmittedCharacters: 0,
     parseErrors: 0,
     firstMutationAt: null,
   };
@@ -224,14 +244,30 @@ export async function readMaintainerTelemetry(eventsPath: string): Promise<Maint
         }
       }
       if (event.type === "tool.inspect") {
-        const outcome = typeof detail?.outcome === "string"
-          ? detail.outcome
-          : detail?.cacheHit === true || detail?.receiptOnly === true ? "receipt" : "execution";
+        const outcome = detail?.outcome;
+        if (outcome !== "execution" && outcome !== "receipt" && outcome !== "failure") {
+          telemetry.parseErrors += 1;
+          continue;
+        }
         if (outcome === "receipt") telemetry.receiptHits += 1;
         else if (outcome === "failure") telemetry.inspectFailures += 1;
         else telemetry.executions += 1;
+        if (detail?.cacheKind === "semantic") telemetry.semanticEvidenceHits += 1;
         if (outcome === "execution" && detail?.expanded === true) telemetry.expansions += 1;
         if (outcome === "execution") {
+          const featureRouteLevel = detail?.featureRouteLevel;
+          if (
+            featureRouteLevel === "primary"
+            || featureRouteLevel === "adjacent"
+            || featureRouteLevel === "shared"
+            || featureRouteLevel === "fallback"
+          ) {
+            telemetry.featureRoutedInspectCalls += 1;
+            if (featureRouteLevel === "primary") telemetry.featureRoutePrimaryExecutions += 1;
+            else if (featureRouteLevel === "adjacent") telemetry.featureRouteAdjacentExecutions += 1;
+            else if (featureRouteLevel === "shared") telemetry.featureRouteSharedExecutions += 1;
+            else telemetry.featureRouteFallbackExecutions += 1;
+          }
           const floorRouteLevel = detail?.floorRouteLevel;
           if (
             floorRouteLevel === "current"
@@ -254,6 +290,20 @@ export async function readMaintainerTelemetry(eventsPath: string): Promise<Maint
           if (typeof detail.bundleWindows === "number") {
             telemetry.bundleWindows += Math.max(0, Math.floor(detail.bundleWindows));
           }
+          if (typeof detail.candidateFiles === "number") {
+            telemetry.inspectCandidateFiles += Math.max(0, Math.floor(detail.candidateFiles));
+          }
+          if (typeof detail.selectedFiles === "number") {
+            telemetry.inspectSelectedFiles += Math.max(0, Math.floor(detail.selectedFiles));
+          }
+        }
+      } else if (event.type === "evidence.solution_lookup") {
+        if (
+          detail?.outcome === "hit"
+          && typeof detail.matchCount === "number"
+          && detail.matchCount > 0
+        ) {
+          telemetry.solutionLookupHits += 1;
         }
       } else if (event.type === "tool.write_outcome") {
         const outcome = detail?.outcome;
@@ -274,6 +324,13 @@ export async function readMaintainerTelemetry(eventsPath: string): Promise<Maint
         }
       } else if (event.type === "tool.loop_guard" && detail?.outcome === "blocked") {
         telemetry.loopGuardBlocks += 1;
+      } else if (event.type === "context.shaped") {
+        if (typeof detail?.omittedCharacters === "number") {
+          telemetry.assistantTextOmittedCharacters += Math.max(
+            0,
+            Math.floor(detail.omittedCharacters),
+          );
+        }
       }
     } catch {
       telemetry.parseErrors += 1;
@@ -310,12 +367,15 @@ export function isBenchmarkUiRequest(value: unknown): value is {
     && ["confirm", "select", "input", "editor"].includes(event.method);
 }
 
-/** 判断一个 UI 请求是否属于固定的完整修复方案审批。 */
+/** 判断一个 UI 请求是否属于固定的代码修改审批。 */
 export function isBenchmarkExecutionApproval(value: unknown): boolean {
   const event = record(value);
   return isBenchmarkUiRequest(value)
     && event?.method === "confirm"
-    && event.title === "是否执行完整修复方案";
+    && (
+      event.title === "是否允许本次代码修改"
+      || event.title === "是否执行完整修复方案"
+    );
 }
 
 /** 构造带任务令牌的 Shell POST 地址；不复制或解析 API Key。 */
@@ -339,6 +399,40 @@ export function benchmarkSettledDecision(input: {
   if (input.taskState === "paused") return { failureCode: "maintainer-paused" };
   if (input.taskState === "ready_to_apply") return { failureCode: null };
   return { failureCode: "maintainer-agent-incomplete" };
+}
+
+/**
+ * 按真实 Agent Loop 是否结束区分语义失败与基础设施失败。
+ *
+ * incomplete、blocked 和 paused 都是已正常 settled 的 Agent 结果；只有未完成运行或
+ * RPC/Shell/状态读取等错误才属于 infra_error。超时继续独立报告。
+ */
+export function classifyMaintainerRunStatus(input: {
+  readonly completed: boolean;
+  readonly failureCode: string | null;
+  readonly infrastructureFailureCode?: string | null;
+}): PiRunMetrics["status"] {
+  if (input.failureCode === "agent-timeout") return "timeout";
+  if (input.infrastructureFailureCode) return "infra_error";
+  if (!input.completed) return "infra_error";
+  if (
+    input.failureCode === null
+    || input.failureCode === "maintainer-agent-incomplete"
+    || input.failureCode === "maintainer-blocked"
+    || input.failureCode === "maintainer-paused"
+  ) {
+    return "settled";
+  }
+  return "infra_error";
+}
+
+/** 超时保持独立状态；其它情况下真实运行故障优先于 Agent 的正常收尾诊断。 */
+export function maintainerRunFailureCode(input: {
+  readonly failureCode: string | null;
+  readonly infrastructureFailureCode?: string | null;
+}): string | null {
+  if (input.failureCode === "agent-timeout") return input.failureCode;
+  return input.infrastructureFailureCode ?? input.failureCode;
 }
 
 /** 当前 Profile 的 Pi 参数始终指向本次构建产物，不保存版本副本。 */
@@ -389,7 +483,6 @@ export async function runPiMaintainer(
   const config = loadConfig();
   const apiKey = requireApiKey(config);
   const profile = defaultModelProfile(config);
-  assertFlashBenchmarkModel(profile.modelId);
   let turns = 0;
   let toolCalls = 0;
   let diagnosticToolCalls = 0;
@@ -409,10 +502,12 @@ export async function runPiMaintainer(
     firstWriteAt: number | null;
     completed: boolean;
     failureCode: string | null;
+    infrastructureFailureCode: string | null;
   } = {
     firstWriteAt: null,
     completed: false,
     failureCode: null,
+    infrastructureFailureCode: null,
   };
   let settleCheck = 0;
   let resolveCompleted: () => void = () => undefined;
@@ -437,7 +532,7 @@ export async function runPiMaintainer(
         runState.completed = true;
         resolveCompleted();
       })().catch(() => {
-        runState.failureCode ??= "maintainer-state-read-failed";
+        runState.infrastructureFailureCode ??= "maintainer-state-read-failed";
         runState.completed = true;
         resolveCompleted();
       });
@@ -452,6 +547,11 @@ export async function runPiMaintainer(
       contextWindow: profile.contextWindow,
       maxOutputTokens: profile.maxOutputTokens,
       store,
+      // Pi Extension 运行在独立子进程中，会直接追加 evidence.jsonl。每次刷新都使用
+      // 新 Store 从磁盘重建，避免 Benchmark 父进程把启动时的空内存快照永久缓存。
+      readEvidenceSnapshot: async () => await buildEvidenceSnapshot(
+        new EvidenceStore(dataDirectory, task),
+      ),
       sendPiCommand: async (command) => {
         const activeRpc = rpc;
         if (!activeRpc) throw new Error("Benchmark Pi RPC 尚未启动");
@@ -462,7 +562,7 @@ export async function runPiMaintainer(
         return await activeRpc.send(command);
       },
       onClose: async () => {
-        runState.failureCode ??= "benchmark-shell-closed";
+        runState.infrastructureFailureCode ??= "benchmark-shell-closed";
         runState.completed = true;
         resolveCompleted();
         await rpc?.send({ type: "abort" }).catch(() => undefined);
@@ -507,7 +607,7 @@ export async function runPiMaintainer(
             type: "notice",
             level: approved ? "info" : "warning",
             text: approved
-              ? "Benchmark 已按固定规则自动批准完整修复方案。"
+              ? "Benchmark 已按固定规则自动批准代码修改。"
               : "Benchmark 已按无人值守规则拒绝额外交互请求。",
           });
         } else {
@@ -564,16 +664,22 @@ export async function runPiMaintainer(
         if (eventRecord.type === "agent_settled" || eventRecord.type === "compaction_end") {
           void activeShell?.syncPiState().catch(() => undefined);
         }
+        if (eventRecord.type === "tool_execution_end" || eventRecord.type === "agent_settled") {
+          void activeShell?.syncEvidence().catch(() => undefined);
+        }
         void store.read(task.id)
           .then((currentTask) => activeShell?.updateTask(currentTask))
           .catch(() => undefined);
         if (eventRecord.type === "extension_error" || eventRecord.type === "pi_stderr") {
-          runState.failureCode ??= "pi-runtime-error";
+          runState.infrastructureFailureCode ??= "pi-runtime-error";
         }
       },
     );
     await rpc.start();
-    await rpc.send({ type: "set_thinking_level", level: "off" });
+    await rpc.send({
+      type: "set_thinking_level",
+      level: profile.reasoning ? "max" : "off",
+    });
     await shell.syncPiState();
     const promptResponse = await fetch(benchmarkShellEndpoint(shell.url, "/api/input"), {
       method: "POST",
@@ -595,21 +701,28 @@ export async function runPiMaintainer(
       await rpc.send({ type: "abort" }).catch(() => undefined);
     }
     const statsRpc = requireBenchmarkRpc(rpc);
-    stats = record(await requestWithDeadline(
+    const statsResult = await requestWithDeadline(
       () => statsRpc.send({ type: "get_session_stats" }),
       SESSION_STATS_TIMEOUT_MS,
       null,
-    )) ?? {};
+    );
+    const sessionStats = record(statsResult);
+    if (sessionStats) stats = sessionStats;
+    else runState.infrastructureFailureCode ??= "pi-stats-rpc-failed";
     shell.updateSessionStats(stats);
-    await store.read(task.id).then((currentTask) => shell?.updateTask(currentTask));
+    await store.read(task.id)
+      .then((currentTask) => shell?.updateTask(currentTask))
+      .catch(() => {
+        runState.infrastructureFailureCode ??= "maintainer-state-read-failed";
+      });
   } catch (error) {
-    runState.failureCode ??= safeFailureCode(error);
+    runState.infrastructureFailureCode ??= safeFailureCode(error);
   } finally {
     await rpc?.stop().catch(() => {
-      runState.failureCode ??= "pi-stop-failed";
+      runState.infrastructureFailureCode ??= "pi-stop-failed";
     });
     await shell?.close().catch(() => {
-      runState.failureCode ??= "benchmark-shell-stop-failed";
+      runState.infrastructureFailureCode ??= "benchmark-shell-stop-failed";
     });
   }
   const tokens = stats.tokens ?? {};
@@ -629,15 +742,7 @@ export async function runPiMaintainer(
     + telemetry.writeNoops
     + telemetry.writeMutations;
   const metrics: PiRunMetrics = {
-    status: runState.failureCode === "agent-timeout"
-      ? "timeout"
-      : runState.completed && (
-          runState.failureCode === null
-          || runState.failureCode === "maintainer-blocked"
-          || runState.failureCode === "maintainer-paused"
-        )
-        ? "settled"
-        : "infra_error",
+    status: classifyMaintainerRunStatus(runState),
     durationMs: Math.round(performance.now() - startedAt),
     diagnosisMs: telemetry.firstMutationAt === null
       ? null
@@ -655,10 +760,19 @@ export async function runPiMaintainer(
     inspectCalls: inspectTotal,
     inspectExecutions: telemetry.executions,
     inspectReceiptHits: telemetry.receiptHits,
+    semanticEvidenceHits: telemetry.semanticEvidenceHits,
+    solutionLookupHits: telemetry.solutionLookupHits,
     inspectBundles: telemetry.bundles,
     inspectBundleWindows: telemetry.bundleWindows,
     inspectFailures: telemetry.inspectFailures,
+    inspectCandidateFiles: telemetry.inspectCandidateFiles,
+    inspectSelectedFiles: telemetry.inspectSelectedFiles,
     routedSearchExpansions: telemetry.expansions,
+    featureRoutedInspectCalls: telemetry.featureRoutedInspectCalls,
+    featureRoutePrimaryExecutions: telemetry.featureRoutePrimaryExecutions,
+    featureRouteAdjacentExecutions: telemetry.featureRouteAdjacentExecutions,
+    featureRouteSharedExecutions: telemetry.featureRouteSharedExecutions,
+    featureRouteFallbackExecutions: telemetry.featureRouteFallbackExecutions,
     floorRoutedInspectCalls: telemetry.floorRoutedInspectCalls,
     floorScopesVisited: telemetry.floorScopesVisited,
     floorRouteCurrentExecutions: telemetry.floorRouteCurrentExecutions,
@@ -678,9 +792,15 @@ export async function runPiMaintainer(
     cacheReadTokens: tokens.cacheRead ?? 0,
     cacheWriteTokens: tokens.cacheWrite ?? 0,
     totalTokens: tokens.total ?? 0,
+    cacheHitRate: (tokens.input ?? 0) + (tokens.cacheRead ?? 0) + (tokens.cacheWrite ?? 0) > 0
+      ? (tokens.cacheRead ?? 0)
+        / ((tokens.input ?? 0) + (tokens.cacheRead ?? 0) + (tokens.cacheWrite ?? 0))
+      : 0,
+    uncachedTokens: (tokens.input ?? 0) + (tokens.cacheWrite ?? 0) + (tokens.output ?? 0),
+    assistantTextOmittedCharacters: telemetry.assistantTextOmittedCharacters,
     contextTokens: typeof contextUsage.tokens === "number" ? contextUsage.tokens : null,
     contextPercent: typeof contextUsage.percent === "number" ? contextUsage.percent : null,
-    failureCode: runState.failureCode,
+    failureCode: maintainerRunFailureCode(runState),
   };
   let workflowClosure = buildMaintainerWorkflowClosure({
     taskState: null,
@@ -705,18 +825,22 @@ export async function runPiMaintainer(
       paused: finalTask.state === "paused",
     });
   } catch {
-    runState.failureCode ??= "maintainer-state-read-failed";
+    runState.infrastructureFailureCode ??= "maintainer-state-read-failed";
   }
-  const evidenceStore = new EvidenceStore(dataDirectory, task);
-  const evidenceGraph = await evidenceStore.active().then((records) => records.map((record) => ({
-    id: record.id,
-    kind: record.kind,
-    status: record.status,
-    links: [...record.links],
-    worktreeHash: record.worktreeHash,
-  }))).catch(() => []);
+  const evidenceGraph = await new EvidenceStore(dataDirectory, task)
+    .list({ status: "all" }).then((records) => records.map((record) => ({
+      id: record.id,
+      kind: record.kind,
+      status: record.status,
+      links: [...record.links],
+      worktreeHash: record.worktreeHash,
+    }))).catch(() => []);
   return {
-    metrics: { ...metrics, failureCode: runState.failureCode },
+    metrics: {
+      ...metrics,
+      status: classifyMaintainerRunStatus(runState),
+      failureCode: maintainerRunFailureCode(runState),
+    },
     evaluationRoot: snapshot.root,
     workflowClosure,
     diagnostics: { lastToolName, lastFinishStatus, evidenceGraph },

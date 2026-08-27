@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { GameBrowser } from "../src/game/browser.js";
+import { GameBrowser, GameBrowserError } from "../src/game/browser.js";
 import { GameDriver } from "../src/game/driver.js";
 import type {
   PlayJudge,
@@ -207,6 +207,37 @@ class RecordingBrowser {
 }
 
 describe("浏览器检查点、刷新、恢复和语义重放", () => {
+  it("游戏桥只接受当前协议", async () => {
+    const browser = new GameBrowser("http://127.0.0.1:5173", () => undefined, null);
+    const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+    let version = 3;
+    const frame = {
+      evaluate: async <T>(operation: () => T): Promise<T> => {
+        Object.defineProperty(globalThis, "window", {
+          configurable: true,
+          value: { __DUNGEON_PLAYTEST__: { version } },
+        });
+        try {
+          return operation();
+        } finally {
+          if (previousWindow) {
+            Object.defineProperty(globalThis, "window", previousWindow);
+          } else {
+            Reflect.deleteProperty(globalThis, "window");
+          }
+        }
+      },
+    };
+    const internals = browser as unknown as {
+      needGameFrame: () => Promise<typeof frame>;
+    };
+    internals.needGameFrame = async () => frame;
+
+    assert.equal(await browser.protocolVersion(), 3);
+    version = 2;
+    await assert.rejects(browser.protocolVersion(), GameBrowserError);
+  });
+
   it("统一 Shell 中执行游戏动作前重新聚焦 iframe 游戏根节点", async () => {
     const browser = new GameBrowser("http://127.0.0.1:5173", () => undefined, null);
     const calls: string[] = [];

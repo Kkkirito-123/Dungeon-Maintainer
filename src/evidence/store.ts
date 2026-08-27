@@ -58,30 +58,187 @@ function safeProjectKey(repoRoot: string): string {
   return digest(normalized).slice(0, 16);
 }
 
+const EVIDENCE_RECORD_KEYS = [
+  "schemaVersion",
+  "id",
+  "taskId",
+  "kind",
+  "actionKey",
+  "fingerprint",
+  "actionAliases",
+  "status",
+  "summary",
+  "artifactRef",
+  "path",
+  "startLine",
+  "lineCount",
+  "baseHash",
+  "worktreeHash",
+  "validityKey",
+  "links",
+  "metadata",
+  "createdAt",
+] as const;
+
+function hasExactKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+): boolean {
+  return Object.keys(value).length === keys.length
+    && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return Object.values(value).every((item) => typeof item === "string");
+}
+
+function isMetadata(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return Object.values(value).every((item) => (
+    item === null
+    || typeof item === "string"
+    || typeof item === "number"
+    || typeof item === "boolean"
+  ));
+}
+
 function validRecord(value: unknown): value is EvidenceRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const record = value as Partial<EvidenceRecord>;
-  return record.schemaVersion === 1
+  const record = value as Record<string, unknown>;
+  return hasExactKeys(record, EVIDENCE_RECORD_KEYS)
+    && record.schemaVersion === 1
     && typeof record.id === "string"
     && typeof record.taskId === "string"
-    && typeof record.kind === "string"
+    && (
+      record.kind === "source"
+      || record.kind === "game"
+      || record.kind === "check"
+      || record.kind === "reproduction"
+      || record.kind === "claim"
+      || record.kind === "change"
+      || record.kind === "verification"
+    )
+    && isNullableString(record.actionKey)
     && typeof record.fingerprint === "string"
-    && typeof record.status === "string"
+    && isStringArray(record.actionAliases)
+    && (
+      record.status === "active"
+      || record.status === "stale"
+      || record.status === "superseded"
+    )
     && typeof record.summary === "string"
+    && isNullableString(record.artifactRef)
+    && isNullableString(record.path)
+    && (
+      record.startLine === null
+      || (Number.isInteger(record.startLine) && (record.startLine as number) >= 1)
+    )
+    && (
+      record.lineCount === null
+      || (Number.isInteger(record.lineCount) && (record.lineCount as number) >= 0)
+    )
+    && isNullableString(record.baseHash)
+    && isNullableString(record.worktreeHash)
     && typeof record.validityKey === "string"
+    && isStringArray(record.links)
+    && isMetadata(record.metadata)
     && typeof record.createdAt === "string";
+}
+
+function semanticIndexKey(
+  kind: EvidenceRecord["kind"],
+  fingerprint: string,
+  validityKey: string,
+): string {
+  return [kind, fingerprint, validityKey].join("\0");
+}
+
+function actionIndexKey(actionKey: string, validityKey: string): string {
+  return actionKey + "\0" + validityKey;
+}
+
+function recordActionKeys(record: EvidenceRecord): string[] {
+  return [...new Set([
+    record.actionKey,
+    ...record.actionAliases,
+  ].filter((value): value is string => Boolean(value)))];
 }
 
 function validSolutionIndex(value: unknown): value is SolutionIndexRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const record = value as Partial<SolutionIndexRecord>;
-  return record.schemaVersion === 1
+  const record = value as Record<string, unknown>;
+  return hasExactKeys(record, [
+    "schemaVersion",
+    "id",
+    "projectKey",
+    "title",
+    "description",
+    "category",
+    "searchText",
+    "relatedPaths",
+    "detailRef",
+    "createdAt",
+  ])
+    && record.schemaVersion === 1
     && typeof record.id === "string"
     && typeof record.projectKey === "string"
     && typeof record.title === "string"
     && typeof record.description === "string"
+    && typeof record.category === "string"
     && typeof record.searchText === "string"
-    && typeof record.detailRef === "string";
+    && isStringArray(record.relatedPaths)
+    && typeof record.detailRef === "string"
+    && typeof record.createdAt === "string";
+}
+
+function validSolutionRecord(
+  value: unknown,
+  id: string,
+  projectKey: string,
+): value is SolutionRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return hasExactKeys(record, [
+    "schemaVersion",
+    "id",
+    "projectKey",
+    "taskId",
+    "title",
+    "symptom",
+    "rootCause",
+    "planTitle",
+    "steps",
+    "verification",
+    "relatedPaths",
+    "evidenceRefs",
+    "buggyHashes",
+    "fixedHashes",
+    "createdAt",
+  ])
+    && record.schemaVersion === 1
+    && record.id === id
+    && record.projectKey === projectKey
+    && typeof record.taskId === "string"
+    && typeof record.title === "string"
+    && typeof record.symptom === "string"
+    && typeof record.rootCause === "string"
+    && typeof record.planTitle === "string"
+    && isStringArray(record.steps)
+    && typeof record.verification === "string"
+    && isStringArray(record.relatedPaths)
+    && isStringArray(record.evidenceRefs)
+    && isStringRecord(record.buggyHashes)
+    && isStringRecord(record.fixedHashes)
+    && typeof record.createdAt === "string";
 }
 
 async function readJsonLines<T>(
@@ -100,10 +257,9 @@ async function readJsonLines<T>(
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index]?.trim();
     if (!line) continue;
+    let value: unknown;
     try {
-      const value: unknown = JSON.parse(line);
-      if (!validate(value)) throw new Error("JSONL 记录结构非法");
-      output.push(value);
+      value = JSON.parse(line);
     } catch (error) {
       // 追加写入中断只可能留下最后一条半行；中间损坏意味着账本不可安全恢复。
       if (index === lines.length - 1) {
@@ -113,6 +269,8 @@ async function readJsonLines<T>(
       }
       throw new Error("证据 JSONL 在中间位置损坏", { cause: error });
     }
+    if (!validate(value)) throw new Error("JSONL 记录结构非法");
+    output.push(value);
   }
   return output;
 }
@@ -169,6 +327,8 @@ export class EvidenceStore {
   /** 同一 ID 最后一条 JSONL 快照对应的单调账本序号。 */
   private recordRevisions = new Map<string, number>();
   private actionIndex = new Map<string, string>();
+  /** 同一 kind、fingerprint 和有效版本下的 active 事实索引。 */
+  private fingerprintIndex = new Map<string, string>();
   private solutions = new Map<string, SolutionIndexRecord>();
   private loaded = false;
   private loadPromise: Promise<void> | null = null;
@@ -208,9 +368,15 @@ export class EvidenceStore {
 
   private rebuildIndexes(): void {
     this.actionIndex.clear();
+    this.fingerprintIndex.clear();
     for (const record of this.records.values()) {
-      if (record.status === "active" && record.actionKey) {
-        this.actionIndex.set(record.actionKey + "\0" + record.validityKey, record.id);
+      if (record.status !== "active") continue;
+      this.fingerprintIndex.set(
+        semanticIndexKey(record.kind, record.fingerprint, record.validityKey),
+        record.id,
+      );
+      for (const actionKey of recordActionKeys(record)) {
+        this.actionIndex.set(actionIndexKey(actionKey, record.validityKey), record.id);
       }
     }
   }
@@ -239,7 +405,9 @@ export class EvidenceStore {
         this.solutionIndexPath(),
         validSolutionIndex,
       )) {
-        if (solution.projectKey !== this.projectKey) continue;
+        if (solution.projectKey !== this.projectKey) {
+          throw new Error("解决方案索引 projectKey 与项目目录不匹配");
+        }
         this.solutions.set(solution.id, solution);
       }
       // revision 表示追加事件数，不是唯一证据 ID 数；状态失效也必须占一个序号。
@@ -277,6 +445,59 @@ export class EvidenceStore {
     ].join("\0")).slice(0, 16);
   }
 
+  private activeBySemantic(candidate: EvidenceCandidate): EvidenceRecord | null {
+    const id = this.fingerprintIndex.get(semanticIndexKey(
+      candidate.kind,
+      candidate.fingerprint,
+      candidate.validityKey,
+    ));
+    const record = id ? this.records.get(id) ?? null : null;
+    return record?.status === "active" ? record : null;
+  }
+
+  private async addActionAlias(
+    record: EvidenceRecord,
+    actionKey: string | null,
+  ): Promise<EvidenceRecord> {
+    if (!actionKey || recordActionKeys(record).includes(actionKey)) return record;
+    const updated: EvidenceRecord = {
+      ...record,
+      actionAliases: [...new Set([...record.actionAliases, actionKey])],
+      createdAt: new Date().toISOString(),
+    };
+    await this.appendRecord(updated);
+    return updated;
+  }
+
+  private async captureLoaded(candidate: EvidenceCandidate): Promise<{
+    record: EvidenceRecord;
+    added: boolean;
+  }> {
+    const existing = this.activeBySemantic(candidate);
+    if (existing) {
+      return {
+        record: await this.addActionAlias(existing, candidate.actionKey),
+        added: false,
+      };
+    }
+    const record: EvidenceRecord = {
+      ...candidate,
+      schemaVersion: 1,
+      id: this.recordId(candidate),
+      taskId: this.task.id,
+      actionAliases: [],
+      summary: safeSummary(candidate.summary),
+      links: [...new Set(candidate.links)].slice(0, 32),
+      metadata: Object.fromEntries(Object.entries(candidate.metadata).map(([key, value]) => [
+        key,
+        typeof value === "string" ? safeSummary(value).slice(0, 300) : value,
+      ])),
+      createdAt: new Date().toISOString(),
+    };
+    await this.appendRecord(record);
+    return { record, added: true };
+  }
+
   /** 保存新证据；相同指纹和有效版本已存在时不重复追加。 */
   async capture(candidate: EvidenceCandidate): Promise<{
     record: EvidenceRecord;
@@ -284,24 +505,7 @@ export class EvidenceStore {
   }> {
     return await this.serializeMutation(async () => {
       await this.load();
-      const id = this.recordId(candidate);
-      const existing = this.records.get(id);
-      if (existing?.status === "active") return { record: existing, added: false };
-      const record: EvidenceRecord = {
-        ...candidate,
-        schemaVersion: 1,
-        id,
-        taskId: this.task.id,
-        summary: safeSummary(candidate.summary),
-        links: [...new Set(candidate.links)].slice(0, 32),
-        metadata: Object.fromEntries(Object.entries(candidate.metadata).map(([key, value]) => [
-          key,
-          typeof value === "string" ? safeSummary(value).slice(0, 300) : value,
-        ])),
-        createdAt: new Date().toISOString(),
-      };
-      await this.appendRecord(record);
-      return { record, added: true };
+      return await this.captureLoaded(candidate);
     });
   }
 
@@ -310,19 +514,37 @@ export class EvidenceStore {
     candidate: EvidenceCandidate,
     text: string,
   ): Promise<{ record: EvidenceRecord; added: boolean }> {
-    await this.load();
-    const id = this.recordId(candidate);
-    const existing = this.records.get(id);
-    if (existing?.status === "active") return { record: existing, added: false };
-    const artifactPath = join(this.taskDirectory(), "evidence", id + ".txt");
-    await mkdir(dirname(artifactPath), { recursive: true });
     const artifact = safeArtifactText(text);
-    await writeFile(artifactPath, artifact.text, "utf8");
-    return await this.capture({
+    const effectiveCandidate: EvidenceCandidate = {
       ...candidate,
       // 敏感读取必须允许下一次重新走真实 inspect；否则安全摘要会永久挡住当前源码。
       actionKey: artifact.reusable ? candidate.actionKey : null,
-      artifactRef: relative(this.taskDirectory(), artifactPath).replaceAll("\\", "/"),
+    };
+    return await this.serializeMutation(async () => {
+      await this.load();
+      const existing = this.activeBySemantic(effectiveCandidate);
+      if (existing) {
+        return {
+          record: await this.addActionAlias(existing, effectiveCandidate.actionKey),
+          added: false,
+        };
+      }
+      const id = this.recordId(effectiveCandidate);
+      const artifactPath = join(this.taskDirectory(), "evidence", id + ".txt");
+      await mkdir(dirname(artifactPath), { recursive: true });
+      let previousText: string | null = null;
+      try {
+        previousText = await readFile(artifactPath, "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      if (previousText !== artifact.text) {
+        await writeFile(artifactPath, artifact.text, "utf8");
+      }
+      return await this.captureLoaded({
+        ...effectiveCandidate,
+        artifactRef: relative(this.taskDirectory(), artifactPath).replaceAll("\\", "/"),
+      });
     });
   }
 
@@ -346,7 +568,18 @@ export class EvidenceStore {
   /** 查询相同动作在相同有效版本下的 active 证据。 */
   async findReusable(actionKey: string, validityKey: string): Promise<EvidenceRecord | null> {
     await this.load();
-    const id = this.actionIndex.get(actionKey + "\0" + validityKey);
+    const id = this.actionIndex.get(actionIndexKey(actionKey, validityKey));
+    return id ? this.records.get(id) ?? null : null;
+  }
+
+  /** 查询相同 kind、结果指纹和有效版本下的 active 证据。 */
+  async findReusableByFingerprint(
+    kind: EvidenceRecord["kind"],
+    fingerprint: string,
+    validityKey: string,
+  ): Promise<EvidenceRecord | null> {
+    await this.load();
+    const id = this.fingerprintIndex.get(semanticIndexKey(kind, fingerprint, validityKey));
     return id ? this.records.get(id) ?? null : null;
   }
 
@@ -355,11 +588,31 @@ export class EvidenceStore {
     return this.records.get(id) ?? null;
   }
 
-  async active(kind?: EvidenceRecord["kind"]): Promise<EvidenceRecord[]> {
+  /**
+   * 按状态和类型读取当前任务的证据快照。
+   *
+   * 本方法只返回内存中的最终记录，不读取工件正文。默认按时间正序，调用方需要最近
+   * 记录时可显式反转并限制数量；这样 Shell 全量快照和模型有限列表共享同一事实源。
+   */
+  async list(options: {
+    status?: EvidenceStatus | "all";
+    kind?: EvidenceRecord["kind"];
+  } = {}): Promise<EvidenceRecord[]> {
     await this.load();
+    const status = options.status ?? "all";
     return [...this.records.values()]
-      .filter((record) => record.status === "active" && (!kind || record.kind === kind))
-      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+      .filter((record) => (
+        (status === "all" || record.status === status)
+        && (!options.kind || record.kind === options.kind)
+      ))
+      .sort((left, right) => (
+        left.createdAt.localeCompare(right.createdAt)
+        || left.id.localeCompare(right.id)
+      ));
+  }
+
+  async active(kind?: EvidenceRecord["kind"]): Promise<EvidenceRecord[]> {
+    return await this.list({ status: "active", ...(kind ? { kind } : {}) });
   }
 
   /** 返回在给定账本 revision 之后新增或重新激活的当前证据。 */
@@ -381,15 +634,23 @@ export class EvidenceStore {
     await this.appendRecord({ ...record, status, createdAt: new Date().toISOString() });
   }
 
-  /** 文件修改后让相关源码证据和全部旧检查/验证失效。 */
-  async invalidatePaths(paths: readonly string[]): Promise<void> {
+  /** 文件修改后让相关源码证据、旧整树快照和全部旧检查/验证失效。 */
+  async invalidatePaths(
+    paths: readonly string[],
+    currentWorktreeHash?: string,
+  ): Promise<void> {
     await this.serializeMutation(async () => {
       await this.load();
       const normalized = new Set(paths.map((path) => path.replaceAll("\\", "/")));
       for (const record of [...this.records.values()]) {
         if (record.status !== "active") continue;
         if (
-          (record.kind === "source" && record.path && normalized.has(record.path))
+          (record.kind === "source" && (
+            (record.path !== null && normalized.has(record.path))
+            || (currentWorktreeHash !== undefined
+              && record.worktreeHash !== null
+              && record.worktreeHash !== currentWorktreeHash)
+          ))
           || record.kind === "check"
           || record.kind === "verification"
         ) {
@@ -533,14 +794,10 @@ export class EvidenceStore {
       throw new Error("解决方案路径脱离项目数据目录");
     }
     const value: unknown = JSON.parse(await readFile(path, "utf8"));
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error("解决方案文件不是有效对象");
+    if (!validSolutionRecord(value, id, this.projectKey)) {
+      throw new Error("解决方案文件格式、版本、ID 或项目绑定非法");
     }
-    const record = value as Partial<SolutionRecord>;
-    if (record.schemaVersion !== 1 || record.id !== id || record.projectKey !== this.projectKey) {
-      throw new Error("解决方案文件版本、ID 或项目绑定非法");
-    }
-    return value as SolutionRecord;
+    return value;
   }
 }
 

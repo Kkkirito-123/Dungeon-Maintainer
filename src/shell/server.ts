@@ -14,6 +14,8 @@ import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
 import type { AgentRpcCommand } from "../agent/rpc.js";
+import type { EvidenceStore } from "../evidence/store.js";
+import { buildEvidenceSnapshot, type EvidenceSnapshot } from "../evidence/view.js";
 import {
   decideTokenControl,
   promptTokenLimit,
@@ -54,12 +56,15 @@ export interface ShellHandle {
   updateSessionStats(stats: unknown): void;
   syncPiState(): Promise<void>;
   updateRuntime(update: { state: "starting" | "ready" | "error" | "stopped"; gameUrl?: string | null }): void;
+  syncEvidence(): Promise<void>;
   handlePiEvent(event: unknown): void;
 }
 
 /** Shell 需要的外部行为，具体实现由 Pi 进程编排层提供。 */
 export interface ShellServerOptions extends ShellStatusConfig {
   store: TaskStore;
+  evidence?: EvidenceStore;
+  readEvidenceSnapshot?: () => Promise<EvidenceSnapshot>;
   sendPiCommand: RpcSender;
   onSwitchTask?: (request: ShellTaskSwitchRequest) => Promise<TaskRecord>;
   listModelProfiles?: () => Promise<unknown>;
@@ -250,6 +255,8 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
   let activityState: ShellActivityState = "done";
   let activityTimer: NodeJS.Timeout | null = null;
   let lastStatePayload = "";
+  let lastEvidenceRevision = -1;
+  let evidenceSync: Promise<void> = Promise.resolve();
   const server: Server = createServer((request, response) => {
     void handleRequest(request, response).catch((error: unknown) => {
       if (!response.headersSent) {
@@ -389,6 +396,27 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
     task = nextTask;
     status = statusFromTask(status, nextTask);
     publishState();
+  };
+
+  const syncEvidence = async (): Promise<void> => {
+    if (!options.evidence && !options.readEvidenceSnapshot) return;
+    evidenceSync = evidenceSync.catch(() => undefined).then(async () => {
+      const snapshot = options.readEvidenceSnapshot
+        ? await options.readEvidenceSnapshot()
+        : options.evidence
+          ? await buildEvidenceSnapshot(options.evidence)
+          : null;
+      if (!snapshot) return;
+      if (snapshot.revision === lastEvidenceRevision && snapshot.taskId === task.id) return;
+      lastEvidenceRevision = snapshot.revision;
+      // 证据快照是当前状态投影，不是事件流水；SSE 重连只需要最近一份，旧快照会让
+      // 环形缓存膨胀并在浏览器重连时重复渲染整张证据图。
+      for (let index = events.length - 1; index >= 0; index -= 1) {
+        if (events[index]?.event.type === "evidence.snapshot") events.splice(index, 1);
+      }
+      publish({ type: "evidence.snapshot", ...snapshot });
+    });
+    await evidenceSync;
   };
 
   const updateTurnUsage = (value: unknown): void => {
@@ -634,6 +662,8 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
             ? "只读内容已就绪，关闭查看器后继续…"
             : approvalTitle === "是否执行完整修复方案"
             ? "等待你确认完整修复方案…"
+            : approvalTitle === "是否允许本次代码修改"
+            ? "等待你确认本次代码修改…"
             : "等待你的选择：" + approvalTitle,
         );
         const request: ShellApprovalRequest = {
@@ -734,6 +764,7 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
         phase: "end",
         error: event.isError === true,
       });
+      void syncEvidence().catch(() => undefined);
       return;
     }
     if (event.type === "agent_start") {
@@ -1156,6 +1187,7 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
   const baseUrl = "http://127.0.0.1:" + String(address.port);
   const shellUrl = baseUrl + "/?taskId=" + encodeURIComponent(shellTaskId) + "&token=" + encodeURIComponent(token);
   publishState();
+  void syncEvidence().catch(() => undefined);
 
   return {
     url: shellUrl,
@@ -1172,6 +1204,7 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
     updateSessionStats,
     syncPiState,
     updateRuntime,
+    syncEvidence,
     handlePiEvent,
   };
 }

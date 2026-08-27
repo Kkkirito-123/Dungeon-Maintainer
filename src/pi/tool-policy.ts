@@ -19,6 +19,7 @@ export const PI_BUILTIN_TOOLS = [
 /** Dungeon Maintainer 额外注册的领域工具。 */
 export const MAINTAINER_TOOLS = [
   "inspect",
+  "evidence",
   "patch",
   "check",
   "finish",
@@ -33,6 +34,7 @@ export const MAINTAINER_TOOLS = [
 /** 诊断阶段逻辑上允许的只读、固定检查和游戏复现工具。 */
 export const DIAGNOSIS_TOOLS = [
   "inspect",
+  "evidence",
   "check",
   "finish",
   "look",

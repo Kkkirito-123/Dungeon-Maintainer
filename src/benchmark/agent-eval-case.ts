@@ -15,6 +15,13 @@ import { lstat, readFile, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { readAgentEvalFixtureSourceFingerprint } from "./agent-eval-fixture.js";
+import {
+  parseAgentEvalAfterOracle,
+  parseAgentEvalBeforeOracle,
+  type AgentEvalAfterOracle,
+  type AgentEvalBeforeOracle,
+} from "./agent-eval-oracle.js";
 
 const executeFile = promisify(execFile);
 
@@ -59,11 +66,12 @@ export interface AgentEvalReproduction {
 
 /** 只允许判卷器读取的隐藏条件。 */
 export interface AgentEvalExpected {
-  readonly schemaVersion: 2;
+  readonly schemaVersion: 3;
   readonly fixtureId: string;
   readonly secretInputs: Readonly<Record<string, string>>;
-  readonly beforeOracle: string;
-  readonly afterOracle: string;
+  readonly expectedRouteFeatures: readonly string[];
+  readonly beforeOracle: AgentEvalBeforeOracle;
+  readonly afterOracle: AgentEvalAfterOracle;
   readonly requiredChecks: readonly string[];
   readonly forbiddenPaths: readonly string[];
 }
@@ -74,6 +82,8 @@ export interface AgentEvalCase {
   readonly publicCase: AgentEvalPublicCase;
   readonly reproduction: AgentEvalReproduction;
   readonly expected: AgentEvalExpected;
+  /** 源码/地图组合指纹，内置 fixture 与游戏 Adapter 使用同一约束。 */
+  readonly sourceFingerprint: string;
 }
 
 /** 案例读取参数。 */
@@ -82,6 +92,15 @@ export interface AgentEvalCaseReadOptions {
   readonly id: string;
   /** 测试可注入的 fixture 根；省略时定位仓库内 `test-fixtures/agent-evals`。 */
   readonly fixtureRoot?: string;
+}
+
+/** 当前游戏 Adapter 的稳定 Benchmark 套件摘要。 */
+export interface GameBenchmarkCatalog {
+  readonly schemaVersion: 2;
+  readonly adapterVersion: 2;
+  readonly suite: "full";
+  readonly fixtureIds: readonly string[];
+  readonly sourceFingerprint: string;
 }
 
 /** 当前游戏 Benchmark Adapter 的案例读取参数。 */
@@ -280,13 +299,14 @@ function parseExpected(value: unknown, requestedId: string): AgentEvalExpected {
   exactKeys(input, [
     "afterOracle",
     "beforeOracle",
+    "expectedRouteFeatures",
     "fixtureId",
     "forbiddenPaths",
     "requiredChecks",
     "schemaVersion",
     "secretInputs",
   ], "expected.json");
-  if (input.schemaVersion !== 2 || input.fixtureId !== requestedId) {
+  if (input.schemaVersion !== 3 || input.fixtureId !== requestedId) {
     throw new Error("expected.json 版本或 fixtureId 不一致");
   }
   const rawSecrets = record(input.secretInputs, "expected.json secretInputs");
@@ -303,17 +323,26 @@ function parseExpected(value: unknown, requestedId: string): AgentEvalExpected {
     if (!CHECK_IDS.has(check)) throw new Error("expected.json 包含未知检查 ID");
     return check;
   });
+  const expectedRouteFeatures = uniqueStrings(
+    input.expectedRouteFeatures,
+    "expectedRouteFeatures",
+    (entry) => boundedText(entry, "expectedRouteFeatures entry", 100),
+  );
+  if (expectedRouteFeatures.length === 0) {
+    throw new Error("expectedRouteFeatures 不能为空");
+  }
   const forbiddenPaths = uniqueStrings(
     input.forbiddenPaths,
     "forbiddenPaths",
     (entry) => projectPath(entry, "forbiddenPaths entry"),
   );
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     fixtureId: requestedId,
     secretInputs,
-    beforeOracle: boundedText(input.beforeOracle, "beforeOracle", 120),
-    afterOracle: boundedText(input.afterOracle, "afterOracle", 120),
+    expectedRouteFeatures,
+    beforeOracle: parseAgentEvalBeforeOracle(input.beforeOracle),
+    afterOracle: parseAgentEvalAfterOracle(input.afterOracle),
     requiredChecks,
     forbiddenPaths,
   };
@@ -369,7 +398,11 @@ export async function readAgentEvalCase(
       throw new Error("reproduction.json 引用了不存在的隐藏输入");
     }
   }
-  return { directory, publicCase, reproduction, expected };
+  const sourceFingerprint = await readAgentEvalFixtureSourceFingerprint({
+    id,
+    fixtureRoot: realRoot,
+  });
+  return { directory, publicCase, reproduction, expected, sourceFingerprint };
 }
 
 /**
@@ -415,8 +448,16 @@ export async function readAgentEvalCaseFromGameAdapter(
     "expected",
     "reproduction",
     "schemaVersion",
+    "sourceFingerprint",
+    "suite",
   ], "Benchmark Adapter describe");
-  if (input.schemaVersion !== 1 || input.adapterVersion !== 1) {
+  if (
+    input.schemaVersion !== 2
+    || input.adapterVersion !== 2
+    || input.suite !== "full"
+    || typeof input.sourceFingerprint !== "string"
+    || !/^[a-f0-9]{64}$/u.test(input.sourceFingerprint)
+  ) {
     throw new Error("游戏 Benchmark Adapter 版本不受支持");
   }
   const publicCase = parsePublicCase(input.case, id);
@@ -432,5 +473,57 @@ export async function readAgentEvalCaseFromGameAdapter(
     publicCase,
     reproduction,
     expected,
+    sourceFingerprint: input.sourceFingerprint,
+  };
+}
+
+/** 从游戏拥有的 Adapter 读取生产 Benchmark 套件，不复制案例清单。 */
+export async function readGameBenchmarkCatalog(options: {
+  readonly gameRepositoryRoot: string;
+}): Promise<GameBenchmarkCatalog> {
+  const root = await realpath(resolve(options.gameRepositoryRoot));
+  const adapter = join(root, "scripts", "benchmark-adapter.mjs");
+  const information = await lstat(adapter);
+  if (information.isSymbolicLink() || !information.isFile()) {
+    throw new Error("游戏 Benchmark Adapter 必须是普通文件");
+  }
+  const result = await executeFile(process.execPath, [adapter, "catalog"], {
+    cwd: root,
+    encoding: "utf8",
+    windowsHide: true,
+    maxBuffer: 1024 * 1024,
+    timeout: 30_000,
+  });
+  let value: unknown;
+  try {
+    value = JSON.parse(result.stdout) as unknown;
+  } catch (error) {
+    throw new Error("游戏 Benchmark Adapter catalog 返回无效 JSON", { cause: error });
+  }
+  const input = record(value, "Benchmark Adapter catalog");
+  exactKeys(input, ["adapterVersion", "cases", "schemaVersion", "sourceFingerprint", "suite"], "Benchmark Adapter catalog");
+  if (
+    input.schemaVersion !== 2
+    || input.adapterVersion !== 2
+    || input.suite !== "full"
+    || typeof input.sourceFingerprint !== "string"
+    || !/^[a-f0-9]{64}$/u.test(input.sourceFingerprint)
+    || !Array.isArray(input.cases)
+    || input.cases.length !== 7
+  ) throw new Error("游戏 Benchmark Adapter catalog 版本或字段不受支持");
+  const fixtureIds = input.cases.map((entry) => {
+    const candidate = record(entry, "Benchmark Adapter catalog case");
+    const id = fixtureId(candidate.fixtureId);
+    return parsePublicCase(entry, id).fixtureId;
+  });
+  if (new Set(fixtureIds).size !== fixtureIds.length) {
+    throw new Error("游戏 Benchmark Adapter catalog 包含重复案例");
+  }
+  return {
+    schemaVersion: 2,
+    adapterVersion: 2,
+    suite: "full",
+    fixtureIds,
+    sourceFingerprint: input.sourceFingerprint,
   };
 }

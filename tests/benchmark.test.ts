@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -10,9 +11,11 @@ import {
   parseGameRepairEvalArgs,
   parseGameRepairMatrixArgs,
 } from "../src/benchmark/main.js";
+import { readGameBenchmarkCatalog } from "../src/benchmark/agent-eval-case.js";
 import {
   GAME_REPAIR_FIXTURE_IDS,
   gameRepairMatrixProfiles,
+  matrixCheckpointIsCompatible,
   summarizeGameRepairMatrixRuns,
 } from "../src/benchmark/game-repair-matrix.js";
 import { buildPiOriginalArguments } from "../src/benchmark/pi-original.js";
@@ -20,27 +23,35 @@ import {
   gameRepairExternalCorrectnessPassed,
   gameRepairFailureCode,
   gameRepairJudgeOutcome,
+  classifyGameRepairFailure,
+  validAgentEvalPreflightCertificate,
 } from "../src/benchmark/agent-eval-runner.js";
 import {
   benchmarkGameStartEnvironment,
   benchmarkSettledDecision,
   benchmarkShellEndpoint,
   buildMaintainerWorkflowClosure,
+  classifyMaintainerRunStatus,
   isBenchmarkExecutionApproval,
   isBenchmarkUiRequest,
+  maintainerRunFailureCode,
   readMaintainerTelemetry,
 } from "../src/benchmark/pi-maintainer.js";
 import {
   requestWithDeadline,
   SESSION_STATS_TIMEOUT_MS,
 } from "../src/benchmark/rpc-timeout.js";
-import { benchmarkModelFingerprint } from "../src/benchmark/provenance.js";
-import { assertFlashBenchmarkModel } from "../src/benchmark/model-policy.js";
+import {
+  benchmarkModelFingerprint,
+  benchmarkRunIdentityIsCurrent,
+  createBenchmarkRunIdentity,
+} from "../src/benchmark/provenance.js";
 import { runShellBenchmark } from "../src/benchmark/shell.js";
 import { analyzeTaskBenchmark } from "../src/benchmark/task.js";
 import { metric, type BenchmarkScenario } from "../src/benchmark/types.js";
 import { resolveGameRuntimeStart } from "../src/pi/game-runtime.js";
 import { shapeModelContext } from "../src/pi/context-shaping.js";
+import { createTaskRecordFixture } from "./testSupport.js";
 
 function metricValue(
   result: BenchmarkScenario,
@@ -50,6 +61,42 @@ function metricValue(
 }
 
 describe("Dungeon Maintainer Benchmark", () => {
+  it("游戏 Adapter catalog 使用每个案例自己的 fixtureId 严格解析 7 项", async () => {
+    const root = await mkdtemp(join(tmpdir(), "maintainer-adapter-catalog-"));
+    try {
+      const scripts = join(root, "scripts");
+      await mkdir(scripts, { recursive: true });
+      const cases = GAME_REPAIR_FIXTURE_IDS.map((fixtureId, index) => ({
+        schemaVersion: 1,
+        fixtureId,
+        category: "combat-sql-state",
+        prompt: "修复公开故障 " + String(index + 1),
+        evidenceSummary: "公开证据 " + String(index + 1),
+        startFloor: 1,
+        startPreset: null,
+        timeoutMs: 60_000,
+      }));
+      const catalog = {
+        schemaVersion: 2,
+        adapterVersion: 2,
+        suite: "full",
+        sourceFingerprint: "a".repeat(64),
+        cases,
+      };
+      await writeFile(
+        join(scripts, "benchmark-adapter.mjs"),
+        "process.stdout.write(" + JSON.stringify(JSON.stringify(catalog)) + ");\n",
+        "utf8",
+      );
+
+      const parsed = await readGameBenchmarkCatalog({ gameRepositoryRoot: root });
+      assert.equal(parsed.fixtureIds.length, 7);
+      assert.deepEqual(parsed.fixtureIds, cases.map((entry) => entry.fixtureId));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("把模型启动前鉴权错误记录为稳定低敏原因码", () => {
     assert.equal(
       gameRepairFailureCode(new Error("BLOCKED_ENV: MAINTAINER_API_KEY 未配置")),
@@ -91,7 +138,7 @@ describe("Dungeon Maintainer Benchmark", () => {
   });
 
   it("Inspect 与写入遥测逐行容错并满足分类闭合", async () => {
-    const root = await mkdtemp(join(tmpdir(), "maintainer-telemetry-v2-"));
+    const root = await mkdtemp(join(tmpdir(), "maintainer-telemetry-"));
     try {
       const path = join(root, "events.jsonl");
       await writeFile(path, [
@@ -101,8 +148,12 @@ describe("Dungeon Maintainer Benchmark", () => {
           detail: {
             action: "bundle",
             outcome: "execution",
+            cacheKind: "none",
             bundleWindows: 3,
+            candidateFiles: 7,
+            selectedFiles: 2,
             expanded: false,
+            featureRouteLevel: "primary",
             floorRouteLevel: "current",
             floorScopeCount: 1,
           },
@@ -114,8 +165,10 @@ describe("Dungeon Maintainer Benchmark", () => {
             detail: {
               action: "search",
               outcome: "execution",
+              cacheKind: index === 2 ? "semantic" : "none",
               bundleWindows: 0,
               expanded: true,
+              featureRouteLevel: floorRouteLevel,
               floorRouteLevel,
               floorScopeCount: 3,
             },
@@ -125,7 +178,7 @@ describe("Dungeon Maintainer Benchmark", () => {
         JSON.stringify({
           at: "2026-08-25T00:00:02.000Z",
           type: "tool.inspect",
-          detail: { action: "bundle", outcome: "receipt", bundleWindows: 0, expanded: false },
+          detail: { action: "bundle", outcome: "receipt", cacheKind: "exact", bundleWindows: 0, expanded: false },
         }),
         JSON.stringify({
           at: "2026-08-25T00:00:03.000Z",
@@ -152,11 +205,36 @@ describe("Dungeon Maintainer Benchmark", () => {
           type: "tool.loop_guard",
           detail: { toolName: "patch", outcome: "blocked", reasonCode: "block-exact_action_result" },
         }),
+        JSON.stringify({
+          at: "2026-08-25T00:00:09.000Z",
+          type: "context.shaped",
+          detail: { omittedCharacters: 1234 },
+        }),
+        JSON.stringify({
+          at: "2026-08-25T00:00:10.000Z",
+          type: "evidence.solution_lookup",
+          detail: { outcome: "hit", matchCount: 2 },
+        }),
       ].join("\n") + "\n", "utf8");
       const telemetry = await readMaintainerTelemetry(path);
       assert.equal(telemetry.executions + telemetry.receiptHits + telemetry.inspectFailures, 6);
       assert.equal(telemetry.bundles, 1);
       assert.equal(telemetry.bundleWindows, 3);
+      assert.equal(telemetry.inspectCandidateFiles, 7);
+      assert.equal(telemetry.inspectSelectedFiles, 2);
+      assert.equal(telemetry.semanticEvidenceHits, 1);
+      assert.equal(telemetry.featureRoutedInspectCalls, 4);
+      assert.equal(telemetry.featureRoutePrimaryExecutions, 1);
+      assert.equal(telemetry.featureRouteAdjacentExecutions, 1);
+      assert.equal(telemetry.featureRouteSharedExecutions, 1);
+      assert.equal(telemetry.featureRouteFallbackExecutions, 1);
+      assert.equal(
+        telemetry.featureRoutePrimaryExecutions
+          + telemetry.featureRouteAdjacentExecutions
+          + telemetry.featureRouteSharedExecutions
+          + telemetry.featureRouteFallbackExecutions,
+        telemetry.featureRoutedInspectCalls,
+      );
       assert.equal(telemetry.floorRoutedInspectCalls, 4);
       assert.equal(telemetry.floorScopesVisited, 10);
       assert.equal(telemetry.floorRouteCurrentExecutions, 1);
@@ -179,6 +257,8 @@ describe("Dungeon Maintainer Benchmark", () => {
       );
       assert.equal(telemetry.writeReplayFailures, 1);
       assert.equal(telemetry.loopGuardBlocks, 1);
+      assert.equal(telemetry.assistantTextOmittedCharacters, 1_234);
+      assert.equal(telemetry.solutionLookupHits, 1);
       assert.equal(telemetry.parseErrors, 1);
       assert.equal(telemetry.firstMutationAt, Date.parse("2026-08-25T00:00:06.000Z"));
     } finally {
@@ -186,10 +266,6 @@ describe("Dungeon Maintainer Benchmark", () => {
     }
   });
 
-  it("真实修复评测拒绝误用 Pro，只接受 Flash modelId", () => {
-    assert.doesNotThrow(() => assertFlashBenchmarkModel("deepseek-v4-flash"));
-    assert.throws(() => assertFlashBenchmarkModel("deepseek-v4-pro"), /只允许 Flash/u);
-  });
 
   it("按方向判定机器指标并解析固定参数", () => {
     assert.equal(metric({
@@ -218,7 +294,6 @@ describe("Dungeon Maintainer Benchmark", () => {
       "--timeout-ms", "60000",
     ]), {
       fixtureId: "terminal-action-bug",
-      fixtureRoot: null,
       dependencyRepoRoot: process.cwd(),
       archiveRoot: resolve(process.cwd(), "benchmark-results", "preflight"),
       timeoutMs: 60_000,
@@ -234,7 +309,6 @@ describe("Dungeon Maintainer Benchmark", () => {
       "--repetition", "2",
     ]), {
       fixtureId: "terminal-action-bug",
-      fixtureRoot: null,
       dependencyRepoRoot: process.cwd(),
       archiveRoot: resolve(process.cwd(), "benchmark-results", "game-repair"),
       timeoutMs: null,
@@ -269,15 +343,14 @@ describe("Dungeon Maintainer Benchmark", () => {
       ]),
       /60000 至 600000/u,
     );
-    assert.equal(GAME_REPAIR_FIXTURE_IDS.length, 12);
+    assert.equal(GAME_REPAIR_FIXTURE_IDS.length, 7);
     assert.deepEqual(parseBenchmarkSuiteArgs([
       "--suite", "four-regressions",
       "--dependency-repo", ".",
       "--ui", "none",
     ]), {
-      fixtureRoot: null,
       dependencyRepoRoot: process.cwd(),
-      archiveRoot: resolve(process.cwd(), "benchmark-results", "flash-current"),
+      archiveRoot: resolve(process.cwd(), "benchmark-results", "pro-current"),
       suite: "four-regressions",
       ui: "none",
       resumeDirectory: null,
@@ -291,7 +364,6 @@ describe("Dungeon Maintainer Benchmark", () => {
       "--archive-root", "benchmark-results/final",
       "--repetitions", "1",
     ]), {
-      fixtureRoot: null,
       dependencyRepoRoot: process.cwd(),
       archiveRoot: resolve(process.cwd(), "benchmark-results", "final"),
       timeoutMs: null,
@@ -329,6 +401,38 @@ describe("Dungeon Maintainer Benchmark", () => {
         "--timeout-ms", "600001",
       ]),
       /60000 至 600000/u,
+    );
+    assert.throws(
+      () => parseAgentEvalPreflightArgs([
+        "--fixture", "terminal-action-bug",
+        "--dependency-repo", ".",
+        "--fixture-root", "test-fixtures/agent-evals",
+      ]),
+      /未知 preflight 参数/u,
+    );
+    assert.throws(
+      () => parseGameRepairEvalArgs([
+        "--profile", "maintainer-current",
+        "--fixture", "terminal-action-bug",
+        "--dependency-repo", ".",
+        "--fixture-root", "test-fixtures/agent-evals",
+      ]),
+      /未知 game-repair 参数/u,
+    );
+    assert.throws(
+      () => parseGameRepairMatrixArgs([
+        "--dependency-repo", ".",
+        "--fixture-root", "test-fixtures/agent-evals",
+      ]),
+      /未知 game-repair-matrix 参数/u,
+    );
+    assert.throws(
+      () => parseBenchmarkSuiteArgs([
+        "--suite", "full",
+        "--dependency-repo", ".",
+        "--fixture-root", "test-fixtures/agent-evals",
+      ]),
+      /未知 benchmark-suite 参数/u,
     );
     assert.deepEqual(gameRepairMatrixProfiles("maintainer-current", 0), [
       "maintainer-current",
@@ -560,17 +664,117 @@ describe("Dungeon Maintainer Benchmark", () => {
     const fingerprint = benchmarkModelFingerprint({
       apiKey: "not-for-reporting",
       baseUrl: "https://api.example.invalid/v1",
-      model: "deepseek-v4-flash",
+      model: "deepseek-v4-pro",
       contextWindow: 64_000,
       maxOutputTokens: 8_192,
       reasoning: true,
       dataDir: resolve("benchmark-data"),
     });
-    assert.equal(fingerprint.modelId, "deepseek-v4-flash");
+    assert.equal(fingerprint.modelId, "deepseek-v4-pro");
     assert.match(fingerprint.modelConfigHash, /^[0-9a-f]{64}$/u);
     assert.deepEqual(Object.keys(fingerprint).sort(), ["modelConfigHash", "modelId"]);
     assert.equal(JSON.stringify(fingerprint).includes("not-for-reporting"), false);
     assert.equal(JSON.stringify(fingerprint).includes("api.example.invalid"), false);
+  });
+
+  it("运行指纹、checkpoint 和证书只接受唯一现行 schema", () => {
+    const components = {
+      benchmarkCommit: "a".repeat(40),
+      benchmarkWorktreeHash: "b".repeat(64),
+      gameSourceFingerprint: "c".repeat(64),
+      oracleVersion: "oracle-exact-final-state",
+      modelId: "deepseek-v4-pro",
+      modelConfigHash: "d".repeat(64),
+    };
+    const identity = createBenchmarkRunIdentity(components);
+    assert.equal(benchmarkRunIdentityIsCurrent(identity), true);
+    assert.equal(benchmarkRunIdentityIsCurrent({
+      ...identity,
+      schemaVersion: 0,
+    }), false);
+    assert.match(identity.runFingerprint, /^[0-9a-f]{64}$/u);
+    assert.notEqual(createBenchmarkRunIdentity({
+      ...components,
+      gameSourceFingerprint: "e".repeat(64),
+    }).runFingerprint, identity.runFingerprint);
+    assert.notEqual(createBenchmarkRunIdentity({
+      ...components,
+      benchmarkWorktreeHash: "f".repeat(64),
+    }).runFingerprint, identity.runFingerprint);
+    assert.notEqual(createBenchmarkRunIdentity({
+      ...components,
+      modelConfigHash: "0".repeat(64),
+    }).runFingerprint, identity.runFingerprint);
+
+    const checkpoint = {
+      schemaVersion: 2 as const,
+      runFingerprint: identity.runFingerprint,
+      profile: "maintainer-current" as const,
+      suite: "full" as const,
+      repetitions: 1,
+      expectedRuns: 7,
+      results: [],
+      runFailures: [],
+    };
+    const expected = {
+      runFingerprint: identity.runFingerprint,
+      profile: "maintainer-current" as const,
+      suite: "full" as const,
+      repetitions: 1,
+      expectedRuns: 7,
+    };
+    assert.equal(matrixCheckpointIsCompatible(checkpoint, expected), true);
+    assert.equal(matrixCheckpointIsCompatible({
+      ...checkpoint,
+      schemaVersion: 1,
+    }, expected), false);
+    assert.equal(matrixCheckpointIsCompatible({
+      ...checkpoint,
+      results: [{ schemaVersion: 4 }],
+    }, expected), false);
+    assert.equal(matrixCheckpointIsCompatible(checkpoint, {
+      ...expected,
+      runFingerprint: "1".repeat(64),
+    }), false);
+
+    const dependencyRepoRoot = process.cwd();
+    const certificate = {
+      schemaVersion: 2 as const,
+      fixtureId: "terminal-action-bug",
+      buggyHead: "2".repeat(40),
+      dependencyKey: createHash("sha256")
+        .update(resolve(dependencyRepoRoot))
+        .digest("hex")
+        .slice(0, 16),
+      oracleVersion: "oracle-exact-final-state" as const,
+      runFingerprint: identity.runFingerprint,
+      beforeOracleMatched: true,
+      cleanAfterOracleMatched: true,
+    };
+    assert.equal(validAgentEvalPreflightCertificate({
+      certificate,
+      fixtureId: certificate.fixtureId,
+      buggyHead: certificate.buggyHead,
+      dependencyRepoRoot,
+      runFingerprint: identity.runFingerprint,
+    }), true);
+    assert.equal(validAgentEvalPreflightCertificate({
+      certificate,
+      fixtureId: certificate.fixtureId,
+      buggyHead: certificate.buggyHead,
+      dependencyRepoRoot,
+      runFingerprint: "3".repeat(64),
+    }), false);
+    assert.equal(validAgentEvalPreflightCertificate({
+      certificate: {
+        ...certificate,
+        schemaVersion: 1,
+      },
+      fixtureId: certificate.fixtureId,
+      buggyHead: certificate.buggyHead,
+      dependencyRepoRoot,
+      runFingerprint: identity.runFingerprint,
+    }), false);
   });
 
   it("Maintainer Benchmark 在首个 settled 后立即交给外部 Oracle", () => {
@@ -594,6 +798,81 @@ describe("Dungeon Maintainer Benchmark", () => {
       taskState: "blocked",
       queueActive: 0,
     }), { failureCode: "maintainer-blocked" });
+
+    assert.equal(classifyMaintainerRunStatus({
+      completed: true,
+      failureCode: "maintainer-agent-incomplete",
+    }), "settled");
+    assert.equal(maintainerRunFailureCode({
+      failureCode: "maintainer-agent-incomplete",
+    }), "maintainer-agent-incomplete");
+    for (const failureCode of [
+      null,
+      "maintainer-blocked",
+      "maintainer-paused",
+      "maintainer-agent-incomplete",
+    ]) {
+      assert.equal(classifyMaintainerRunStatus({
+        completed: true,
+        failureCode,
+      }), "settled");
+    }
+    for (const infrastructureFailureCode of [
+      "pi-stats-rpc-failed",
+      "benchmark-shell-stop-failed",
+      "maintainer-state-read-failed",
+    ]) {
+      const settledWithRuntimeFailure = {
+        completed: true,
+        failureCode: "maintainer-agent-incomplete",
+        infrastructureFailureCode,
+      };
+      assert.equal(classifyMaintainerRunStatus(settledWithRuntimeFailure), "infra_error");
+      assert.equal(
+        maintainerRunFailureCode(settledWithRuntimeFailure),
+        infrastructureFailureCode,
+      );
+    }
+    assert.equal(classifyMaintainerRunStatus({
+      completed: true,
+      failureCode: "maintainer-state-read-failed",
+    }), "infra_error");
+    assert.equal(classifyMaintainerRunStatus({
+      completed: false,
+      failureCode: null,
+    }), "infra_error");
+    assert.equal(classifyMaintainerRunStatus({
+      completed: false,
+      failureCode: "agent-timeout",
+    }), "timeout");
+    assert.equal(gameRepairJudgeOutcome({
+      infrastructureFailure: false,
+      externalCorrectnessPassed: false,
+      workflowClosurePassed: false,
+    }).status, "failed");
+  });
+
+  it("把最终失败归入互斥的 agent、oracle 与 infrastructure 类别", () => {
+    assert.equal(classifyGameRepairFailure({
+      status: "passed",
+      agentFailureCode: null,
+      workflowClosurePassed: true,
+    }), "none");
+    assert.equal(classifyGameRepairFailure({
+      status: "infra_error",
+      agentFailureCode: "pi-rpc-error",
+      workflowClosurePassed: false,
+    }), "infrastructure");
+    assert.equal(classifyGameRepairFailure({
+      status: "failed",
+      agentFailureCode: "maintainer-agent-incomplete",
+      workflowClosurePassed: false,
+    }), "agent");
+    assert.equal(classifyGameRepairFailure({
+      status: "failed",
+      agentFailureCode: null,
+      workflowClosurePassed: true,
+    }), "oracle");
   });
 
   it("统计 RPC 超时后返回低敏 fallback，不阻塞 Benchmark 清理", async () => {
@@ -616,13 +895,16 @@ describe("Dungeon Maintainer Benchmark", () => {
     const root = await mkdtemp(join(tmpdir(), "maintainer-benchmark-task-"));
     try {
       await mkdir(join(root, "pi"), { recursive: true });
-      await writeFile(join(root, "task.json"), JSON.stringify({
+      await writeFile(join(root, "task.json"), JSON.stringify(createTaskRecordFixture({
+        id: "benchmark-task",
         changedPaths: ["game/src/example.ts"],
-        checks: [{ status: "passed" }],
-        reproductions: [{ id: "reproduction" }],
-        conclusion: "已完成",
         state: "ready_to_apply",
-      }), "utf8");
+      })), "utf8");
+      await writeFile(join(root, "evidence.jsonl"), [
+        JSON.stringify({ kind: "check", status: "active", metadata: { status: "passed" } }),
+        JSON.stringify({ kind: "reproduction", status: "active", metadata: {} }),
+        JSON.stringify({ kind: "claim", status: "active", metadata: { finishStatus: "result" } }),
+      ].join("\n") + "\n", "utf8");
       await writeFile(join(root, "events.jsonl"), [
         JSON.stringify({
           type: "task.state",
@@ -715,17 +997,36 @@ describe("Dungeon Maintainer Benchmark", () => {
     assert.equal(metricValue(result, "diagnosis_ms"), 2_000);
   });
 
-  it("continuation 事件按 ID 去重并识别重复语义结果", async () => {
-    const root = await mkdtemp(join(tmpdir(), "maintainer-benchmark-continuation-"));
+  it("任务 Benchmark 拒绝无 schema 的旧 task.json", async () => {
+    const root = await mkdtemp(join(tmpdir(), "maintainer-benchmark-old-task-"));
     try {
       await mkdir(join(root, "pi"), { recursive: true });
       await writeFile(join(root, "task.json"), JSON.stringify({
         changedPaths: [],
         checks: [],
         reproductions: [],
-        conclusion: "合成审计任务",
+        conclusion: "旧格式",
         state: "active",
       }), "utf8");
+      await writeFile(join(root, "events.jsonl"), "", "utf8");
+      await assert.rejects(
+        analyzeTaskBenchmark(root, 64_000),
+        /不是当前任务格式/u,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("continuation 事件按 ID 去重并识别重复语义结果", async () => {
+    const root = await mkdtemp(join(tmpdir(), "maintainer-benchmark-continuation-"));
+    try {
+      await mkdir(join(root, "pi"), { recursive: true });
+      await writeFile(join(root, "task.json"), JSON.stringify(createTaskRecordFixture({
+        id: "benchmark-continuation",
+        changedPaths: [],
+        state: "active",
+      })), "utf8");
       await writeFile(join(root, "events.jsonl"), [
         JSON.stringify({
           at: "1970-01-01T00:00:01.500Z",
@@ -913,11 +1214,14 @@ describe("Dungeon Maintainer Benchmark", () => {
       perResultCharacters: 4_096,
     }).messages, result.messages);
     assert.deepEqual(result.stats, {
+      assistantTextOmittedCharacters: 0,
+      omittedCharacters: oldResult.length - 4_096,
       omittedResults: 0,
       truncatedResults: 1,
       sentCharacters: 4_096
         + "当前楼层=2；题面状态=错误；最新游戏证据".length
         + "答案定义源码：expectedSql；最新源码证据".length,
+      toolResultOmittedCharacters: oldResult.length - 4_096,
     });
   });
 
@@ -944,5 +1248,179 @@ describe("Dungeon Maintainer Benchmark", () => {
       perTurnCharacters: 1_500,
       perResultCharacters: 1_000,
     }).messages, result.messages);
+  });
+
+  it("跨工具批次保留最近 finish 执行契约与最新源码", () => {
+    const approvedPlan = "用户已批准方案；allowedPaths=game/src/presentation/AppShell.ts；立即 patch/write。"
+      + "p".repeat(500);
+    const latestSource = "AppShell 目标源码与 baseHash：" + "s".repeat(700);
+    const messages = [
+      { role: "assistant", content: [{ type: "text", text: "先检查旧区域" }] },
+      {
+        role: "toolResult",
+        toolCallId: "old-inspect",
+        toolName: "inspect",
+        content: [{ type: "text", text: "旧源码：" + "x".repeat(700) }],
+      },
+      { role: "assistant", content: [{ type: "text", text: "提交完整方案" }] },
+      {
+        role: "toolResult",
+        toolCallId: "approved-finish",
+        toolName: "finish",
+        content: [{ type: "text", text: approvedPlan }],
+      },
+      { role: "assistant", content: [{ type: "text", text: "定向回读目标文件" }] },
+      {
+        role: "toolResult",
+        toolCallId: "target-inspect",
+        toolName: "inspect",
+        content: [{ type: "text", text: latestSource }],
+      },
+    ];
+    const result = shapeModelContext(messages, {
+      perTurnCharacters: 2_000,
+      perResultCharacters: 1_000,
+    });
+    const resultText = (index: number): string => {
+      const content = result.messages[index]?.content;
+      return Array.isArray(content) ? content.map((block) => block.text).join("") : "";
+    };
+
+    assert.match(resultText(1), /TOOL_RESULT_RECEIPT/u);
+    assert.equal(resultText(3), approvedPlan);
+    assert.equal(resultText(5), latestSource);
+    assert.ok(result.stats.sentCharacters <= 2_000);
+  });
+
+  it("长会话的短回执仍为获批方案和最近源码保留预算", () => {
+    const historical = Array.from({ length: 140 }, (_, index) => {
+      const evidenceId = index.toString(16).padStart(16, "0");
+      return [
+        { role: "assistant", content: [{ type: "text", text: "历史检查 " + String(index) }] },
+        {
+          role: "toolResult",
+          toolCallId: "history-" + String(index),
+          toolName: "inspect",
+          content: [{
+            type: "text",
+            text: "[EVIDENCE id=" + evidenceId + "]\n" + "h".repeat(600),
+          }],
+        },
+      ];
+    }).flat();
+    const approvedPlan = "用户已批准方案；allowedPaths=game/src/presentation/dom/AppShell.ts；立即 patch/write。"
+      + "p".repeat(500);
+    const latestSource = "[EVIDENCE id=feedfeedfeedfeed baseHash=" + "a".repeat(64) + "]\n"
+      + "目标代码：this.floorTransitionCoordinator.sync(false, delay);\n"
+      + "s".repeat(3_000);
+    const messages = [
+      ...historical,
+      { role: "assistant", content: [{ type: "text", text: "提交方案" }] },
+      {
+        role: "toolResult",
+        toolCallId: "approved-plan",
+        toolName: "finish",
+        content: [{ type: "text", text: approvedPlan }],
+      },
+      { role: "assistant", content: [{ type: "text", text: "读取目标源码" }] },
+      {
+        role: "toolResult",
+        toolCallId: "latest-source",
+        toolName: "inspect",
+        content: [{ type: "text", text: latestSource }],
+      },
+      { role: "assistant", content: [{ type: "text", text: "准备精确补丁" }] },
+      {
+        role: "toolResult",
+        toolCallId: "latest-status",
+        toolName: "status",
+        content: [{ type: "text", text: "worktree clean" }],
+      },
+    ];
+    const result = shapeModelContext(messages, {
+      perTurnCharacters: 16_384,
+      perResultCharacters: 4_096,
+    });
+    const textAt = (toolCallId: string): string => {
+      const message = result.messages.find((entry) => entry.toolCallId === toolCallId);
+      return Array.isArray(message?.content)
+        ? message.content.map((block) => block.text).join("")
+        : "";
+    };
+
+    assert.equal(textAt("approved-plan"), approvedPlan);
+    assert.equal(textAt("latest-source"), latestSource);
+    assert.match(textAt("history-0"), /TOOL_RESULT_RECEIPT/u);
+    assert.ok(result.stats.sentCharacters <= 16_384);
+  });
+
+  it("历史 assistant 长篇说明折叠为稳定回执，但保留原工具调用", () => {
+    const longAnalysis = "已经定位到候选文件，需要继续核对边界。".repeat(80);
+    const messages = [{
+      role: "assistant",
+      content: [
+        { type: "text", text: longAnalysis },
+        {
+          type: "toolCall",
+          id: "inspect-call",
+          name: "inspect",
+          arguments: { action: "bundle", query: "portal" },
+        },
+      ],
+    }];
+    const result = shapeModelContext(messages, {
+      perTurnCharacters: 16_384,
+      perResultCharacters: 4_096,
+      assistantTextCharacters: 256,
+    });
+    const content = result.messages[0]?.content;
+    assert.ok(Array.isArray(content));
+    assert.match(content.find((block) => block.type === "text")?.text ?? "", /ASSISTANT_TEXT_RECEIPT/u);
+    assert.deepEqual(content.find((block) => block.type === "toolCall"), messages[0]?.content[1]);
+    assert.equal(result.stats.assistantTextOmittedCharacters > 0, true);
+    assert.equal(result.stats.toolResultOmittedCharacters, 0);
+    assert.equal(result.stats.omittedCharacters, result.stats.assistantTextOmittedCharacters);
+    assert.deepEqual(shapeModelContext(messages, {
+      perTurnCharacters: 16_384,
+      perResultCharacters: 4_096,
+      assistantTextCharacters: 256,
+    }).messages, result.messages);
+  });
+
+  it("新增工具批次不会再次改写更早的回执前缀", () => {
+    const firstHistory = [
+      { role: "assistant", content: [{ type: "text", text: "先检查旧区域" }] },
+      {
+        role: "toolResult",
+        toolCallId: "old-result",
+        toolName: "inspect",
+        content: [{ type: "text", text: "旧证据:" + "x".repeat(700) }],
+      },
+      { role: "assistant", content: [{ type: "text", text: "再读取当前区域" }] },
+      {
+        role: "toolResult",
+        toolCallId: "current-result",
+        toolName: "inspect",
+        content: [{ type: "text", text: "当前证据:" + "y".repeat(700) }],
+      },
+    ];
+    const limits = { perTurnCharacters: 1_500, perResultCharacters: 1_000 };
+    const first = shapeModelContext(firstHistory, limits).messages;
+    const second = shapeModelContext([
+      ...firstHistory,
+      { role: "assistant", content: [{ type: "text", text: "继续检查" }] },
+      {
+        role: "toolResult",
+        toolCallId: "next-result",
+        toolName: "inspect",
+        content: [{ type: "text", text: "下一证据:" + "z".repeat(700) }],
+      },
+    ], limits).messages;
+
+    assert.deepEqual(second[1], first[1]);
+    assert.match(JSON.stringify(first[1]), /TOOL_RESULT_RECEIPT/u);
+    assert.match(JSON.stringify(first[3]), /当前证据/u);
+    assert.match(JSON.stringify(second[3]), /TOOL_RESULT_RECEIPT/u);
+    assert.match(JSON.stringify(second.at(-1)), /下一证据/u);
   });
 });

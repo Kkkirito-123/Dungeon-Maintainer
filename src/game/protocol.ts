@@ -113,9 +113,9 @@ export interface PlaytestEvent {
   summary: string;
 }
 
-/** 页面中 window.__DUNGEON_PLAYTEST__ 实现的协议 v2/v3 兼容投影。 */
+/** 页面中 window.__DUNGEON_PLAYTEST__ 实现的当前协议 v3 投影。 */
 export interface DungeonPlaytestBridge {
-  version: 2 | 3;
+  version: 3;
   readonly checkpointRestored: boolean;
   prepare(presetId: string): boolean;
   checkpoint(): boolean;
@@ -128,5 +128,5 @@ export interface DungeonPlaytestBridge {
   inputSql(sql: string): Promise<PlayResult>;
   query(): Promise<PlayResult>;
   judge(floor: number): PlayJudge;
-  events?(afterSequence: number): readonly PlaytestEvent[];
+  events(afterSequence: number): readonly PlaytestEvent[];
 }

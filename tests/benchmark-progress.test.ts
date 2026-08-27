@@ -19,7 +19,7 @@ describe("Benchmark 常驻进度页", () => {
         profile: "maintainer-current",
         repetition: 1,
         completed: 3,
-        total: 12,
+        total: 7,
         status: "running",
         cumulativeTokens: 1200,
         cumulativeToolCalls: 8,

@@ -1,13 +1,13 @@
 /**
  * Pi 工具调用的领域化循环门禁。
  *
- * 职责：为已完成工具调用生成稳定摘要，保留最近八项结果，识别精确重复、A-B-A-B
- * 交替路线和长时间无进展，并在客观进展出现后解除当前冻结。
+ * 职责：为已完成工具调用生成稳定摘要，保留最近八项结果，并在同一动作得到同一
+ * 结果连续重复两次后阻止第三次调用。客观进展出现后解除当前冻结。
  * 非职责：不解释模型正文、不调用 Pi、不读取任务或工作区、不决定哪些事实算作领域证据；
  * 证据值和路线值由 Extension 按工具语义提供。
- * 输入输出：调用前接收工具名、参数和可选路线，返回允许、策略重置、阻止或硬停止决策；
+ * 输入输出：调用前接收工具名、参数和可选路线，返回允许或重复动作阻止决策；
  * 调用后接收结果与 EvidenceStore revision，只保存 SHA-256 摘要和数字版本。
- * 相邻模块边界：Extension 负责遵守门禁、构造领域证据并注入策略重置；任务状态和持久化
+ * 相邻模块边界：Extension 负责遵守门禁和构造领域证据；任务状态和持久化
  * 仍由 TaskStore 负责，本模块只维护单活动任务的进程内状态。
  * 副作用与权限：除进程内计数与冻结集合外无副作用，不访问文件、网络、进程或任何工具权限。
  * 隐私：最近结果仅包含工具名和不可逆摘要；原始参数、结果与证据不会被本模块持久化。
@@ -20,8 +20,6 @@
 import { createHash } from "node:crypto";
 
 const MAX_RECENT_OUTCOMES = 8;
-const STRATEGY_RESET_THRESHOLD = 5;
-const HARD_STOP_THRESHOLD = 8;
 
 /** 调用前参与循环判断的最小工具动作，不包含执行结果。 */
 export interface LoopAction {
@@ -39,7 +37,7 @@ export interface ActionOutcome {
   toolName: string;
   /** 工具名和规范化参数的 SHA-256 摘要。 */
   actionDigest: string;
-  /** 用于识别 A-B-A-B 的领域路线摘要。 */
+  /** 调查路线摘要，仅用于低敏遥测，不参与阻止决策。 */
   routeDigest: string;
   /** 规范化工具结果的 SHA-256 摘要。 */
   resultDigest: string;
@@ -64,18 +62,15 @@ export interface CompletedAction {
 /**
  * 工具调用前的门禁决策。
  *
- * `strategy_reset`、`block` 和 `hard_stop` 都表示本次工具不得执行，因此也不得调用
- * recordOutcome。策略重置只在同一进展版本首次达到阈值时返回一次。
+ * `block` 表示本次重复动作不得执行，因此也不得调用 recordOutcome。
  */
 export type LoopGuardDecision =
   | { kind: "allow"; noProgressCount: number }
-  | { kind: "strategy_reset"; reason: "no_progress"; noProgressCount: number }
   | {
     kind: "block";
-    reason: "exact_action_result" | "alternating_route" | "route_no_progress";
+    reason: "exact_action_result";
     noProgressCount: number;
-  }
-  | { kind: "hard_stop"; reason: "no_progress"; noProgressCount: number };
+  };
 
 function stableSerialize(value: unknown, ancestors: Set<object>): string {
   if (value === null) return "null";
@@ -153,10 +148,6 @@ function routeDigest(action: LoopAction): string {
 export class LoopGuard {
   private outcomes: ActionOutcome[] = [];
   private frozenActionDigests = new Set<string>();
-  private frozenRouteDigests = new Set<string>();
-  private noProgressRouteCounts = new Map<string, number>();
-  private strategyResetRevision: number | null = null;
-  private hardStopRevision: number | null = null;
   private currentProgressRevision = 0;
   private currentNoProgressCount = 0;
   private observedEvidenceRevision = 0;
@@ -174,7 +165,7 @@ export class LoopGuard {
   /**
    * 返回当前进展版本内连续没有客观进展的已完成调用数。
    *
-   * @returns 零到硬停止阈值之间的计数；被阻止的调用不会增加该值。
+   * @returns 当前进展版本内的无进展调用数；被阻止的调用不会增加该值。
    * @remarks 只读访问，无副作用。
    */
   public get noProgressCount(): number {
@@ -197,24 +188,11 @@ export class LoopGuard {
    * @param action 已按领域语义规范化的工具动作和可选路线。
    * @returns `allow` 才可执行；其余决策要求阻止本次调用并由 Extension 处理提示或收尾。
    * @throws {TypeError} 动作或路线含循环引用，无法形成稳定摘要时抛出。
-   * @remarks 本方法不会记录 Outcome 或增加无进展次数；首次策略重置会在当前版本内被标记，
-   * 避免每个后续动作都重复注入同一提示。它不调用工具，也不改变外部权限。
+   * @remarks 本方法不会记录 Outcome 或增加无进展次数；累计无进展次数只作诊断，
+   * 不形成全局次数门禁，也不根据调查路线阻止新的搜索。
    */
   public evaluateAction(action: LoopAction): LoopGuardDecision {
     const nextActionDigest = actionDigest(action);
-    const nextRouteDigest = routeDigest(action);
-
-    if (action.toolName !== "finish"
-      && (this.hardStopRevision === this.currentProgressRevision
-      || this.currentNoProgressCount >= HARD_STOP_THRESHOLD)) {
-      this.hardStopRevision = this.currentProgressRevision;
-      return {
-        kind: "hard_stop",
-        reason: "no_progress",
-        noProgressCount: this.currentNoProgressCount,
-      };
-    }
-
     if (this.frozenActionDigests.has(nextActionDigest)) {
       return {
         kind: "block",
@@ -222,14 +200,6 @@ export class LoopGuard {
         noProgressCount: this.currentNoProgressCount,
       };
     }
-    if (this.frozenRouteDigests.has(nextRouteDigest)) {
-      return {
-        kind: "block",
-        reason: "alternating_route",
-        noProgressCount: this.currentNoProgressCount,
-      };
-    }
-
     const currentOutcomes = this.outcomes.filter(
       (outcome) => outcome.progressRevision === this.currentProgressRevision,
     );
@@ -247,46 +217,6 @@ export class LoopGuard {
       };
     }
 
-    // 搜索词属于一次动作的细节，不属于调查路线。调用方可以把同一 worktree、
-    // action 和 scope 投影为同一路线；前两次都没有明确源码覆盖进展后，第三个
-    // 同义 query 必须在执行 rg 前被挡住，不能靠改写关键词绕过精确动作去重。
-    if (action.toolName === "inspect" && (this.noProgressRouteCounts.get(nextRouteDigest) ?? 0) >= 2) {
-      this.frozenRouteDigests.add(nextRouteDigest);
-      return {
-        kind: "block",
-        reason: "route_no_progress",
-        noProgressCount: this.currentNoProgressCount,
-      };
-    }
-
-    const thirdLast = currentOutcomes.at(-3);
-    const secondLast = currentOutcomes.at(-2);
-    const last = currentOutcomes.at(-1);
-    if (thirdLast
-      && secondLast
-      && last
-      && thirdLast.routeDigest === last.routeDigest
-      && secondLast.routeDigest === nextRouteDigest
-      && thirdLast.routeDigest !== secondLast.routeDigest) {
-      this.frozenRouteDigests.add(thirdLast.routeDigest);
-      this.frozenRouteDigests.add(secondLast.routeDigest);
-      return {
-        kind: "block",
-        reason: "alternating_route",
-        noProgressCount: this.currentNoProgressCount,
-      };
-    }
-
-    if (this.currentNoProgressCount >= STRATEGY_RESET_THRESHOLD
-      && this.strategyResetRevision !== this.currentProgressRevision) {
-      this.strategyResetRevision = this.currentProgressRevision;
-      return {
-        kind: "strategy_reset",
-        reason: "no_progress",
-        noProgressCount: this.currentNoProgressCount,
-      };
-    }
-
     return { kind: "allow", noProgressCount: this.currentNoProgressCount };
   }
 
@@ -296,7 +226,7 @@ export class LoopGuard {
    * @param completed 允许执行的动作、稳定结果投影和证据 revision。
    * @returns 调用方显式 madeProgress 时返回 true，否则返回 false。
    * @throws {TypeError} 结果投影含循环引用时抛出；失败时不写入部分状态。
-   * @remarks cacheHit 不会增加 EvidenceStore revision，因此只增加无进展计数。本方法不调用
+   * @remarks 缓存回执不会增加 EvidenceStore revision，因此只增加无进展计数。本方法不调用
    * 工具、不持久化正文，也不扩大权限。
    */
   public recordOutcome(completed: CompletedAction): boolean {
@@ -313,10 +243,6 @@ export class LoopGuard {
       this.advanceProgress();
     } else {
       this.currentNoProgressCount += 1;
-      this.noProgressRouteCounts.set(
-        nextRouteDigest,
-        (this.noProgressRouteCounts.get(nextRouteDigest) ?? 0) + 1,
-      );
     }
 
     const outcome: ActionOutcome = {
@@ -344,10 +270,6 @@ export class LoopGuard {
     this.currentProgressRevision += 1;
     this.currentNoProgressCount = 0;
     this.frozenActionDigests.clear();
-    this.frozenRouteDigests.clear();
-    this.noProgressRouteCounts.clear();
-    this.strategyResetRevision = null;
-    this.hardStopRevision = null;
   }
 
   /**
@@ -360,24 +282,9 @@ export class LoopGuard {
   public resetForNewTask(evidenceRevision = 0): void {
     this.outcomes = [];
     this.frozenActionDigests.clear();
-    this.frozenRouteDigests.clear();
-    this.noProgressRouteCounts.clear();
-    this.strategyResetRevision = null;
-    this.hardStopRevision = null;
     this.currentProgressRevision = 0;
     this.currentNoProgressCount = 0;
     this.observedEvidenceRevision = evidenceRevision;
   }
 
-  /**
-   * 开始同一 Bug Goal 的新 Episode。
-   *
-   * 清除只属于上一 Episode 的无进展计数和 hard stop，但保留已冻结的精确动作与
-   * 路线，确保 recover 必须真正换策略，不能靠创建新 Episode 立刻重放同一动作。
-   */
-  public beginEpisode(): void {
-    this.currentNoProgressCount = 0;
-    this.strategyResetRevision = null;
-    this.hardStopRevision = null;
-  }
 }

@@ -31,13 +31,19 @@ export function renderShellPage(): string {
     #settings-button { margin-left: auto; }
     main { min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-columns: minmax(320px, 42%) 6px minmax(420px, 1fr); }
     section { min-width: 0; min-height: 0; }
-    #chat-panel { overflow: hidden; display: grid; grid-template-rows: minmax(0, 1fr) auto 52px; background: #111827; }
+    #chat-panel { overflow: hidden; display: grid; grid-template-rows: minmax(0, 1fr) auto auto 52px; background: #111827; }
     #messages { min-height: 0; overflow: auto; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
     .message { white-space: pre-wrap; overflow-wrap: anywhere; border-radius: 7px; padding: 9px 11px; line-height: 1.45; max-width: 96%; }
     .message.user { align-self: flex-end; background: #1d4ed8; }
     .message.assistant { align-self: flex-start; background: #1f2937; }
     .message.system { align-self: stretch; background: #172033; color: #cbd5e1; font-size: 12px; }
     .tool { align-self: stretch; color: #93c5fd; background: #0f172a; border-left: 3px solid #334155; border-radius: 4px; font-size: 12px; padding: 6px 9px; }
+    #evidence-panel { margin: 0 10px 6px; border: 1px solid #334155; border-radius: 5px; background: #0b1220; max-height: 26vh; overflow: auto; }
+    #evidence-panel summary { cursor: pointer; padding: 6px 8px; color: #93c5fd; font-size: 12px; }
+    #evidence-list { padding: 0 8px 7px; }
+    .evidence-group { margin-top: 5px; color: #94a3b8; font-size: 11px; }
+    .evidence-row { padding: 4px 0; border-top: 1px solid #1e293b; white-space: pre-wrap; overflow-wrap: anywhere; color: #cbd5e1; font-size: 11px; }
+    .evidence-row.stale, .evidence-row.superseded { color: #64748b; }
     #activity { min-height: 38px; display: flex; align-items: center; gap: 9px; padding: 8px 12px; border-top: 1px solid #263247; background: #0b1220; color: #bfdbfe; font-size: 12px; }
     #activity[hidden] { display: none; }
     #activity.error { color: #fca5a5; background: #1f151c; }
@@ -106,6 +112,7 @@ export function renderShellPage(): string {
     <main id="main-layout">
       <section id="chat-panel" aria-label="Pi CLI 聊天">
         <div id="messages" aria-live="polite"></div>
+        <details id="evidence-panel" open><summary>证据链</summary><div id="evidence-list"><div class="evidence-group">等待证据…</div></div></details>
         <div id="activity" role="status" aria-live="polite" aria-atomic="true" hidden><span class="activity-dot" aria-hidden="true"></span><span id="activity-text"></span><span id="activity-time"></span></div>
         <form id="input-form"><input id="input" autocomplete="off" placeholder="描述问题，或输入 /play、/verify…"><button type="submit">发送</button></form>
       </section>
@@ -124,6 +131,7 @@ export function renderShellPage(): string {
       const token = params.get('token') || '';
       const endpoint = (path) => path + '?taskId=' + encodeURIComponent(taskId) + '&token=' + encodeURIComponent(token);
       const messages = document.getElementById('messages');
+      const evidenceList = document.getElementById('evidence-list');
       const input = document.getElementById('input');
       const form = document.getElementById('input-form');
       const sendButton = form.querySelector('button[type="submit"]');
@@ -498,6 +506,36 @@ export function renderShellPage(): string {
           + (running ? ' · 运行中 ' + String(running) : '');
         messages.scrollTop = messages.scrollHeight;
       };
+      const evidenceLocation = (record) => record.path ? ' · ' + record.path + (record.startLine ? ':' + record.startLine : '') + (record.lineCount ? '+' + record.lineCount : '') : '';
+      const renderEvidence = (data) => {
+        const records = Array.isArray(data.records) ? data.records : [];
+        const active = records.filter((record) => record.status === 'active');
+        const historical = records.filter((record) => record.status !== 'active');
+        const row = (record) => {
+          const node = document.createElement('div');
+          node.className = 'evidence-row ' + record.status;
+          const hash = record.baseHash ? ' · hash ' + String(record.baseHash).slice(0, 12) : record.worktreeHash ? ' · worktree ' + String(record.worktreeHash).slice(0, 12) : '';
+          const links = [];
+          if (Array.isArray(record.upstreamIds) && record.upstreamIds.length) links.push('↑ ' + record.upstreamIds.join(','));
+          if (Array.isArray(record.downstreamIds) && record.downstreamIds.length) links.push('↓ ' + record.downstreamIds.join(','));
+          node.textContent = '[' + record.kind + '/' + record.status + '] ' + record.id + evidenceLocation(record) + hash + (links.length ? ' · ' + links.join(' ') : '') + '\\n' + record.summary;
+          return node;
+        };
+        evidenceList.replaceChildren();
+        const title = document.createElement('div');
+        title.className = 'evidence-group';
+        title.textContent = '当前任务 · revision ' + String(data.revision || 0) + ' · active ' + String(active.length);
+        evidenceList.appendChild(title);
+        active.forEach((record) => evidenceList.appendChild(row(record)));
+        if (historical.length) {
+          const details = document.createElement('details');
+          const summary = document.createElement('summary');
+          summary.textContent = '历史 stale/superseded · ' + String(historical.length);
+          details.appendChild(summary);
+          historical.forEach((record) => details.appendChild(row(record)));
+          evidenceList.appendChild(details);
+        }
+      };
       const showApproval = (request) => {
         currentApproval = request;
         if (request.kind === 'input') {
@@ -516,10 +554,11 @@ export function renderShellPage(): string {
         document.getElementById('approval-title').textContent = request.title;
         document.getElementById('approval-message').textContent = request.message;
         const isExecutionPlan = request.title === '是否执行完整修复方案';
+        const isWriteApproval = request.title === '是否允许本次代码修改';
         const isReadOnlyEditor = request.kind === 'editor';
         document.getElementById('approval-cancel').hidden = isReadOnlyEditor;
-        document.getElementById('approval-cancel').textContent = isExecutionPlan ? '暂不执行' : '取消';
-        document.getElementById('approval-ok').textContent = isReadOnlyEditor ? '关闭' : isExecutionPlan ? '执行完整方案' : '确认';
+        document.getElementById('approval-cancel').textContent = isExecutionPlan || isWriteApproval ? '暂不执行' : '取消';
+        document.getElementById('approval-ok').textContent = isReadOnlyEditor ? '关闭' : isExecutionPlan ? '执行完整方案' : isWriteApproval ? '允许修改' : '确认';
         approval.showModal();
       };
       document.getElementById('approval-ok').addEventListener('click', () => {
@@ -586,10 +625,11 @@ export function renderShellPage(): string {
           messages.scrollTop = messages.scrollHeight;
         }
         else if (data.type === 'chat.tool') showTool(data);
+        else if (data.type === 'evidence.snapshot') renderEvidence(data);
         else if (data.type === 'activity') showActivity(data);
         else if (data.type === 'notice') showNotice(data.level, data.text);
         else if (data.type === 'approval') showApproval(data.request);
-        else if (data.type === 'game') { gameState.textContent = data.state === 'ready' ? '游戏已就绪 · Playtest Bridge v2' : '游戏状态：' + data.state; if (data.gameUrl && frame.src !== data.gameUrl) { frame.src = data.gameUrl; frame.hidden = false; empty.hidden = true; } }
+        else if (data.type === 'game') { gameState.textContent = data.state === 'ready' ? '游戏已就绪 · Playtest Bridge' : '游戏状态：' + data.state; if (data.gameUrl && frame.src !== data.gameUrl) { frame.src = data.gameUrl; frame.hidden = false; empty.hidden = true; } }
         else if (data.type === 'closed') showNotice('info', 'Pi 会话已结束，任务证据仍保留。');
       };
       const events = new EventSource(endpoint('/events'));

@@ -1,5 +1,5 @@
 /**
- * Evidence Graph v1 专用冒烟测试。
+ * Evidence Graph 专用冒烟测试。
  *
  * 这里只验证本地确定性存储、缓存、失效、复现、Solution 和循环门禁，不启动真实游戏、
  * 不调用模型，也不运行完整 Benchmark。测试仓库与数据目录均为一次性临时目录。
@@ -13,11 +13,13 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { buildEvidenceCard } from "../src/evidence/card.js";
 import { checkEvidence } from "../src/evidence/projector.js";
 import { gameEvidence } from "../src/evidence/projector.js";
 import { readDiagnosticEvidence } from "../src/evidence/diagnostic.js";
 import { EvidenceStore } from "../src/evidence/store.js";
 import { SemanticTrace } from "../src/logging/trace.js";
+import { currentSolutionContext } from "../src/pi/evidence-context.js";
 import { LoopGuard } from "../src/pi/loop-guard.js";
 import { registerFinishTool } from "../src/pi/tools/finish.js";
 import { inspectTask } from "../src/pi/tools/inspect.js";
@@ -51,7 +53,102 @@ function finishExtensionContext(approved: boolean): ExtensionContext {
   } as unknown as ExtensionContext;
 }
 
-describe("Evidence Graph v1 冒烟", () => {
+describe("Evidence Graph 冒烟", () => {
+  it("worktree 修改后失效旧 search/bundle，同时保留精确读取的路径粒度", async () => {
+    const changedPath = "src/changed.ts";
+    const unchangedPath = "src/unchanged.ts";
+    const repository = await createTemporaryGitRepository({
+      [changedPath]: "export const portalState = 'stuck';\n",
+      [unchangedPath]: "export const stableState = 'ready';\n",
+    });
+    try {
+      const dataDir = join(repository.temporaryRoot, "data");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "evidence-worktree-invalidation",
+        objective: "验证整树源码证据失效",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(dataDir, "tasks", "evidence-worktree-invalidation", "pi"),
+      });
+      await store.transition(task, "active");
+      const evidence = new EvidenceStore(dataDir, task);
+      const oldWorktreeHash = await hashWorktree(repository.repoRoot);
+
+      await inspectTask({ task, store, evidence }, {
+        action: "search",
+        query: "portalState",
+      }, undefined, oldWorktreeHash);
+      await inspectTask({ task, store, evidence }, {
+        action: "bundle",
+        query: "portalState",
+      }, undefined, oldWorktreeHash);
+      await inspectTask({ task, store, evidence }, {
+        action: "read",
+        path: changedPath,
+        startLine: 1,
+        lineCount: 20,
+      });
+      await inspectTask({ task, store, evidence }, {
+        action: "read",
+        path: unchangedPath,
+        startLine: 1,
+        lineCount: 20,
+      });
+
+      const oldScoped = (await evidence.active("source")).filter((record) => (
+        record.worktreeHash === oldWorktreeHash
+      ));
+      assert.deepEqual(
+        [...new Set(oldScoped.map((record) => record.metadata.action))].sort(),
+        ["bundle", "search"],
+      );
+
+      await writeFile(
+        join(repository.repoRoot, changedPath),
+        "export const portalState = 'ready';\n",
+        "utf8",
+      );
+      const currentWorktreeHash = await hashWorktree(repository.repoRoot);
+      await evidence.invalidatePaths([changedPath], currentWorktreeHash);
+
+      const activeSources = await evidence.active("source");
+      assert.equal(activeSources.some((record) => record.worktreeHash === oldWorktreeHash), false);
+      assert.equal(activeSources.some((record) => record.path === changedPath), false);
+      assert.equal(activeSources.some((record) => record.path === unchangedPath), true);
+      assert.doesNotMatch(buildEvidenceCard(await evidence.active()), new RegExp(
+        oldWorktreeHash.slice(0, 12),
+        "u",
+      ));
+      const staleActions = (await evidence.list({ status: "stale", kind: "source" }))
+        .filter((record) => record.worktreeHash === oldWorktreeHash)
+        .map((record) => record.metadata.action);
+      assert.deepEqual([...new Set(staleActions)].sort(), ["bundle", "search"]);
+      for (const record of oldScoped) {
+        assert.ok(record.actionKey);
+        assert.equal(await evidence.findReusable(record.actionKey, oldWorktreeHash), null);
+      }
+
+      const refreshed = await inspectTask({ task, store, evidence }, {
+        action: "search",
+        query: "portalState",
+      }, undefined, currentWorktreeHash);
+      const reused = await inspectTask({ task, store, evidence }, {
+        action: "search",
+        query: "portalState",
+      }, undefined, currentWorktreeHash);
+      assert.equal(refreshed.details.cacheKind, "none");
+      assert.equal(reused.details.cacheKind, "exact");
+      assert.equal(
+        (await evidence.get(refreshed.details.evidenceId))?.worktreeHash,
+        currentWorktreeHash,
+      );
+    } finally {
+      await repository.dispose();
+    }
+  });
+
   it("action-not-available 的三类证据可跨进程恢复，单次源码读取不能提前 proposed", async () => {
     const bridgePath = "game/src/devtools/dungeon-agent/bridge.ts";
     const actionsPath = "game/src/devtools/dungeon-agent/actions.ts";
@@ -138,6 +235,236 @@ describe("Evidence Graph v1 冒烟", () => {
 
       const restarted = new EvidenceStore(dataDir, task);
       assert.equal((await readDiagnosticEvidence(restarted)).sourceEvidenceReady, true);
+    } finally {
+      await repository.dispose();
+    }
+  });
+
+  it("同一 fingerprint/validity 的不同 actionKey 复用证据并持久化 alias", async () => {
+    const sourcePath = "src/game.ts";
+    const repository = await createTemporaryGitRepository({
+      [sourcePath]: "export const state = 'ready';\n",
+    });
+    try {
+      const dataDir = join(repository.temporaryRoot, "data");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "evidence-semantic-alias",
+        objective: "验证语义证据索引",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(dataDir, "tasks", "evidence-semantic-alias", "pi"),
+      });
+      await store.transition(task, "active");
+      const evidence = new EvidenceStore(dataDir, task);
+      const candidate = {
+        kind: "source" as const,
+        actionKey: "inspect:read:state",
+        fingerprint: "same-source-result",
+        status: "active" as const,
+        summary: "当前源码证据",
+        artifactRef: null,
+        path: sourcePath,
+        startLine: 1,
+        lineCount: 1,
+        baseHash: "base-v1",
+        worktreeHash: "worktree-v1",
+        validityKey: "base-v1",
+        links: [],
+        metadata: {},
+      };
+      const first = await evidence.capture(candidate);
+      const second = await evidence.capture({
+        ...candidate,
+        actionKey: "inspect:bundle:state",
+      });
+
+      assert.equal(first.added, true);
+      assert.equal(second.added, false);
+      assert.equal(second.record.id, first.record.id);
+      assert.equal(second.record.actionAliases.includes("inspect:bundle:state"), true);
+      assert.equal(
+        (await evidence.findReusableByFingerprint(
+          "source",
+          "same-source-result",
+          "base-v1",
+        ))?.id,
+        first.record.id,
+      );
+      assert.equal(
+        (await evidence.findReusable("inspect:bundle:state", "base-v1"))?.id,
+        first.record.id,
+      );
+
+      const restarted = new EvidenceStore(dataDir, task);
+      assert.equal(
+        (await restarted.findReusable("inspect:bundle:state", "base-v1"))?.id,
+        first.record.id,
+      );
+      assert.match(
+        await readFile(join(store.taskDir(task.id), "evidence.jsonl"), "utf8"),
+        /inspect:bundle:state/u,
+      );
+    } finally {
+      await repository.dispose();
+    }
+  });
+
+  it("只读取字段完整且无旧扩展的当前 Evidence 记录", async () => {
+    const repository = await createTemporaryGitRepository({
+      "src/game.ts": "export const state = 'ready';\n",
+    });
+    try {
+      const dataDir = join(repository.temporaryRoot, "data");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "evidence-current-record-only",
+        objective: "拒绝非当前 Evidence 格式",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(dataDir, "tasks", "evidence-current-record-only", "pi"),
+      });
+      await store.transition(task, "active");
+      const path = join(store.taskDir(task.id), "evidence.jsonl");
+      const currentRecord = {
+        schemaVersion: 1,
+        id: "current-record",
+        taskId: task.id,
+        kind: "source",
+        actionKey: "inspect:read:state",
+        fingerprint: "source-result",
+        actionAliases: [],
+        status: "active",
+        summary: "完整当前记录",
+        artifactRef: null,
+        path: "src/game.ts",
+        startLine: 1,
+        lineCount: 1,
+        baseHash: "base-a",
+        worktreeHash: "worktree-a",
+        validityKey: "base-a",
+        links: [],
+        metadata: {},
+        createdAt: new Date().toISOString(),
+      };
+      const missingField = { ...currentRecord } as Record<string, unknown>;
+      delete missingField.actionAliases;
+      await writeFile(path, JSON.stringify(missingField) + "\n", "utf8");
+
+      await assert.rejects(
+        new EvidenceStore(dataDir, task).load(),
+        /JSONL 记录结构非法/u,
+      );
+
+      await writeFile(
+        path,
+        JSON.stringify({ ...currentRecord, legacyActionKeys: [] }) + "\n",
+        "utf8",
+      );
+      await assert.rejects(
+        new EvidenceStore(dataDir, task).load(),
+        /JSONL 记录结构非法/u,
+      );
+
+      await writeFile(path, JSON.stringify(currentRecord) + "\n", "utf8");
+      const loaded = new EvidenceStore(dataDir, task);
+      await loaded.load();
+      assert.equal((await loaded.get(currentRecord.id))?.summary, currentRecord.summary);
+    } finally {
+      await repository.dispose();
+    }
+  });
+
+  it("captureText 语义命中时不覆盖已有工件", async () => {
+    const repository = await createTemporaryGitRepository({ "src/game.ts": "export const state = 'ready';\n" });
+    try {
+      const dataDir = join(repository.temporaryRoot, "data");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "evidence-artifact-dedup",
+        objective: "验证证据工件去重",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(dataDir, "tasks", "evidence-artifact-dedup", "pi"),
+      });
+      await store.transition(task, "active");
+      const evidence = new EvidenceStore(dataDir, task);
+      const candidate = {
+        kind: "source" as const,
+        actionKey: "inspect:read:first",
+        fingerprint: "same-artifact-result",
+        status: "active" as const,
+        summary: "源码正文",
+        artifactRef: null,
+        path: "src/game.ts",
+        startLine: 1,
+        lineCount: 1,
+        baseHash: "base-v1",
+        worktreeHash: "worktree-v1",
+        validityKey: "base-v1",
+        links: [],
+        metadata: {},
+      };
+      const first = await evidence.captureText(candidate, "first artifact body\n");
+      const second = await evidence.captureText({
+        ...candidate,
+        actionKey: "inspect:search:state",
+      }, "different body must not replace the same fingerprint\n");
+
+      assert.equal(first.added, true);
+      assert.equal(second.added, false);
+      assert.equal(second.record.id, first.record.id);
+      assert.equal(
+        await evidence.getEvidenceArtifact(first.record.id),
+        "first artifact body\n",
+      );
+      assert.equal(
+        (await evidence.findReusable("inspect:search:state", "base-v1"))?.id,
+        first.record.id,
+      );
+    } finally {
+      await repository.dispose();
+    }
+  });
+
+  it("Inspect 为同结果的不同查询登记语义回执，随后直接精确命中", async () => {
+    const repository = await createTemporaryGitRepository({
+      "src/state.ts": "export const state = 'ready';\n",
+    });
+    try {
+      const dataDir = join(repository.temporaryRoot, "data");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "inspect-semantic-reuse",
+        objective: "验证相同搜索结果复用",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(dataDir, "tasks", "inspect-semantic-reuse", "pi"),
+      });
+      await store.transition(task, "active");
+      const evidence = new EvidenceStore(dataDir, task);
+      const first = await inspectTask({ task, store, evidence }, {
+        action: "search",
+        query: "state",
+      });
+      const semantic = await inspectTask({ task, store, evidence }, {
+        action: "search",
+        query: "ready",
+      });
+      const exact = await inspectTask({ task, store, evidence }, {
+        action: "search",
+        query: "ready",
+      });
+
+      assert.equal(first.details.cacheKind, "none");
+      assert.equal(semantic.details.cacheKind, "semantic");
+      assert.match(semantic.text, /semanticResult=true/u);
+      assert.equal(exact.details.cacheKind, "exact");
+      assert.equal(exact.details.evidenceId, first.details.evidenceId);
     } finally {
       await repository.dispose();
     }
@@ -303,7 +630,7 @@ describe("Evidence Graph v1 冒烟", () => {
         startLine: 1,
         lineCount: 20,
       });
-      assert.equal(first.details.cacheHit, false);
+      assert.equal(first.details.cacheKind, "none");
       const firstRevision = evidence.revision;
       const second = await inspectTask({ task, store, evidence }, {
         action: "read",
@@ -311,7 +638,7 @@ describe("Evidence Graph v1 冒烟", () => {
         startLine: 1,
         lineCount: 20,
       });
-      assert.equal(second.details.cacheHit, true);
+      assert.equal(second.details.cacheKind, "exact");
       assert.equal(evidence.revision, firstRevision);
       assert.match(second.text, /CACHE HIT/u);
 
@@ -329,7 +656,7 @@ describe("Evidence Graph v1 冒烟", () => {
         path: secretPath,
         startLine: 1,
         lineCount: 20,
-      })).details.cacheHit, false);
+      })).details.cacheKind, "none");
 
       const loopGuard = new LoopGuard();
       loopGuard.resetForNewTask(evidence.revision);
@@ -350,14 +677,14 @@ describe("Evidence Graph v1 冒烟", () => {
         original.replace("'stuck'", "'ready'"),
         "utf8",
       );
-      await evidence.invalidatePaths([sourcePath]);
+      await evidence.invalidatePaths([sourcePath], await hashWorktree(repository.repoRoot));
       const afterChange = await inspectTask({ task, store, evidence }, {
         action: "read",
         path: sourcePath,
         startLine: 1,
         lineCount: 20,
       });
-      assert.equal(afterChange.details.cacheHit, false);
+      assert.equal(afterChange.details.cacheKind, "none");
       assert.notEqual(afterChange.details.evidenceId, first.details.evidenceId);
 
       const check = checkEvidence({
@@ -514,12 +841,76 @@ describe("Evidence Graph v1 冒烟", () => {
         finishExtensionContext(true),
       );
 
-      // finish 的验证路径只决定当前任务是否可应用；跨任务 Solution 不再由 Coding
-      // Agent 自动生成，避免遥测/索引失败推翻已经通过的修复。
-      assert.equal(
-        (await recoveredEvidence.searchSolutions("击败 boss 后卡在传送门", 3)).length,
-        0,
+      const savedSolutions = await recoveredEvidence.searchSolutions(
+        "击败 boss 后卡在传送门",
+        3,
       );
+      assert.equal(savedSolutions.length, 1);
+      const savedSolution = savedSolutions[0];
+      assert(savedSolution);
+      assert.deepEqual(savedSolution.relatedPaths, [sourcePath]);
+      const solutionPath = join(
+        dataDir,
+        "projects",
+        recoveredEvidence.projectKey,
+        "solutions",
+        savedSolution.id + ".json",
+      );
+      const solutionText = await readFile(solutionPath, "utf8");
+      const incompleteSolution = JSON.parse(solutionText) as Record<string, unknown>;
+      delete incompleteSolution.verification;
+      await writeFile(
+        solutionPath,
+        JSON.stringify(incompleteSolution, null, 2) + "\n",
+        "utf8",
+      );
+      await assert.rejects(
+        recoveredEvidence.getSolution(savedSolution.id),
+        /解决方案文件格式、版本、ID 或项目绑定非法/u,
+      );
+      const oldExtendedSolution = {
+        ...(JSON.parse(solutionText) as Record<string, unknown>),
+        legacyCategory: "game-repair",
+      };
+      await writeFile(
+        solutionPath,
+        JSON.stringify(oldExtendedSolution, null, 2) + "\n",
+        "utf8",
+      );
+      await assert.rejects(
+        recoveredEvidence.getSolution(savedSolution.id),
+        /解决方案文件格式、版本、ID 或项目绑定非法/u,
+      );
+      await writeFile(solutionPath, solutionText, "utf8");
+      assert.equal((await recoveredEvidence.getSolution(savedSolution.id))?.id, savedSolution.id);
+      const nextTask = await store.create({
+        id: "evidence-smoke-next",
+        objective: "击败 boss 后卡在传送门，请检查并修复",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(dataDir, "tasks", "evidence-smoke-next", "pi"),
+      });
+      const nextEvidence = new EvidenceStore(dataDir, nextTask);
+      const historicalContext = await currentSolutionContext(
+        nextEvidence,
+        nextTask.objective,
+      );
+      assert.equal(historicalContext.matchCount, 1);
+      assert.match(historicalContext.text ?? "", /历史解决方案候选/u);
+      assert.match(historicalContext.text ?? "", /修复首领后传送门推进/u);
+      assert.match(historicalContext.text ?? "", /game\/src\/domain\/portal\.ts/u);
+      assert.doesNotMatch(historicalContext.text ?? "", /solutionId|evidenceRefs|score/u);
+      const solutionEvents = (await readFile(
+        join(store.taskDir(task.id), "events.jsonl"),
+        "utf8",
+      )).split(/\r?\n/u).filter(Boolean).map(
+        (row) => JSON.parse(row) as { type: string; detail: Record<string, unknown> },
+      );
+      assert.equal(solutionEvents.some((event) => (
+        event.type === "evidence.solution_saved"
+        && event.detail.outcome === "saved"
+      )), true);
       const blockedApi = new SingleToolApi();
       registerFinishTool(blockedApi as unknown as ExtensionAPI, {
         task,

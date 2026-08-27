@@ -6,7 +6,7 @@
  * 和每个文件的真实字节 Hash。来源可以保留启动时的脏状态，但任何新增漂移都会在
  * git apply 前拒绝；维护器不尝试自动合并。
  *
- * reverse.diff 与 patch.diff 保存同一份已验证补丁，回滚方向由 Git 解释；V1 不暴露
+ * reverse.diff 与 patch.diff 保存同一份已验证补丁，回滚方向由 Git 解释；1.0 不暴露
  * 自动回滚命令，但保留恢复产物供人工检查。所有操作都不会 commit、push 或创建 PR。
  */
 
@@ -41,14 +41,11 @@ async function assertSourceSnapshot(task: TaskRecord): Promise<void> {
   if (state.head !== task.baseHead) {
     throw new Error("目标仓库 HEAD 与任务 baseHead 不一致");
   }
-  if (task.sourceSnapshotHash) {
-    if (await hashWorktree(task.repoRoot) !== task.sourceSnapshotHash) {
-      throw new Error("来源工作树已偏离任务启动快照");
-    }
-    return;
+  if (!task.sourceSnapshotHash) {
+    throw new Error("当前任务缺少来源工作树快照，不能生成或应用补丁");
   }
-  if (!state.clean) {
-    throw new Error("旧任务没有来源快照且目标仓库存在未提交修改");
+  if (await hashWorktree(task.repoRoot) !== task.sourceSnapshotHash) {
+    throw new Error("来源工作树已偏离任务启动快照");
   }
 }
 
@@ -121,36 +118,7 @@ export async function capturePatch(
   ]);
 
   const baseHashes = Object.fromEntries(await Promise.all(paths.map(
-    async (path) => {
-      if (task.sourceSnapshotHash) {
-        return [path, await hashFile(task.repoRoot, path)] as const;
-      }
-      let expectedBlob: string | null = null;
-      try {
-        expectedBlob = await runGit(
-          task.repoRoot,
-          ["rev-parse", task.baseHead + ":" + path],
-        );
-      } catch {
-        expectedBlob = null;
-      }
-      const present = await pathExists(join(task.repoRoot, path));
-      if (expectedBlob === null) {
-        if (present) throw new Error("目标文件已偏离任务基线：" + path);
-        return [path, "missing"] as const;
-      }
-      if (!present) throw new Error("目标文件已偏离任务基线：" + path);
-      const targetBlob = await runGit(
-        task.repoRoot,
-        ["hash-object", "--path=" + path, "--", path],
-      );
-      if (targetBlob !== expectedBlob) {
-        throw new Error("目标文件已偏离任务基线：" + path);
-      }
-      // Git blob 会规范文本换行；先证明语义属于 baseHead，再保存目标工作区真实字节
-      // Hash，才能在 Windows CRLF 环境中同时避免误报和覆盖并发编辑。
-      return [path, await hashFile(task.repoRoot, path)] as const;
-    },
+    async (path) => [path, await hashFile(task.repoRoot, path)] as const,
   )));
   return { paths, baseHashes, patchPath, reversePatchPath };
 }

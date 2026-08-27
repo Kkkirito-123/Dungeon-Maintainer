@@ -6,7 +6,7 @@
  * `game-runtime.ts` 负责，补丁、检查、复现和 apply 仍属于各自 workspace/repair 模块。
  *
  * 输入是父进程已经校验并固定绑定的 TaskRecord、TaskStore、配置和可选测试运行时；输出是
- * 注册到 Pi 的十个领域工具、五个命令、系统提示和事件钩子，不返回可跨任务复用的运行时对象。
+ * 注册到 Pi 的十一个领域工具、五个命令、系统提示和事件钩子，不返回可跨任务复用的运行时对象。
  * Pi 是唯一模型循环；Extension 只注入游戏上下文、记录低敏事实并执行确定性安全边界，
  * 不在 agent_settled 后创建隐藏请求，也不按证据数量替模型规划或自动暂停。
  *
@@ -17,6 +17,7 @@
  * 或刷新恢复失败会拒绝危险操作，由当前 Agent 根据工具结果收敛或等待用户输入。
  */
 
+import { createHash } from "node:crypto";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type {
   ExtensionAPI,
@@ -61,6 +62,10 @@ import { registerMaintainerCommands } from "./commands/index.js";
 import { DungeonGameRuntime } from "./game-runtime.js";
 import { buildDungeonMaintainerPrompt } from "./prompt.js";
 import {
+  currentEvidenceContext,
+  currentSolutionContext,
+} from "./evidence-context.js";
+import {
   FULL_CODING_TOOLS,
 } from "./tool-policy.js";
 import {
@@ -73,11 +78,17 @@ import { LoopGuard, stableDigest, type LoopAction } from "./loop-guard.js";
 import { syncWorktreeChanges } from "../workspace/changes.js";
 import { hashWorktree } from "../workspace/git.js";
 import { resolveProjectPath } from "../workspace/policy.js";
-import { assertWritePathAllowed, hasActiveWriteScope } from "../workspace/write-scope.js";
+import {
+  assertWritePathAllowed,
+  hasActiveWriteScope,
+  validateWriteScopePaths,
+} from "../workspace/write-scope.js";
 
 const NATIVE_WRITE_TOOLS = new Set(["write"]);
 const WRITE_TOOLS = new Set(["write", "patch"]);
-const LOOP_GUARD_TOOLS = new Set(["inspect", "patch", "write", "check", "finish"]);
+// LoopGuard 只保护可能反复消耗外部资源的诊断/写入动作；evidence 是廉价回读，
+// finish 是控制流入口，两者必须始终可用，不能被重复动作门禁打断正常 Pi 流程。
+const LOOP_GUARD_TOOLS = new Set(["inspect", "patch", "write", "check"]);
 const REPAIR_ACTION_PATTERN = /(?:修复|修好|解决|排查|诊断|定位|调查|纠正|改掉|处理|实现|增加|支持|fix|debug|diagnos)/iu;
 const PROBLEM_PATTERN = /(?:问题|故障|错误|异常|bug|失败|不一致|不正确|不对|掉血|没法|无法|不能|看不见|卡住|崩溃|默认答案)/iu;
 const STRONG_REPAIR_PATTERN = /(?:修复|修好|解决|改掉|fix)|(?:(?:默认\s*(?:答案|SQL|查询)|题目).{0,24}(?:错|错误|不对|不一致))/iu;
@@ -204,6 +215,33 @@ async function protectedWritePathFailure(
   return null;
 }
 
+async function requestedWritePaths(
+  task: TaskRecord,
+  toolName: string,
+  input: Record<string, unknown>,
+): Promise<string[]> {
+  if (toolName === "write") {
+    if (typeof input.path !== "string" || !input.path.trim()) {
+      throw new Error("原生写入缺少合法项目相对路径。");
+    }
+    return await validateWriteScopePaths(task.worktreeRoot, [input.path]);
+  }
+  if (toolName !== "patch" || !Array.isArray(input.edits) || input.edits.length === 0) {
+    throw new Error("patch 缺少合法 edits。");
+  }
+  const paths = input.edits.map((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("patch 缺少合法 edits。");
+    }
+    const path = (value as Record<string, unknown>).path;
+    if (typeof path !== "string" || !path.trim()) {
+      throw new Error("patch 缺少合法项目相对路径。");
+    }
+    return path;
+  });
+  return await validateWriteScopePaths(task.worktreeRoot, paths);
+}
+
 function loopActionFor(
   toolName: string,
   input: Record<string, unknown>,
@@ -227,6 +265,13 @@ function loopActionFor(
             featureId: input.featureId,
             floorId: input.floorId,
           }
+          : toolName === "evidence"
+            ? {
+              action: input.action,
+              evidenceId: input.evidenceId,
+              kind: input.kind,
+              status: input.status,
+            }
           : { status: input.status, id: input.id },
       ),
     },
@@ -381,6 +426,13 @@ export function installDungeonMaintainerExtension(
     pi.setActiveTools([...FULL_CODING_TOOLS]);
   };
 
+  const loopGuardReason = (): string => {
+    if (executionApproved) {
+      return "循环门禁已阻止重复无进展动作；完整方案已经批准，请更换具体路径或参数并继续正常工具流程。";
+    }
+    return "循环门禁已阻止重复无进展动作；请使用现有证据更换路径或参数。";
+  };
+
   registerProviders(pi, config);
   const sharedContext = {
     task,
@@ -404,8 +456,20 @@ export function installDungeonMaintainerExtension(
   registerSessionPolicyHooks(pi, store, task);
 
   // 变换只发生在发给模型的临时上下文，不改原始 session/evidence store。
+  let contextTelemetryWrites: Promise<void> = Promise.resolve();
   pi.on("context", (event) => {
-    return { messages: shapeModelContext(event.messages).messages };
+    const shaped = shapeModelContext(event.messages);
+    if (shaped.stats.assistantTextOmittedCharacters > 0) {
+      contextTelemetryWrites = contextTelemetryWrites.then(async () => {
+        await appendEvent(store, task.id, "context.shaped", {
+          omittedCharacters: shaped.stats.assistantTextOmittedCharacters,
+          totalOmittedCharacters: shaped.stats.omittedCharacters,
+          omittedResults: shaped.stats.omittedResults,
+          truncatedResults: shaped.stats.truncatedResults,
+        });
+      }).catch(() => undefined);
+    }
+    return { messages: shaped.messages };
   });
 
   let nativeWriteBatch: NativeWriteBatch | null = null;
@@ -501,7 +565,38 @@ export function installDungeonMaintainerExtension(
 
   pi.on("agent_end", async () => {
     // 这里只记录 Pi 的原生运行事实；不在 settled 后生成隐藏消息或第二套模型循环。
+    await contextTelemetryWrites;
     await appendEvent(store, task.id, "pi.agent_end", { state: task.state });
+  });
+  pi.on("agent_settled", async (_event, context) => {
+    // 模型自然结束就是本轮控制流终点。若它已经修改代码但没有显式调用
+    // finish(result)，这里只复用同一个确定性验证器收尾，不再发送隐藏消息或
+    // 创建第二个 Agent Loop。
+    if (!executionApproved) return;
+    try {
+      const refreshFailure = await refreshGateFailure();
+      if (refreshFailure) throw new Error(refreshFailure);
+      if (task.changedPaths.length === 0) return;
+      const verification = await verifyCurrentTask();
+      await appendEvent(store, task.id, "verification.agent_settled", {
+        passed: true,
+        changedPaths: verification.changedPaths.length,
+      });
+      context.ui.notify("代码修改已自动验证，可以执行 /apply。", "info");
+    } catch (error) {
+      const failure = safeRefreshFailure(error);
+      await appendEvent(store, task.id, "verification.agent_settled", {
+        passed: false,
+        failure,
+      });
+      context.ui.notify(
+        "代码已保留在 detached worktree，但自动验证未通过：" + failure,
+        "warning",
+      );
+    } finally {
+      setExecutionApproved(false);
+      await store.closeWriteScope(task);
+    }
   });
   pi.on("turn_end", async (_event, context) => {
     inspectWorktreeHashes.clear();
@@ -541,8 +636,9 @@ export function installDungeonMaintainerExtension(
       publishRefreshOutcome(context, outcome);
     }
   });
-  pi.on("tool_call", async (event) => {
+  pi.on("tool_call", async (event, context) => {
     const input = event.input as Record<string, unknown>;
+    let preWorktreeHash: string | null = null;
     if (
       event.toolName === "check"
       || (event.toolName === "finish" && event.input.status === "result")
@@ -556,21 +652,56 @@ export function installDungeonMaintainerExtension(
         };
       }
     }
-    let preWorktreeHash: string | null = null;
     if (WRITE_TOOLS.has(event.toolName)) {
       preWorktreeHash = await hashWorktree(task.worktreeRoot);
       if (!executionApproved) {
-        await recordWriteOutcome(
-          event.toolName,
-          "rejected",
-          preWorktreeHash,
-          "authorization-required",
-        );
-        return {
-          block: true,
-          terminate: false,
-          reason: "完整修复方案尚未获用户确认，不能修改代码；请先提交 finish(status=proposed)，不要结束当前任务。",
-        };
+        let paths: string[];
+        try {
+          paths = await requestedWritePaths(task, event.toolName, input);
+        } catch (error) {
+          const reason = safeRefreshFailure(error);
+          await recordWriteOutcome(
+            event.toolName,
+            "rejected",
+            preWorktreeHash,
+            "path-rejected",
+          );
+          return { block: true, terminate: false, reason };
+        }
+        const approvalMessage = [
+          "模型准备修改以下文件：",
+          ...paths.map((path) => "- " + path),
+          "",
+          "批准后，本轮只允许修改这些文件；代码仍只写入 detached worktree，最终验证通过后才可 /apply。",
+        ].join("\n");
+        const approved = !context.hasUI
+          || typeof context.ui.confirm !== "function"
+          ? false
+          : await context.ui.confirm("是否允许本次代码修改", approvalMessage);
+        const digest = createHash("sha256")
+          .update(task.id + ":" + task.baseHead + ":" + paths.join("\n"))
+          .digest("hex");
+        await appendEvent(store, task.id, "execution.approval", {
+          digest: digest.slice(0, 16),
+          approved,
+          pathCount: paths.length,
+          source: "first-write",
+        });
+        if (!approved) {
+          await recordWriteOutcome(
+            event.toolName,
+            "rejected",
+            preWorktreeHash,
+            "authorization-denied",
+          );
+          return {
+            block: true,
+            terminate: false,
+            reason: "用户未批准本次代码修改；worktree 保持不变。",
+          };
+        }
+        await store.approveWriteScope(task, paths, digest);
+        setExecutionApproved(true);
       }
       const pathFailure = await protectedWritePathFailure(task, event.toolName, input);
       if (pathFailure) {
@@ -608,6 +739,7 @@ export function installDungeonMaintainerExtension(
             outcome: "failure",
             expanded: false,
             bundleWindows: 0,
+            featureRouteLevel: "none",
             floorRouteLevel: "none",
             floorScopeCount: 0,
           });
@@ -622,13 +754,15 @@ export function installDungeonMaintainerExtension(
         }
         return {
           block: true,
-          terminate: decision.kind === "hard_stop",
-          reason: decision.kind === "hard_stop"
-            ? "循环门禁检测到持续无进展，已停止本轮工具执行。"
-            : "循环门禁已阻止重复无进展动作；请使用现有证据更换路径或参数。",
+          terminate: false,
+          reason: loopGuardReason(),
         };
       }
-      pendingLoopActions.set(event.toolCallId, { action, actionDigest, preWorktreeHash });
+      pendingLoopActions.set(event.toolCallId, {
+        action,
+        actionDigest,
+        preWorktreeHash,
+      });
       pendingLoopActionCounts.set(actionDigest, pendingCount + 1);
       if (event.toolName === "inspect") {
         inspectWorktreeHashes.set(event.toolCallId, preWorktreeHash);
@@ -696,6 +830,13 @@ export function installDungeonMaintainerExtension(
         ok: details.ok,
         event: details.event,
       }));
+    } else if (event.toolName === "look" && details !== null) {
+      // look 只保存楼层/模式这一类低敏玩家投影摘要，不把完整实时状态复制进证据账本。
+      await evidence.capture(gameEvidence({
+        toolName: event.toolName,
+        ok: true,
+        event: typeof details.mode === "string" ? details.mode : "look",
+      }));
     }
     const pending = takePendingLoopAction(event.toolCallId);
     const postWorktreeHash = WRITE_TOOLS.has(event.toolName)
@@ -710,8 +851,7 @@ export function installDungeonMaintainerExtension(
           isError: event.isError,
           ok: typeof details?.ok === "boolean" ? details.ok : null,
           status: typeof details?.status === "string" ? details.status : null,
-          cacheHit: details?.cacheHit === true,
-          receiptOnly: details?.receiptOnly === true,
+          cacheKind: typeof details?.cacheKind === "string" ? details.cacheKind : null,
           worktreeHash: postWorktreeHash ?? pending.preWorktreeHash,
         },
         evidenceRevision: evidence.revision,
@@ -753,16 +893,33 @@ export function installDungeonMaintainerExtension(
         recordGuardResult(changed);
       } else {
         const meaningfulInspectProgress = event.toolName === "inspect"
+          && !executionApproved
           && !event.isError
           && details !== null
-          && details.receiptOnly !== true
+          && details.cacheKind === "none"
           && (
             details.action === "read"
             || details.action === "read_many"
             || (details.action === "bundle" && Number(details.bundleWindows ?? 0) > 0)
           )
           && Number(details.lines ?? 0) > 0;
-        recordGuardResult(meaningfulInspectProgress);
+        const meaningfulCheckProgress = event.toolName === "check"
+          && !executionApproved
+          && !event.isError
+          && details?.cached !== true;
+        const finishStatus = typeof details?.status === "string" ? details.status : null;
+        const meaningfulFinishProgress = event.toolName === "finish"
+          && !event.isError
+          && (
+            finishStatus === "reproduced"
+            || finishStatus === "result"
+            || (finishStatus === "proposed" && details?.executionApproved === true)
+          );
+        recordGuardResult(
+          meaningfulInspectProgress
+          || meaningfulCheckProgress
+          || meaningfulFinishProgress,
+        );
       }
       return undefined;
     }
@@ -883,6 +1040,12 @@ export function installDungeonMaintainerExtension(
     const currentRequest = latestNaturalRequest || eventPrompt || task.objective;
     currentArchitectureRoute = routeArchitecture(architectureMap, currentRequest, view?.floor ?? null);
     const routeCard = architectureRouteCard(currentArchitectureRoute);
+    const evidenceContext = await currentEvidenceContext(evidence);
+    const solutionContext = await currentSolutionContext(evidence, currentRequest);
+    await appendEvent(store, task.id, "evidence.solution_lookup", {
+      outcome: solutionContext.matchCount > 0 ? "hit" : "miss",
+      matchCount: solutionContext.matchCount,
+    });
     const dynamicContext = [
       "本轮最高优先级请求：",
       currentRequest,
@@ -894,6 +1057,10 @@ export function installDungeonMaintainerExtension(
       view ? JSON.stringify(view) : null,
       task.changedPaths.length > 0 ? "当前 Agent 增量文件：" : null,
       task.changedPaths.length > 0 ? JSON.stringify(task.changedPaths) : null,
+      evidenceContext ? "" : null,
+      evidenceContext,
+      solutionContext.text ? "" : null,
+      solutionContext.text,
     ].filter((line): line is string => line !== null).join("\n");
     return {
       // 保留 Pi 已经根据项目 AGENTS/Skills 组装的基础 Prompt；只追加维护器固定规则。
@@ -927,7 +1094,7 @@ export function installDungeonMaintainerExtension(
       }
       const hasFailedCheck = (await evidence.checks()).some((record) => record.status !== "passed");
       if (task.state === "paused") {
-        // 兼容读取旧 schema v4 任务；新架构不会再自动写入 paused。
+        // 当前任务格式仍可能包含 paused 终态，但新 Agent Loop 不再自动写入它。
         await store.transition(task, "active");
       }
       const continuation = isContinuationRequest(text)
@@ -958,6 +1125,7 @@ export function installDungeonMaintainerExtension(
 
   pi.on("session_shutdown", async (event) => {
     // 关闭 Pi 只结束临时浏览器/Vite，不隐式取消持久化任务或修改正式仓库。
+    await contextTelemetryWrites;
     await gameRuntime.close();
     await appendEvent(store, task.id, "pi.session_shutdown", {
       reason: event.reason,

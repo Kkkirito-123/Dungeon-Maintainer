@@ -6,7 +6,7 @@
  * 与 evidence.jsonl 同时维护两套事实。修改 schema 必须同步 TaskStore 读取校验与测试。
  */
 
-/** V1 允许的任务状态。 */
+/** 1.0 允许的任务状态。 */
 export type TaskState =
   | "created"
   | "active"
@@ -71,7 +71,7 @@ export interface TaskRecord {
   sourceBranch: string;
   /** 启动快照包含的本地未提交文件数量，只保存数量而不记录敏感路径。 */
   sourceDirtyFiles: number;
-  /** 来源工作树在启动瞬间的完整 Hash；旧版 schema v2 任务可能为 null。 */
+  /** 来源工作树在启动瞬间的完整 Hash；受控只读运行可为 null，但生成或应用补丁时必须存在。 */
   sourceSnapshotHash: string | null;
   worktreeRoot: string;
   piSessionDir: string;

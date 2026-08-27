@@ -12,8 +12,8 @@ async function typescriptFiles(directory: URL): Promise<URL[]> {
   return output;
 }
 
-describe("V1 启动与 Extension 职责分区", () => {
-  it("app.ts 保持兼容门面，启动副作用归属 src/app 专用模块", async () => {
+describe("1.0 启动与 Extension 职责分区", () => {
+  it("app.ts 保持轻量公开入口，启动副作用归属 src/app 专用模块", async () => {
     const appFacade = await readFile(
       new URL("../../src/app.ts", import.meta.url),
       "utf8",
@@ -64,7 +64,7 @@ describe("V1 启动与 Extension 职责分区", () => {
     assert.doesNotMatch(extension, /task-queue|readDiagnosticEvidence|buildEvidenceCard/u);
     assert.doesNotMatch(extension, /triggerTurn\s*:\s*true/u);
     assert.doesNotMatch(extension, /transition\(task,\s*"paused"/u);
-    assert.doesNotMatch(toolIndex, /registerEvidenceTool/u);
+    assert.match(toolIndex, /registerEvidenceTool/u);
     assert.match(sessionPolicy, /session_before_switch/u);
     assert.match(gameRuntime, /startGameServer\(/u);
   });

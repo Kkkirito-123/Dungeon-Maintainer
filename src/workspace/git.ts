@@ -14,6 +14,7 @@ import { promisify } from "node:util";
 import { normalizeProjectPath } from "./policy.js";
 
 const exec = promisify(execFile);
+const MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024;
 
 /**
  * 执行固定 Git 命令并保留原始换行。
@@ -29,7 +30,7 @@ export async function runGitRaw(
   const result = await exec("git", args, {
     cwd,
     encoding: "utf8",
-    maxBuffer: 16 * 1024 * 1024,
+    maxBuffer: MAX_GIT_OUTPUT_BYTES,
     windowsHide: true,
   });
   return result.stdout;
@@ -130,7 +131,9 @@ export async function hashWorktree(root: string): Promise<string> {
     runGitRaw(root, ["ls-files", "-z", "--others", "--exclude-standard"]),
   ]);
   let untracked = "";
-  for (const path of others.split("\0").filter(Boolean).sort()) {
+  // Git 会把嵌套仓库报告为带斜杠的目录标记；目录本身没有可读取的字节，
+  // 且其内部 .git 不属于当前 worktree，不能把它当作普通文件读取。
+  for (const path of others.split("\0").filter((entry) => entry && !entry.endsWith("/")).sort()) {
     untracked += path + ":" + hashBytes(await readFile(join(root, path))) + "\n";
   }
   return createHash("sha256")

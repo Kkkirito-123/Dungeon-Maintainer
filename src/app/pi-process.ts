@@ -20,7 +20,8 @@ import { startShellServer, type ShellHandle } from "../shell/server.js";
 import type { ShellTaskSwitchRequest } from "../shell/protocol.js";
 import { TaskStore, createTaskId } from "../task/store.js";
 import type { TaskRecord } from "../task/types.js";
-import { hasTaskEvidence } from "../evidence/store.js";
+import { EvidenceStore, hasTaskEvidence } from "../evidence/store.js";
+import { buildEvidenceSnapshot } from "../evidence/view.js";
 import { comparablePath } from "./path.js";
 import { pathExists } from "../workspace/git.js";
 import {
@@ -167,6 +168,9 @@ export class AppController {
       contextWindow: activeProfile.contextWindow,
       maxOutputTokens: activeProfile.maxOutputTokens,
       store: this.store,
+      readEvidenceSnapshot: async () => (
+        await buildEvidenceSnapshot(new EvidenceStore(this.config.dataDir, this.activeTask))
+      ),
       sendPiCommand: async (command: AgentRpcCommand) => await this.send(command),
       onSwitchTask: async (request) => await this.switchTask(request),
       listModelProfiles: () => Promise.resolve(this.modelProfileSummaries()),
@@ -337,6 +341,12 @@ export class AppController {
   ): void {
     if (this.rpc !== rpc || generation !== this.generation || !this.shell) return;
     this.shell.handlePiEvent(event);
+    if (event && typeof event === "object" && !Array.isArray(event)) {
+      const type = (event as Record<string, unknown>).type;
+      if (type === "tool_execution_end" || type === "agent_settled") {
+        void this.shell.syncEvidence().catch(() => undefined);
+      }
+    }
     if (event && typeof event === "object" && !Array.isArray(event)) {
       const record = event as Record<string, unknown>;
       if (record.type === "message_update" && record.usage) {

@@ -35,7 +35,9 @@ const PATCH = [
 
 interface FixtureOverrides {
   id?: string;
+  schemaVersion?: number;
   baselineFileCount?: number;
+  sourceFingerprint?: string;
   patchSha256?: string;
   dirtyPaths?: string[];
 }
@@ -46,19 +48,28 @@ async function writeFixture(
   overrides: FixtureOverrides = {},
 ): Promise<void> {
   const fixtureDirectory = join(fixtureRoot, directoryId);
-  await mkdir(join(fixtureDirectory, "repository", "src"), { recursive: true });
+  const baseId = "base-" + directoryId;
+  const baseDirectory = join(fixtureRoot, "_bases", baseId);
+  await mkdir(join(baseDirectory, "repository", "src"), { recursive: true });
   await writeFile(
-    join(fixtureDirectory, "repository", "src", "example.ts"),
+    join(baseDirectory, "repository", "src", "example.ts"),
     SOURCE,
     "utf8",
   );
-  await writeFile(join(fixtureDirectory, "source.patch"), PATCH, "utf8");
-  await writeFile(join(fixtureDirectory, "fixture.json"), JSON.stringify({
+  await writeFile(join(baseDirectory, "base.json"), JSON.stringify({
     schemaVersion: 1,
-    id: overrides.id ?? directoryId,
-    baseCommit: "a".repeat(40),
+    id: baseId,
+    sourceCommit: "a".repeat(40),
+    sourceFingerprint: overrides.sourceFingerprint ?? "b".repeat(64),
     baselineFileCount: overrides.baselineFileCount ?? 1,
     repositoryDir: "repository",
+  }, null, 2) + "\n", "utf8");
+  await mkdir(fixtureDirectory, { recursive: true });
+  await writeFile(join(fixtureDirectory, "source.patch"), PATCH, "utf8");
+  await writeFile(join(fixtureDirectory, "fixture.json"), JSON.stringify({
+    schemaVersion: overrides.schemaVersion ?? 2,
+    id: overrides.id ?? directoryId,
+    base: baseId,
     sourcePatch: "source.patch",
     patchSha256: overrides.patchSha256
       ?? createHash("sha256").update(PATCH).digest("hex"),
@@ -94,15 +105,59 @@ describe("Agent Eval fixture materializer", () => {
       { op: "use", actionId: "terminal" },
     ]);
     assert.equal(Object.keys(testCase.expected.secretInputs).length, 0);
+    assert.equal(testCase.expected.schemaVersion, 3);
+    assert.deepEqual(testCase.expected.expectedRouteFeatures, ["feature.terminal-action"]);
     assert.equal(testCase.expected.beforeOracle, "terminal-action-unavailable");
     assert.equal(testCase.expected.afterOracle, "terminal-action-available");
+    assert.match(testCase.sourceFingerprint, /^[0-9a-f]{64}$/u);
+  });
+
+  it("expected.json 只接受当前 schema v3", async () => {
+    const temporaryRoot = await mkdtemp(join(tmpdir(), "maintainer-agent-eval-schema-"));
+    try {
+      const fixtureRoot = join(temporaryRoot, "fixtures");
+      const fixtureId = "old-expected";
+      const fixtureDirectory = join(fixtureRoot, fixtureId);
+      await writeFixture(fixtureRoot, fixtureId);
+      await writeFile(join(fixtureDirectory, "case.json"), JSON.stringify({
+        schemaVersion: 1,
+        fixtureId,
+        category: "combat-sql-state",
+        prompt: "修复测试故障。",
+        evidenceSummary: "可见故障。",
+        startFloor: 1,
+        startPreset: null,
+        timeoutMs: 60_000,
+      }), "utf8");
+      await writeFile(join(fixtureDirectory, "reproduction.json"), JSON.stringify({
+        schemaVersion: 1,
+        fixtureId,
+        steps: [{ op: "wait", milliseconds: 10 }],
+      }), "utf8");
+      await writeFile(join(fixtureDirectory, "expected.json"), JSON.stringify({
+        schemaVersion: 2,
+        fixtureId,
+        secretInputs: {},
+        beforeOracle: "combat-stalled",
+        afterOracle: "combat-progressed",
+        requiredChecks: [],
+        forbiddenPaths: [".git"],
+      }), "utf8");
+
+      await assert.rejects(
+        readAgentEvalCase({ fixtureRoot, id: fixtureId }),
+        /expected\.json 字段与 schema 不一致/u,
+      );
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true, maxRetries: 3 });
+    }
   });
 
   it("内置 terminal-action-bug 复用 521 文件共享基线且只注入一个脏路径", async () => {
     const temporaryRoot = await mkdtemp(join(tmpdir(), "maintainer-agent-eval-real-"));
     try {
       const fixtureRoot = resolve(process.cwd(), "test-fixtures", "agent-evals");
-      const repositoryRoot = join(fixtureRoot, "_bases", "game-repair-v1", "repository");
+      const repositoryRoot = join(fixtureRoot, "_bases", "game-repair", "repository");
       assert.equal(await countFixtureFiles(repositoryRoot), 521);
       const result = await materializeAgentEvalFixture({
         fixtureRoot,
@@ -112,6 +167,10 @@ describe("Agent Eval fixture materializer", () => {
       assert.deepEqual(result.dirtyPaths, [
         "game/src/devtools/dungeon-agent/actions.ts",
       ]);
+      assert.equal(
+        result.sourceFingerprint,
+        "5207ba4b79b7e28816360258f7d5df6612aaf3f0bdfc3a9094ec77efa3ea245e",
+      );
       assert.match(
         await readFile(
           join(result.destination, "game", "src", "devtools", "dungeon-agent", "actions.ts"),
@@ -187,6 +246,7 @@ describe("Agent Eval fixture materializer", () => {
       assert.equal(result.destination, resolve(destination));
       assert.equal(result.baseCommit, await runTestGit(destination, ["rev-parse", "HEAD"]));
       assert.deepEqual(result.dirtyPaths, ["src/example.ts"]);
+      assert.equal(result.sourceFingerprint, "b".repeat(64));
       assert.equal(
         await readFile(join(destination, "src", "example.ts"), "utf8"),
         "export const value = 2;\n",
@@ -261,6 +321,18 @@ describe("Agent Eval fixture materializer", () => {
     const temporaryRoot = await mkdtemp(join(tmpdir(), "maintainer-agent-eval-"));
     try {
       const fixtureRoot = join(temporaryRoot, "fixtures");
+      await writeFixture(fixtureRoot, "old-schema", { schemaVersion: 1 });
+      const oldSchemaDestination = join(temporaryRoot, "old-schema-target");
+      await assert.rejects(
+        materializeAgentEvalFixture({
+          fixtureRoot,
+          id: "old-schema",
+          destination: oldSchemaDestination,
+        }),
+        /当前 schema v2/u,
+      );
+      await assertMissing(oldSchemaDestination);
+
       await writeFixture(fixtureRoot, "wrong-hash", { patchSha256: "0".repeat(64) });
       const hashDestination = join(temporaryRoot, "hash-target");
       await assert.rejects(

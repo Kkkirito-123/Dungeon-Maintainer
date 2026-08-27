@@ -36,18 +36,7 @@ const FIXED_GIT_NAME = "Dungeon Maintainer Agent Eval";
 const FIXED_GIT_EMAIL = "agent-eval@dungeon-maintainer.invalid";
 const FIXED_GIT_DATE = "2000-01-01T00:00:00+00:00";
 
-interface AgentEvalFixtureManifestV1 {
-  schemaVersion: 1;
-  id: string;
-  baseCommit: string;
-  baselineFileCount: number;
-  repositoryDir: "repository";
-  sourcePatch: "source.patch";
-  patchSha256: string;
-  dirtyPaths: string[];
-}
-
-interface AgentEvalFixtureManifestV2 {
+interface AgentEvalFixtureManifest {
   schemaVersion: 2;
   id: string;
   base: string;
@@ -56,14 +45,11 @@ interface AgentEvalFixtureManifestV2 {
   dirtyPaths: string[];
 }
 
-type AgentEvalFixtureManifest =
-  | AgentEvalFixtureManifestV1
-  | AgentEvalFixtureManifestV2;
-
 interface AgentEvalSharedBaseManifest {
   schemaVersion: 1;
   id: string;
   sourceCommit: string;
+  sourceFingerprint: string;
   baselineFileCount: number;
   repositoryDir: "repository";
 }
@@ -84,10 +70,12 @@ export interface AgentEvalFixtureMaterializeOptions {
 export interface MaterializedAgentEvalFixture {
   /** 新建仓库的规范绝对路径。 */
   readonly destination: string;
-  /** 本地重建的实际基线提交，不要求与来源 manifest 的 `baseCommit` 相同。 */
+  /** 本地重建的实际基线提交，不要求与共享基线的 `sourceCommit` 相同。 */
   readonly baseCommit: string;
   /** 应用补丁后的排序去重项目相对路径。 */
   readonly dirtyPaths: readonly string[];
+  /** 源码/地图组合指纹，用于绑定预检证书和结果来源。 */
+  readonly sourceFingerprint: string;
 }
 
 /** 当前游戏 Benchmark Adapter 的物化参数。 */
@@ -144,79 +132,37 @@ function parseManifest(value: unknown, requestedId: string): AgentEvalFixtureMan
     throw new Error("fixture.json 必须是对象");
   }
   const manifest = value as Record<string, unknown>;
-  const schemaVersion = manifest.schemaVersion;
-  const expectedKeys = schemaVersion === 2 ? [
+  const expectedKeys = [
     "base",
     "dirtyPaths",
     "id",
     "patchSha256",
     "schemaVersion",
     "sourcePatch",
-  ] : [
-    "baseCommit",
-    "baselineFileCount",
-    "dirtyPaths",
-    "id",
-    "patchSha256",
-    "repositoryDir",
-    "schemaVersion",
-    "sourcePatch",
   ];
   if (Object.keys(manifest).sort().join("\n") !== expectedKeys.join("\n")) {
-    throw new Error("fixture.json 字段与 schema v1 不一致");
-  }
-  if (manifest.id !== requestedId) {
-    throw new Error("fixture.json 内容与 schema 不一致");
-  }
-  if (schemaVersion === 2) {
-    if (
-      typeof manifest.base !== "string"
-      || normalizeFixtureId(manifest.base) !== manifest.base
-      || manifest.sourcePatch !== "source.patch"
-      || typeof manifest.patchSha256 !== "string"
-      || !/^[0-9a-f]{64}$/u.test(manifest.patchSha256)
-      || !Array.isArray(manifest.dirtyPaths)
-    ) {
-      throw new Error("fixture.json 内容与 schema v2 不一致");
-    }
-    const dirtyPaths = manifest.dirtyPaths.map(normalizeFixturePath);
-    if (new Set(dirtyPaths).size !== dirtyPaths.length) {
-      throw new Error("fixture.json 的 dirtyPaths 不允许重复");
-    }
-    return {
-      schemaVersion: 2,
-      id: requestedId,
-      base: manifest.base,
-      sourcePatch: "source.patch",
-      patchSha256: manifest.patchSha256,
-      dirtyPaths: [...dirtyPaths].sort(),
-    };
+    throw new Error("fixture.json 字段与当前 schema v2 不一致");
   }
   if (
-    schemaVersion !== 1
-    || typeof manifest.baseCommit !== "string"
-    || !/^[0-9a-f]{40}$/u.test(manifest.baseCommit)
-    || typeof manifest.baselineFileCount !== "number"
-    || !Number.isSafeInteger(manifest.baselineFileCount)
-    || manifest.baselineFileCount < 0
-    || manifest.repositoryDir !== "repository"
+    manifest.schemaVersion !== 2
+    || manifest.id !== requestedId
+    || typeof manifest.base !== "string"
+    || normalizeFixtureId(manifest.base) !== manifest.base
     || manifest.sourcePatch !== "source.patch"
     || typeof manifest.patchSha256 !== "string"
     || !/^[0-9a-f]{64}$/u.test(manifest.patchSha256)
     || !Array.isArray(manifest.dirtyPaths)
   ) {
-    throw new Error("fixture.json 内容与 schema v1 不一致");
+    throw new Error("fixture.json 内容与当前 schema v2 不一致");
   }
   const dirtyPaths = manifest.dirtyPaths.map(normalizeFixturePath);
   if (new Set(dirtyPaths).size !== dirtyPaths.length) {
     throw new Error("fixture.json 的 dirtyPaths 不允许重复");
   }
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: requestedId,
-    baseCommit: manifest.baseCommit,
-    baselineFileCount: manifest.baselineFileCount,
-    repositoryDir: "repository",
+    base: manifest.base,
     sourcePatch: "source.patch",
     patchSha256: manifest.patchSha256,
     dirtyPaths: [...dirtyPaths].sort(),
@@ -237,6 +183,7 @@ function parseSharedBaseManifest(
     "repositoryDir",
     "schemaVersion",
     "sourceCommit",
+    "sourceFingerprint",
   ];
   if (Object.keys(manifest).sort().join("\n") !== expectedKeys.join("\n")) {
     throw new Error("base.json 字段与 schema v1 不一致");
@@ -246,6 +193,8 @@ function parseSharedBaseManifest(
     || manifest.id !== requestedId
     || typeof manifest.sourceCommit !== "string"
     || !/^[0-9a-f]{40}$/u.test(manifest.sourceCommit)
+    || typeof manifest.sourceFingerprint !== "string"
+    || !/^[0-9a-f]{64}$/u.test(manifest.sourceFingerprint)
     || typeof manifest.baselineFileCount !== "number"
     || !Number.isSafeInteger(manifest.baselineFileCount)
     || manifest.baselineFileCount < 0
@@ -257,6 +206,7 @@ function parseSharedBaseManifest(
     schemaVersion: 1,
     id: requestedId,
     sourceCommit: manifest.sourceCommit,
+    sourceFingerprint: manifest.sourceFingerprint,
     baselineFileCount: manifest.baselineFileCount,
     repositoryDir: "repository",
   };
@@ -303,6 +253,73 @@ async function requirePlainFile(path: string, label: string): Promise<void> {
   if (information.isSymbolicLink() || !information.isFile()) {
     throw new Error(label + " 必须是普通文件");
   }
+}
+
+interface AgentEvalFixtureDefinition {
+  readonly manifest: AgentEvalFixtureManifest;
+  readonly patchPath: string;
+  readonly repositoryPath: string;
+  readonly baselineFileCount: number;
+  readonly sourceFingerprint: string;
+}
+
+async function readFixtureDefinition(
+  fixtureRoot: string,
+  id: string,
+): Promise<AgentEvalFixtureDefinition> {
+  const rootInformation = await lstat(fixtureRoot);
+  if (rootInformation.isSymbolicLink() || !rootInformation.isDirectory()) {
+    throw new Error("Agent Eval fixture 根必须是真实目录");
+  }
+  const realFixtureRoot = await realpath(fixtureRoot);
+  const requestedFixtureDirectory = resolve(realFixtureRoot, id);
+  const fixtureInformation = await lstat(requestedFixtureDirectory);
+  if (fixtureInformation.isSymbolicLink() || !fixtureInformation.isDirectory()) {
+    throw new Error("Agent Eval fixture 必须是真实目录");
+  }
+  const fixtureDirectory = await realpath(requestedFixtureDirectory);
+  assertDirectChild(realFixtureRoot, fixtureDirectory, "Agent Eval fixture");
+
+  const manifestPath = join(fixtureDirectory, "fixture.json");
+  const patchPath = join(fixtureDirectory, "source.patch");
+  await requirePlainFile(manifestPath, "fixture.json");
+  await requirePlainFile(patchPath, "source.patch");
+  const manifest = await readManifest(manifestPath, id);
+
+  const basesPath = join(realFixtureRoot, "_bases");
+  const basesInformation = await lstat(basesPath);
+  if (basesInformation.isSymbolicLink() || !basesInformation.isDirectory()) {
+    throw new Error("Agent Eval 共享基线根必须是真实目录");
+  }
+  const realBasesPath = await realpath(basesPath);
+  assertDirectChild(realFixtureRoot, realBasesPath, "Agent Eval 共享基线根");
+  const requestedBaseDirectory = resolve(realBasesPath, manifest.base);
+  const baseInformation = await lstat(requestedBaseDirectory);
+  if (baseInformation.isSymbolicLink() || !baseInformation.isDirectory()) {
+    throw new Error("Agent Eval 共享基线必须是真实目录");
+  }
+  const baseDirectory = await realpath(requestedBaseDirectory);
+  assertDirectChild(realBasesPath, baseDirectory, "Agent Eval 共享基线");
+  const baseManifestPath = join(baseDirectory, "base.json");
+  await requirePlainFile(baseManifestPath, "base.json");
+  const baseManifest = await readSharedBaseManifest(baseManifestPath, manifest.base);
+  return {
+    manifest,
+    patchPath,
+    repositoryPath: join(baseDirectory, baseManifest.repositoryDir),
+    baselineFileCount: baseManifest.baselineFileCount,
+    sourceFingerprint: baseManifest.sourceFingerprint,
+  };
+}
+
+/** 读取内置 fixture 当前共享基线的源码/地图指纹。 */
+export async function readAgentEvalFixtureSourceFingerprint(options: {
+  readonly id: string;
+  readonly fixtureRoot: string;
+}): Promise<string> {
+  const id = normalizeFixtureId(options.id);
+  const definition = await readFixtureDefinition(resolve(options.fixtureRoot), id);
+  return definition.sourceFingerprint;
 }
 
 async function inspectRepositoryTree(root: string): Promise<number> {
@@ -418,7 +435,7 @@ async function readDirtyPaths(destination: string): Promise<string[]> {
  * @throws ID/路径穿越、符号链接或特殊文件、已有目标、manifest 不一致、
  * Git 失败或补丁后脏路径不一致时拒绝；创建后失败会回收本次目标。
  * @remarks 调用方只授权创建 `destination`；函数不改动 fixture、其他目录或用户
- * Git 配置。manifest 的 `baseCommit` 仅作为来源元数据校验，不强制本地重建提交同 Hash。
+ * Git 配置。共享基线的 `sourceCommit` 仅作为来源元数据，不强制本地重建提交同 Hash。
  */
 export async function materializeAgentEvalFixture(
   options: AgentEvalFixtureMaterializeOptions,
@@ -435,51 +452,14 @@ export async function materializeAgentEvalFixture(
     throw new Error("Agent Eval 目标目录已存在");
   }
 
-  const rootInformation = await lstat(fixtureRoot);
-  if (rootInformation.isSymbolicLink() || !rootInformation.isDirectory()) {
-    throw new Error("Agent Eval fixture 根必须是真实目录");
-  }
-  const realFixtureRoot = await realpath(fixtureRoot);
-  const requestedFixtureDirectory = resolve(realFixtureRoot, id);
-  const fixtureInformation = await lstat(requestedFixtureDirectory);
-  if (fixtureInformation.isSymbolicLink() || !fixtureInformation.isDirectory()) {
-    throw new Error("Agent Eval fixture 必须是真实目录");
-  }
-  const fixtureDirectory = await realpath(requestedFixtureDirectory);
-  assertDirectChild(realFixtureRoot, fixtureDirectory, "Agent Eval fixture");
-
-  const manifestPath = join(fixtureDirectory, "fixture.json");
-  const patchPath = join(fixtureDirectory, "source.patch");
-  await requirePlainFile(manifestPath, "fixture.json");
-  await requirePlainFile(patchPath, "source.patch");
-  const manifest = await readManifest(manifestPath, id);
-
-  let repositoryPath: string;
-  let baselineFileCount: number;
-  if (manifest.schemaVersion === 1) {
-    repositoryPath = join(fixtureDirectory, manifest.repositoryDir);
-    baselineFileCount = manifest.baselineFileCount;
-  } else {
-    const basesPath = join(realFixtureRoot, "_bases");
-    const basesInformation = await lstat(basesPath);
-    if (basesInformation.isSymbolicLink() || !basesInformation.isDirectory()) {
-      throw new Error("Agent Eval 共享基线根必须是真实目录");
-    }
-    const realBasesPath = await realpath(basesPath);
-    assertDirectChild(realFixtureRoot, realBasesPath, "Agent Eval 共享基线根");
-    const requestedBaseDirectory = resolve(realBasesPath, manifest.base);
-    const baseInformation = await lstat(requestedBaseDirectory);
-    if (baseInformation.isSymbolicLink() || !baseInformation.isDirectory()) {
-      throw new Error("Agent Eval 共享基线必须是真实目录");
-    }
-    const baseDirectory = await realpath(requestedBaseDirectory);
-    assertDirectChild(realBasesPath, baseDirectory, "Agent Eval 共享基线");
-    const baseManifestPath = join(baseDirectory, "base.json");
-    await requirePlainFile(baseManifestPath, "base.json");
-    const baseManifest = await readSharedBaseManifest(baseManifestPath, manifest.base);
-    repositoryPath = join(baseDirectory, baseManifest.repositoryDir);
-    baselineFileCount = baseManifest.baselineFileCount;
-  }
+  const definition = await readFixtureDefinition(fixtureRoot, id);
+  const {
+    manifest,
+    patchPath,
+    repositoryPath,
+    baselineFileCount,
+    sourceFingerprint,
+  } = definition;
   const repositoryInformation = await lstat(repositoryPath);
   if (repositoryInformation.isSymbolicLink() || !repositoryInformation.isDirectory()) {
     throw new Error("fixture repository 必须是真实目录");
@@ -539,7 +519,7 @@ export async function materializeAgentEvalFixture(
     if ((await runGit(destination, ["rev-list", "--count", "HEAD"])).trim() !== "1") {
       throw new Error("Agent Eval 必须只有一个 Bug root commit");
     }
-    return { destination, baseCommit, dirtyPaths };
+    return { destination, baseCommit, dirtyPaths, sourceFingerprint };
   } catch (error) {
     if (created) {
       try {
@@ -597,20 +577,22 @@ export async function materializeAgentEvalFixtureFromGameAdapter(
   const output = value as Record<string, unknown>;
   const expectedKeys = [
     "adapterVersion", "baseCommit", "destination", "dirtyPaths",
-    "fixtureId", "schemaVersion", "variant",
+    "fixtureId", "schemaVersion", "sourceFingerprint", "variant",
   ];
   if (Object.keys(output).sort().join("\n") !== expectedKeys.sort().join("\n")) {
     throw new Error("游戏 Benchmark Adapter 物化结果字段不一致");
   }
   if (
-    output.schemaVersion !== 1
-    || output.adapterVersion !== 1
+    output.schemaVersion !== 2
+    || output.adapterVersion !== 2
     || output.fixtureId !== id
     || output.variant !== variant
     || resolve(String(output.destination)) !== destination
     || typeof output.baseCommit !== "string"
     || !/^[0-9a-f]{40}$/u.test(output.baseCommit)
     || !Array.isArray(output.dirtyPaths)
+    || typeof output.sourceFingerprint !== "string"
+    || !/^[a-f0-9]{64}$/u.test(output.sourceFingerprint)
   ) throw new Error("游戏 Benchmark Adapter 物化结果不合法");
   const dirtyPaths = output.dirtyPaths.map(normalizeFixturePath).sort();
   if (new Set(dirtyPaths).size !== dirtyPaths.length) {
@@ -619,5 +601,5 @@ export async function materializeAgentEvalFixtureFromGameAdapter(
   if (variant === "clean" && dirtyPaths.length !== 0) {
     throw new Error("游戏 Benchmark Adapter clean 结果不得包含 dirtyPaths");
   }
-  return { destination, baseCommit: output.baseCommit, dirtyPaths };
+  return { destination, baseCommit: output.baseCommit, dirtyPaths, sourceFingerprint: output.sourceFingerprint };
 }

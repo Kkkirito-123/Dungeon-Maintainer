@@ -3,15 +3,19 @@
  *
  * TaskStore 是任务事实的唯一写入口：task.json 使用临时文件加原子替换，
  * events.jsonl 只追加低敏元数据。它不执行 Git、浏览器或 Pi，也不读取目标仓库。
- * 旧 schema v1-v3 明确拒绝恢复；EvidenceStore 上线后不保留双写迁移分支。
+ * 只读取当前 schema v4；EvidenceStore 上线后不保留双写或旧数据迁移分支。
+ * 产品能力统一按 1.0 提供，schema 数字仅表示数据格式。
  *
- * 重要失败模式：非法任务 ID、非法状态迁移、旧 schema 或损坏 JSON 都会在产生
- * 副作用前抛错。批准记录只保存摘要，不保存补丁正文或用户确认内容。
+ * 重要失败模式：非法任务 ID、非法状态迁移、非当前格式或损坏 JSON 都会在产生
+ * 副作用前抛错。Windows 可能短暂锁住 task.json，保存时使用唯一临时文件并重试
+ * 原子替换，避免并发工具事件把审批状态卡在半途。批准记录只保存摘要，不保存补丁正文
+ * 或用户确认内容。
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { redactText } from "../logging/redact.js";
 import type {
   ApprovalRecord,
@@ -47,6 +51,174 @@ const TRANSITIONS: Readonly<Record<TaskState, readonly TaskState[]>> = {
   blocked: ["active", "discarded"],
   discarded: [],
 };
+
+const TASK_RECORD_KEYS = [
+  "schemaVersion",
+  "id",
+  "displayName",
+  "objective",
+  "repoRoot",
+  "baseHead",
+  "sourceBranch",
+  "sourceDirtyFiles",
+  "sourceSnapshotHash",
+  "worktreeRoot",
+  "piSessionDir",
+  "modelProfileId",
+  "thinkingLevel",
+  "writeScope",
+  "state",
+  "createdAt",
+  "updatedAt",
+  "changedPaths",
+  "patchLines",
+  "baseHashes",
+  "verification",
+  "approval",
+  "patchPath",
+  "reversePatchPath",
+  "appliedHashes",
+] as const;
+
+function hasExactKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+): boolean {
+  return Object.keys(value).length === keys.length
+    && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return Object.values(value).every((item) => typeof item === "string");
+}
+
+function isWriteScope(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const scope = value as Record<string, unknown>;
+  return hasExactKeys(scope, [
+    "state",
+    "allowedPaths",
+    "digest",
+    "approvedAt",
+    "closedAt",
+  ])
+    && (scope.state === "unapproved" || scope.state === "approved" || scope.state === "closed")
+    && isStringArray(scope.allowedPaths)
+    && isNullableString(scope.digest)
+    && isNullableString(scope.approvedAt)
+    && isNullableString(scope.closedAt);
+}
+
+function isVerification(value: unknown): boolean {
+  if (value === null) return true;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const verification = value as Record<string, unknown>;
+  return hasExactKeys(verification, [
+    "worktreeHash",
+    "checkIds",
+    "reproductionId",
+    "replayPassed",
+    "verifiedAt",
+  ])
+    && typeof verification.worktreeHash === "string"
+    && isStringArray(verification.checkIds)
+    && isNullableString(verification.reproductionId)
+    && typeof verification.replayPassed === "boolean"
+    && typeof verification.verifiedAt === "string";
+}
+
+function isApproval(value: unknown): boolean {
+  if (value === null) return true;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const approval = value as Record<string, unknown>;
+  return hasExactKeys(approval, [
+    "paths",
+    "digest",
+    "requestedAt",
+    "approvedAt",
+    "usedAt",
+  ])
+    && isStringArray(approval.paths)
+    && typeof approval.digest === "string"
+    && typeof approval.requestedAt === "string"
+    && isNullableString(approval.approvedAt)
+    && isNullableString(approval.usedAt);
+}
+
+/** 判断未知值是否为字段完整且 ID 匹配的当前任务记录。 */
+export function taskRecordIsCurrent(value: unknown, taskId: string): value is TaskRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return hasExactKeys(record, TASK_RECORD_KEYS)
+    && record.schemaVersion === 4
+    && typeof record.id === "string"
+    && record.id.length > 0
+    && record.id === taskId
+    && typeof record.displayName === "string"
+    && Boolean(record.displayName.trim())
+    && typeof record.objective === "string"
+    && typeof record.repoRoot === "string"
+    && typeof record.baseHead === "string"
+    && typeof record.sourceBranch === "string"
+    && Number.isInteger(record.sourceDirtyFiles)
+    && (record.sourceDirtyFiles as number) >= 0
+    && isNullableString(record.sourceSnapshotHash)
+    && typeof record.worktreeRoot === "string"
+    && typeof record.piSessionDir === "string"
+    && typeof record.modelProfileId === "string"
+    && (
+      record.thinkingLevel === "off"
+      || record.thinkingLevel === "minimal"
+      || record.thinkingLevel === "low"
+      || record.thinkingLevel === "medium"
+      || record.thinkingLevel === "high"
+      || record.thinkingLevel === "xhigh"
+      || record.thinkingLevel === "max"
+    )
+    && isWriteScope(record.writeScope)
+    && typeof record.state === "string"
+    && Object.hasOwn(TRANSITIONS, record.state)
+    && typeof record.createdAt === "string"
+    && typeof record.updatedAt === "string"
+    && isStringArray(record.changedPaths)
+    && Number.isInteger(record.patchLines)
+    && (record.patchLines as number) >= 0
+    && isStringRecord(record.baseHashes)
+    && isVerification(record.verification)
+    && isApproval(record.approval)
+    && isNullableString(record.patchPath)
+    && isNullableString(record.reversePatchPath)
+    && isStringRecord(record.appliedHashes);
+}
+
+const TASK_REPLACE_RETRY_DELAYS_MS = [0, 10, 25, 50, 100, 200, 400, 800] as const;
+
+function isRetryableTaskReplaceError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "EPERM" || code === "EBUSY" || code === "EACCES";
+}
+
+async function replaceTaskFile(temporary: string, target: string): Promise<void> {
+  for (const [index, waitMs] of TASK_REPLACE_RETRY_DELAYS_MS.entries()) {
+    if (waitMs > 0) await delay(waitMs);
+    try {
+      await rename(temporary, target);
+      return;
+    } catch (error) {
+      const isLastAttempt = index === TASK_REPLACE_RETRY_DELAYS_MS.length - 1;
+      if (isLastAttempt || !isRetryableTaskReplaceError(error)) throw error;
+    }
+  }
+}
 
 /** 创建不可预测且可作为 Pi session-id 的任务 ID。 */
 export function createTaskId(): string {
@@ -146,39 +318,15 @@ export class TaskStore {
    *
    * @param taskId 要恢复的任务 ID。
    * @returns schema v4 任务记录。
-   * @throws 旧任务、损坏 JSON、ID 不匹配或状态非法时拒绝。
+   * @throws 格式、ID 或状态非法时拒绝。
    */
   async read(taskId: string): Promise<TaskRecord> {
     const path = join(this.taskDir(taskId), "task.json");
     const value: unknown = JSON.parse(await readFile(path, "utf8"));
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error("任务记录不是有效对象");
+    if (!taskRecordIsCurrent(value, taskId)) {
+      throw new Error("任务记录格式、ID 或状态非法；请使用 start 创建当前格式任务");
     }
-    const record = value as Record<string, unknown>;
-    if (
-      record.schemaVersion !== 4
-      || record.id !== taskId
-      || typeof record.state !== "string"
-      || !Object.hasOwn(TRANSITIONS, record.state)
-    ) {
-      throw new Error("旧任务或任务记录版本、ID、状态非法；请使用 start 创建 schema v4 任务");
-    }
-    const task = value as unknown as TaskRecord;
-    let needsSave = false;
-    if (
-      typeof record.displayName !== "string"
-      || !record.displayName.trim()
-      || record.displayName === "未命名修复"
-    ) {
-      task.displayName = defaultTaskDisplayName(record.sourceBranch);
-      needsSave = true;
-    } else {
-      task.displayName = normalizeTaskDisplayName(record.displayName);
-    }
-    if (needsSave) {
-      await this.save(task);
-    }
-    return task;
+    return value;
   }
 
   /** 修改任务展示名称；名称只影响 UI 和任务目录，不改变任何执行绑定。 */
@@ -248,13 +396,22 @@ export class TaskStore {
     await mkdir(directory, { recursive: true });
     task.updatedAt = new Date().toISOString();
     const target = join(directory, "task.json");
-    const temporary = target + "." + String(process.pid) + ".tmp";
-    await writeFile(
-      temporary,
-      JSON.stringify(task, null, 2) + "\n",
-      "utf8",
-    );
-    await rename(temporary, target);
+    const temporary = target
+      + "."
+      + String(process.pid)
+      + "."
+      + randomUUID()
+      + ".tmp";
+    try {
+      await writeFile(
+        temporary,
+        JSON.stringify(task, null, 2) + "\n",
+        "utf8",
+      );
+      await replaceTaskFile(temporary, target);
+    } finally {
+      await rm(temporary, { force: true }).catch(() => undefined);
+    }
   }
 
   /**

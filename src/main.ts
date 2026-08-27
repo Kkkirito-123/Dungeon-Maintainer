@@ -19,7 +19,7 @@ export type MaintainerCliCommand =
   | { action: "help" };
 
 const HELP = [
-  "Dungeon Maintainer V1",
+  "Dungeon Maintainer 1.0",
   "",
   "用法：",
   "  dungeon-maintain start --repo <游戏仓库>",

@@ -8,7 +8,7 @@
 
 ## 组成
 
-- `../_bases/game-repair-v1/repository/`：519 文件共享正常基线，只保存一份。
+- `../_bases/game-repair/repository/`：521 文件共享正常基线，只保存一份。
 - `source.patch`：把终端按钮映射改坏的一行 Bug Patch。
 - `fixture.json`：共享基线 ID、补丁 Hash 和唯一预期 dirty 路径。
 - `case.json`：允许发送给 Agent 的公开任务和超时。

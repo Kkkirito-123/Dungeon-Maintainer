@@ -14,9 +14,6 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { AgentRpcCommand } from "../agent/rpc.js";
 
-/** @deprecated 应用层使用中立名称；旧名称只保留类型兼容。 */
-export type PiRpcCommand = AgentRpcCommand;
-
 /** RPC 进程事件回调。 */
 export type PiRpcEventListener = (event: unknown) => void;
 

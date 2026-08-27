@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "id": "duplicate-final-victory-commit",
-  "base": "game-repair-v1",
+  "base": "game-repair",
   "sourcePatch": "source.patch",
   "patchSha256": "51dcd5067f2c3b075019cfcfed7c41c228ad383dc8f3b89149a2229951e25c08",
   "dirtyPaths": ["game/src/domain/session/GameSession.ts"]
