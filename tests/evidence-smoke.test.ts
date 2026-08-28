@@ -1,8 +1,8 @@
 /**
  * Evidence Graph 专用冒烟测试。
  *
- * 这里只验证本地确定性存储、缓存、失效、复现、Solution 和循环门禁，不启动真实游戏、
- * 不调用模型，也不运行完整 Benchmark。测试仓库与数据目录均为一次性临时目录。
+ * 这里只验证本地确定性存储、缓存、失效和复现，不启动真实游戏、
+ * 不调用模型，也不运行完整 Eval。测试仓库与数据目录均为一次性临时目录。
  */
 
 import assert from "node:assert/strict";
@@ -13,14 +13,11 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { buildEvidenceCard } from "../src/evidence/card.js";
 import { checkEvidence } from "../src/evidence/projector.js";
 import { gameEvidence } from "../src/evidence/projector.js";
 import { readDiagnosticEvidence } from "../src/evidence/diagnostic.js";
 import { EvidenceStore } from "../src/evidence/store.js";
 import { SemanticTrace } from "../src/logging/trace.js";
-import { currentSolutionContext } from "../src/pi/evidence-context.js";
-import { LoopGuard } from "../src/pi/loop-guard.js";
 import { registerFinishTool } from "../src/pi/tools/finish.js";
 import { inspectTask } from "../src/pi/tools/inspect.js";
 import {
@@ -79,11 +76,11 @@ describe("Evidence Graph 冒烟", () => {
       await inspectTask({ task, store, evidence }, {
         action: "search",
         query: "portalState",
-      }, undefined, oldWorktreeHash);
+      });
       await inspectTask({ task, store, evidence }, {
         action: "bundle",
         query: "portalState",
-      }, undefined, oldWorktreeHash);
+      });
       await inspectTask({ task, store, evidence }, {
         action: "read",
         path: changedPath,
@@ -117,10 +114,6 @@ describe("Evidence Graph 冒烟", () => {
       assert.equal(activeSources.some((record) => record.worktreeHash === oldWorktreeHash), false);
       assert.equal(activeSources.some((record) => record.path === changedPath), false);
       assert.equal(activeSources.some((record) => record.path === unchangedPath), true);
-      assert.doesNotMatch(buildEvidenceCard(await evidence.active()), new RegExp(
-        oldWorktreeHash.slice(0, 12),
-        "u",
-      ));
       const staleActions = (await evidence.list({ status: "stale", kind: "source" }))
         .filter((record) => record.worktreeHash === oldWorktreeHash)
         .map((record) => record.metadata.action);
@@ -133,11 +126,11 @@ describe("Evidence Graph 冒烟", () => {
       const refreshed = await inspectTask({ task, store, evidence }, {
         action: "search",
         query: "portalState",
-      }, undefined, currentWorktreeHash);
+      });
       const reused = await inspectTask({ task, store, evidence }, {
         action: "search",
         query: "portalState",
-      }, undefined, currentWorktreeHash);
+      });
       assert.equal(refreshed.details.cacheKind, "none");
       assert.equal(reused.details.cacheKind, "exact");
       assert.equal(
@@ -658,20 +651,6 @@ describe("Evidence Graph 冒烟", () => {
         lineCount: 20,
       })).details.cacheKind, "none");
 
-      const loopGuard = new LoopGuard();
-      loopGuard.resetForNewTask(evidence.revision);
-      const cachedAction = {
-        toolName: "inspect",
-        input: { action: "read", path: sourcePath },
-      };
-      assert.equal(loopGuard.evaluateAction(cachedAction).kind, "allow");
-      assert.equal(loopGuard.recordOutcome({
-        action: cachedAction,
-        result: second.details,
-        evidenceRevision: evidence.revision,
-      }), false);
-      assert.equal(loopGuard.noProgressCount, 1);
-
       await writeFile(
         join(repository.repoRoot, sourcePath),
         original.replace("'stuck'", "'ready'"),
@@ -841,76 +820,6 @@ describe("Evidence Graph 冒烟", () => {
         finishExtensionContext(true),
       );
 
-      const savedSolutions = await recoveredEvidence.searchSolutions(
-        "击败 boss 后卡在传送门",
-        3,
-      );
-      assert.equal(savedSolutions.length, 1);
-      const savedSolution = savedSolutions[0];
-      assert(savedSolution);
-      assert.deepEqual(savedSolution.relatedPaths, [sourcePath]);
-      const solutionPath = join(
-        dataDir,
-        "projects",
-        recoveredEvidence.projectKey,
-        "solutions",
-        savedSolution.id + ".json",
-      );
-      const solutionText = await readFile(solutionPath, "utf8");
-      const incompleteSolution = JSON.parse(solutionText) as Record<string, unknown>;
-      delete incompleteSolution.verification;
-      await writeFile(
-        solutionPath,
-        JSON.stringify(incompleteSolution, null, 2) + "\n",
-        "utf8",
-      );
-      await assert.rejects(
-        recoveredEvidence.getSolution(savedSolution.id),
-        /解决方案文件格式、版本、ID 或项目绑定非法/u,
-      );
-      const oldExtendedSolution = {
-        ...(JSON.parse(solutionText) as Record<string, unknown>),
-        legacyCategory: "game-repair",
-      };
-      await writeFile(
-        solutionPath,
-        JSON.stringify(oldExtendedSolution, null, 2) + "\n",
-        "utf8",
-      );
-      await assert.rejects(
-        recoveredEvidence.getSolution(savedSolution.id),
-        /解决方案文件格式、版本、ID 或项目绑定非法/u,
-      );
-      await writeFile(solutionPath, solutionText, "utf8");
-      assert.equal((await recoveredEvidence.getSolution(savedSolution.id))?.id, savedSolution.id);
-      const nextTask = await store.create({
-        id: "evidence-smoke-next",
-        objective: "击败 boss 后卡在传送门，请检查并修复",
-        repoRoot: repository.repoRoot,
-        baseHead: repository.baseHead,
-        worktreeRoot: repository.repoRoot,
-        piSessionDir: join(dataDir, "tasks", "evidence-smoke-next", "pi"),
-      });
-      const nextEvidence = new EvidenceStore(dataDir, nextTask);
-      const historicalContext = await currentSolutionContext(
-        nextEvidence,
-        nextTask.objective,
-      );
-      assert.equal(historicalContext.matchCount, 1);
-      assert.match(historicalContext.text ?? "", /历史解决方案候选/u);
-      assert.match(historicalContext.text ?? "", /修复首领后传送门推进/u);
-      assert.match(historicalContext.text ?? "", /game\/src\/domain\/portal\.ts/u);
-      assert.doesNotMatch(historicalContext.text ?? "", /solutionId|evidenceRefs|score/u);
-      const solutionEvents = (await readFile(
-        join(store.taskDir(task.id), "events.jsonl"),
-        "utf8",
-      )).split(/\r?\n/u).filter(Boolean).map(
-        (row) => JSON.parse(row) as { type: string; detail: Record<string, unknown> },
-      );
-      assert.equal(solutionEvents.some((event) => (
-        event.type === "evidence.solution_saved"
-        && event.detail.outcome === "saved"
-      )), true);
       const blockedApi = new SingleToolApi();
       registerFinishTool(blockedApi as unknown as ExtensionAPI, {
         task,
@@ -931,11 +840,6 @@ describe("Evidence Graph 冒烟", () => {
         undefined,
         finishExtensionContext(false),
       );
-      assert.equal(
-        (await recoveredEvidence.searchSolutions("独特阻塞结论", 3)).length,
-        0,
-      );
-
       const sqlTrace = new SemanticTrace(10);
       sqlTrace.push({
         action: "input-sql",

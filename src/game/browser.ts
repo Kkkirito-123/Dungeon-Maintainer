@@ -8,7 +8,12 @@
  * 因此用户只看到一个可拖拽分栏的窗口。没有 Shell 地址时仅用于单元测试兼容直开游戏。
  */
 
-import { chromium, type BrowserContext, type Frame, type Page } from "playwright";
+import {
+  chromium,
+  type BrowserContext,
+  type Frame,
+  type Page,
+} from "playwright";
 import type {
   PlayJudge,
   PlayResult,
@@ -21,6 +26,16 @@ export class GameBrowserError extends Error {}
 
 /** 浏览器页面错误的低敏通知。 */
 export type BrowserErrorListener = (kind: string) => void;
+
+/** 试玩模式不把同源可选 Presence 服务缺席计为游戏故障。 */
+export function isOptionalPresenceError(baseUrl: string, sourceUrl: string): boolean {
+  try {
+    const source = new URL(sourceUrl);
+    return source.origin === new URL(baseUrl).origin && source.pathname === "/api/presence";
+  } catch {
+    return false;
+  }
+}
 
 /**
  * 一个 Pi 任务持有的唯一 Chromium 会话。
@@ -76,7 +91,12 @@ export class GameBrowser {
     this.page = this.context.pages()[0] ?? await this.context.newPage();
     this.page.setDefaultTimeout(15_000);
     this.page.on("console", (message) => {
-      if (message.type() === "error") this.onError("console-error");
+      if (
+        message.type() === "error"
+        && !isOptionalPresenceError(this.baseUrl, message.location().url)
+      ) {
+        this.onError("console-error");
+      }
     });
     this.page.on("pageerror", () => {
       this.onError("page-error");
@@ -104,7 +124,7 @@ export class GameBrowser {
   /**
    * 在首个复现检查点前应用一个内置管理员状态预设。
    *
-   * 该入口只供零模型 Benchmark 准备确定性起点，不属于 Pi 的游戏工具面；
+   * 该入口只供零模型 Eval 准备确定性起点，不属于 Pi 的游戏工具面；
    * 预设 ID 由受校验的 fixture 提供，页面拒绝未知预设。
    */
   async prepare(presetId: string): Promise<void> {
@@ -114,7 +134,7 @@ export class GameBrowser {
       }).__DUNGEON_PLAYTEST__;
       return bridge?.prepare?.(id) ?? false;
     }, presetId));
-    if (!prepared) throw new GameBrowserError("游戏无法应用 Benchmark 起点预设");
+    if (!prepared) throw new GameBrowserError("游戏无法应用 Eval 起点预设");
   }
 
   /**

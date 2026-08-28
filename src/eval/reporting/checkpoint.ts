@@ -1,0 +1,179 @@
+/**
+ * EvalSuite 断点文件。
+ *
+ * 本模块只做原子单写和恢复所需的最小验证。并行 Worker 不直接写文件，Suite 会把
+ * 所有写入排入同一 Promise 链，因此 checkpoint 不会发生交错覆盖。
+ */
+
+import { randomUUID } from "node:crypto";
+import { readFile, rename, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import type { EvalRunProfile, EvalRunResult } from "../execution/run.js";
+import type { EvalPreflightResult } from "../execution/preflight.js";
+
+/** 可恢复的 Suite 状态。 */
+export interface EvalSuiteCheckpoint {
+  readonly schemaVersion: 3;
+  readonly runFingerprint: string;
+  readonly datasetId: string;
+  readonly profile: EvalRunProfile | "both";
+  readonly repetitions: number;
+  readonly expectedRuns: number;
+  readonly results: readonly EvalRunResult[];
+  readonly runFailures: readonly {
+    readonly scenarioId: string;
+    readonly profile: EvalRunProfile;
+    readonly repetition: number;
+    readonly code: string;
+  }[];
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function profile(value: unknown): value is EvalRunProfile {
+  return value === "maintainer" || value === "pi-baseline";
+}
+
+function positiveInteger(value: unknown): boolean {
+  return Number.isSafeInteger(value) && Number(value) >= 1;
+}
+
+function isRunResult(value: unknown, runFingerprint: string): value is EvalRunResult {
+  const result = record(value);
+  const agentResult = record(result?.agentResult);
+  const identity = result?.identity === null ? null : record(result?.identity);
+  return result !== null
+    && result.schemaVersion === 5
+    && typeof result.runId === "string"
+    && typeof result.scenarioId === "string"
+    && profile(result.profile)
+    && positiveInteger(result.repetition)
+    && (result.status === "passed" || result.status === "failed" || result.status === "infra_error")
+    && agentResult !== null
+    && (agentResult.status === "settled" || agentResult.status === "timeout" || agentResult.status === "infra_error")
+    && typeof agentResult.totalTokens === "number"
+    && typeof agentResult.toolCalls === "number"
+    && (identity === null || identity.runFingerprint === runFingerprint);
+}
+
+function isRunFailure(value: unknown): boolean {
+  const failure = record(value);
+  return failure !== null
+    && typeof failure.scenarioId === "string"
+    && profile(failure.profile)
+    && positiveInteger(failure.repetition)
+    && typeof failure.code === "string";
+}
+
+/** 只复用相同 Dataset、Profile、重复次数和运行身份的 checkpoint。 */
+export function evalSuiteCheckpointIsCompatible(
+  checkpoint: unknown,
+  expected: {
+    readonly runFingerprint: string;
+    readonly datasetId: string;
+    readonly profile: EvalRunProfile | "both";
+    readonly repetitions: number;
+    readonly expectedRuns: number;
+  },
+): checkpoint is EvalSuiteCheckpoint {
+  const value = record(checkpoint);
+  return value !== null
+    && value.schemaVersion === 3
+    && value.runFingerprint === expected.runFingerprint
+    && value.datasetId === expected.datasetId
+    && value.profile === expected.profile
+    && value.repetitions === expected.repetitions
+    && value.expectedRuns === expected.expectedRuns
+    && Array.isArray(value.results)
+    && value.results.every((result) => isRunResult(result, expected.runFingerprint))
+    && Array.isArray(value.runFailures)
+    && value.runFailures.every(isRunFailure);
+}
+
+/** 通过同目录临时文件和 rename 原子替换 checkpoint。 */
+export async function writeEvalSuiteCheckpoint(
+  archiveDirectory: string,
+  checkpoint: EvalSuiteCheckpoint,
+): Promise<void> {
+  const target = join(archiveDirectory, "checkpoint.json");
+  const temporary = target + ".tmp-" + randomUUID();
+  await writeFile(temporary, JSON.stringify(checkpoint, null, 2) + "\n", "utf8");
+  await rename(temporary, target);
+}
+
+/** 读取 checkpoint；损坏或旧 schema 统一视为不可恢复。 */
+export async function readEvalSuiteCheckpoint(
+  path: string,
+): Promise<EvalSuiteCheckpoint | null> {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
+    const value = record(parsed);
+    if (
+      !value
+      || typeof value.runFingerprint !== "string"
+      || typeof value.datasetId !== "string"
+      || (value.profile !== "both" && !profile(value.profile))
+      || !positiveInteger(value.repetitions)
+      || !Number.isSafeInteger(value.expectedRuns)
+    ) return null;
+    return evalSuiteCheckpointIsCompatible(value, {
+      runFingerprint: value.runFingerprint,
+      datasetId: value.datasetId,
+      profile: value.profile,
+      repetitions: Number(value.repetitions),
+      expectedRuns: Number(value.expectedRuns),
+    }) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function isPreflightResult(
+  value: unknown,
+  scenarioId: string,
+  runFingerprint: string,
+): value is EvalPreflightResult {
+  const result = record(value);
+  const certificate = result?.certificate === null ? null : record(result?.certificate);
+  return result !== null
+    && result.schemaVersion === 3
+    && result.scenarioId === scenarioId
+    && result.runFingerprint === runFingerprint
+    && (result.status === "passed" || result.status === "failed" || result.status === "infra_error")
+    && typeof result.initialFailureMatched === "boolean"
+    && typeof result.cleanBaselineMatched === "boolean"
+    && (
+      certificate === null
+      || (
+        certificate.schemaVersion === 2
+        && certificate.scenarioId === scenarioId
+        && certificate.runFingerprint === runFingerprint
+      )
+    );
+}
+
+/** 按 Dataset 顺序读取全部预检；任一缺失或不匹配就重新预检整组。 */
+export async function readSavedEvalPreflights(
+  archiveDirectory: string,
+  scenarioIds: readonly string[],
+  runFingerprint: string,
+): Promise<EvalPreflightResult[] | null> {
+  const entries: EvalPreflightResult[] = [];
+  for (const scenarioId of scenarioIds) {
+    try {
+      const parsed: unknown = JSON.parse(await readFile(
+        join(archiveDirectory, "preflight", scenarioId + "-preflight.json"),
+        "utf8",
+      ));
+      if (!isPreflightResult(parsed, scenarioId, runFingerprint)) return null;
+      entries.push(parsed);
+    } catch {
+      return null;
+    }
+  }
+  return entries;
+}

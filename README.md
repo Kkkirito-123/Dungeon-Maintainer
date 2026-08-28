@@ -4,39 +4,8 @@ Dungeon Maintainer 是 SQL Dungeon（`SELECT * FROM DUNGEON`）专用的本地 C
 它复用 Pi RPC 作为 Agent 内核，在一个本地 Chromium Shell 中同时展示 Pi 风格聊天 CLI 和
 worktree 中的真实游戏。正式游戏仓库只有在用户显式执行 `/apply` 后才会改变。
 
-> [!IMPORTANT]
-> **2026-08-27 实测更新：Pi 风格自然收尾已进入当前 Maintainer。** 当当前回合没有下一次工具调用时，
-> Agent 按 Pi 原生语义直接 `agent_settled`；不会自动创建隐藏续跑，也不会因为自然结束而偷偷触发验证。
-> 代码修改保留在隔离 worktree，用户可以显式执行 `/verify` 或 `/apply`。Evidence card 只帮助模型保留证据，
-> 不参与额外的 RAG 终止门禁。
->
-> 下面是同一组 7 个真实游戏修复 fixture 的单次实测。两边使用相同的模型配置、游戏源码和 Pi `v0.84.2`；
-> Maintainer 使用本次自然收尾代码，Pi Original 使用已有基线归档。负数表示 Maintainer 更快。
-
-| 汇总指标 | Maintainer (`deepseek-v4-pro`) | Pi Original | 变化 |
-|---|---:|---:|---:|
-| 任务通过 | 7/7 | 7/7 | 持平 |
-| 平均 Agent Loop | 164.1 s | 196.1 s | **-16.4%** |
-| 平均端到端总用时 | 184.2 s | 217.8 s | **-15.5%** |
-| 工具调用总数 | 202 | 263 | **-23.2%** |
-| 回合总数 | 152 | 227 | **-33.0%** |
-| 总 Token | 1,891,656 | 6,591,202 | **-71.3%** |
-| 未缓存 Token | 237,384 | 349,794 | **-32.1%** |
-| 聚合缓存命中率 | 88.73% | 95.34% | -6.61 个百分点 |
-
-| 修复案例 | Maintainer 总用时 | Pi Original 总用时 | 时间变化 |
-|---|---:|---:|---:|
-| 首个终端动作点击后不可用 | 1:54 | 4:32 | **-58.1%** |
-| 查询通过但战斗阶段不推进 | 2:25 | 2:14 | +8.3% |
-| 最终阶段 Boss 卡在 1 HP | 4:27 | 2:16 | +96.3% |
-| 管理员试玩击败层主后不自动传送 | 2:25 | 5:28 | **-55.8%** |
-| 传送动画结束后不加载下一层 | 5:03 | 2:55 | +73.3% |
-| 点查结果正确但执行计划仍显示 SCAN | 2:20 | 4:44 | **-50.8%** |
-| 最终胜利被重复结算 | 2:55 | 3:16 | **-10.6%** |
-
-这是工程调试快照，不代表统计显著性，也不表示每个案例都更快；但它表明当前化简在不牺牲 7/7 功能正确性的前提下，
-整体减少了回合、工具和 Token。完整结构化报告保留在
-[`benchmark-results/.../summary.json`](benchmark-results/pi-style-natural-settle-all-20260827/matrix-2026-08-27T05-27-27-997Z-740bf156/summary.json)。
+维护器刻意保持单循环：一条请求进入一个 Pi Agent Loop，没有隐藏规划器、自动续跑、架构路由或
+跨任务方案索引。当前任务 Evidence、全部领域工具、安全门禁和前端可见能力继续保留。
 
 ```text
 单个 Chromium Shell
@@ -45,8 +14,8 @@ worktree 中的真实游戏。正式游戏仓库只有在用户显式执行 `/ap
 └─ 底部：上下文、Token、任务和运行状态
         ↓
 Pi RPC + Dungeon Maintainer Extension
-  ├─ inspect / patch / check / finish
-  ├─ look / go / use / query
+  ├─ inspect / evidence / patch / check / finish
+  ├─ look / go / use / input_sql / query / tree
   ├─ detached worktree + 固定检查
   └─ Vite + Playwright iframe + 检查点重放
         ↓
@@ -58,7 +27,7 @@ Pi RPC + Dungeon Maintainer Extension
 维护器与游戏保持两个独立仓库。1.0 固定为单 Agent、单 Pi、单活动 worktree、单 Vite 和单浏览器会话；
 历史任务和其他合法 worktree 可持久化并在 Shell 中切换，切换时旧 Pi 会先停止，不会后台继续调用模型。
 不提供公网 Dashboard、Electron、面向用户的任意终端、多 Agent、自动提交、推送、PR、部署或长期记忆。
-任意 Bash 不加载；方案确认后只开放隔离 worktree 内的 `edit/write` 和受限 `patch`。
+任意 Bash 不加载；方案确认后只开放隔离 worktree 内的原生 `write` 和受限 `patch`。
 
 核心代码按单一职责分区：`src/app.ts` 是公开入口，`src/app/` 分别拥有仓库事实、Pi 进程、
 任务生命周期与 start/resume；`src/pi/extension.ts` 只做 Pi 装配，会话安全策略和游戏运行时分别
@@ -100,16 +69,15 @@ node dist/src/main.js --help
 ```text
 MAINTAINER_API_KEY=
 MAINTAINER_BASE_URL=https://api.deepseek.com/v1
-MAINTAINER_MODEL=deepseek-chat
+MAINTAINER_MODEL=deepseek-v4-pro
 MAINTAINER_CONTEXT_WINDOW=64000
 MAINTAINER_MAX_TOKENS=4096
 MAINTAINER_REASONING=true
 ```
 
-进程环境变量优先于维护器 `.env`。首版模型档案保存在维护器数据目录的
-`settings/profiles.json`，只包含名称、OpenAI-compatible 地址、模型 ID、上下文、输出上限和
-推理支持；Windows 上的 API Key 写入凭据管理器，开发环境仍可用环境变量。密钥只通过环境传给
-Pi Provider，不进入命令行、`task.json`、事件日志或补丁文件。
+进程环境变量优先于维护器 `.env`。模型、接口、上下文、输出上限和推理能力只有这一套
+`MAINTAINER_*` 配置源；不再存在模型档案、`profiles.json` 或运行时模型切换。密钥只通过环境传给
+Pi Provider，不进入命令行、`task.json`、事件日志、浏览器或补丁文件。
 
 ## 启动与恢复
 
@@ -144,14 +112,14 @@ Shell 左侧是聊天输入，右侧 iframe 显示同一个 worktree 的游戏�
 
 Pi 启动时固定使用 `--mode rpc`，显式加载 Pi 原生 Coding 工具和维护器领域工具，同时禁用外部 Extension、
 Skill、Prompt Template 和上下文文件。Extension 默认只激活只读诊断工具；用户在 Shell 确认“病因 +
-完整方案 + 验证方式”后，才为当前 Agent 运行临时开放 `edit/write/patch`。Pi 内会在运行时真正替换会话前取消
-`/new`、`/resume`、`/import`、`/fork`、`/clone` 和 `/tree`。模型、Thinking 和压缩通过 Pi 原生 RPC
-切换，Shell 以 Pi 返回状态为事实源；保存并启用新的模型档案时才会重启这一唯一 Pi。
+完整方案 + 验证方式”后，才为当前 Agent 运行临时开放 `write/patch`。Pi 内会在运行时真正替换会话前取消
+`/new`、`/resume`、`/import`、`/fork`、`/clone` 和 `/tree`。模型固定来自进程启动时的
+`MAINTAINER_MODEL`；Thinking 和压缩仍通过 Pi 原生 RPC 调整，Shell 以 Pi 返回状态为事实源。
 Shell 与后端仅通过本机 HTTP/SSE 通信，API Key 不进入浏览器。
 
 ## Pi 内工具与命令
 
-维护器提供十个领域工具，并只复用 Pi 原生 `edit/write`。原生 `read/grep/find/ls` 不加载；源码读取、
+维护器提供 11 个领域工具，并只复用 1 个 Pi 原生 `write`（合计 12 个工具）。原生 `read/grep/find/ls/edit` 不加载；源码读取、
 搜索、目录和 Diff 统一通过安全 `inspect`：
 
 | 工具 | 作用 | 硬边界 |
@@ -264,10 +232,8 @@ pnpm test
 pnpm build
 ```
 
-Dungeon Maintainer 现在只有一条产品线：1.0。三级路由、区域归档和 Evidence Graph 均属于
-1.0 的内置能力；生产代码只接受当前任务、架构图、游戏桥和 Benchmark 格式，不提供旧版本迁移。
-详细设计见
-[docs/MAINTAINER_DESIGN.md](docs/MAINTAINER_DESIGN.md)。
+Dungeon Maintainer 现在只有一条产品线：单 Pi Loop、固定工具、当前任务 Evidence 和确定性安全门禁。
+代码地图、命名规则和新手阅读顺序见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ## 统一 Chromium Shell
 
@@ -284,8 +250,8 @@ Chromium 以 App 模式启动，不显示标签栏和地址栏；Playwright 使�
 
 左侧输入发送后会立即出现固定“当前动作”栏，不依赖模型先生成文字。它依次显示等待 Pi、读取游戏
 状态、复现、定位代码、修改 worktree、验证、生成结论或等待方案确认，并每 5 秒更新已用时间。
-同一条活动只更新原位置，不追加聊天气泡，也不产生模型 Token；当前回合完成前输入框会暂时禁用，
-避免重复消息并发进入同一个 Pi 会话。
+同一条活动只更新原位置，不追加聊天气泡，也不产生模型 Token；当前回合中可以通过输入框发送 Pi
+原生 steer 追加要求，也可以“停止本轮”。新请求和固定命令仍要等 `agent_settled`，不会并发进入同一 Pi 会话。
 
 界面代码集中保存在维护器的 src/shell 文件夹，避免散落到 app、Pi 和 game 模块：
 
@@ -296,27 +262,30 @@ Chromium 以 App 模式启动，不显示标签栏和地址栏；Playwright 使�
 
 Shell 只展示低敏摘要，不传输 API Key、完整 Prompt、thinking、SQL、管理员答案、隐藏裁判
 或浏览器帧。底部严格固定两排并各自横向滚动：第一排是工作树、任务、阶段、模型、Thinking 和上下文，
-第二排是本轮/会话 Token、缓存、工具预算、运行时、Diff 和验证。工作树按钮可展开合法 worktree、
+第二排是本轮/会话 Token、缓存、工具调用次数、运行时、Diff 和验证。工作树按钮可展开合法 worktree、
 可恢复任务和当前 detached worktree 文件树。游戏 iframe 由同一个 Chromium Context 中的 Playwright
 驱动，修改后执行检查点、刷新、恢复和语义重放。
 
-## Benchmark 与 Token 门禁
+## 内置 Eval
 
-### 2026-08-27 · 7 案例工程对比
+`pnpm eval` 把真实故障场景物化到独立仓库，先由外部 Oracle 确认故障存在，再启动正常 Maintainer
+修复，最后由同一个 Oracle 判卷。现场演示和 CI 共用一个 Runner；演示模式显示场景、预检、运行、
+结果、耗时、Token 和工具调用，CI 模式输出 JSON 与退出码。
 
-顶部的实测表是当前公开快照；下面的运行说明用于复现同一矩阵。结果不代表统计显著性，
-也不表示每个案例都更快；完整结构化报告不进入 Git，由本地 `benchmark-results/` 归档保存。
+```powershell
+pnpm eval -- suite `
+  --dataset eval-v1 `
+  --profile maintainer `
+  --workers 2 `
+  --dependencies "C:\path\to\select-from-dungeon" `
+  --ui progress
+```
 
-`pnpm benchmark` 默认使用真实 HTTP/SSE Shell 和受控 Pi 事件，不调用模型；传入
-`--repo` 后再启动真实 Vite 与无头 Chromium，验证首个终端的玩家可见投影、一次空输入拒绝，以及
-短复现窗口的检查点恢复与同动作重放；它不依赖隐藏答案。详细指标和真实 Pi 任务分析见
-[docs/BENCHMARK.md](docs/BENCHMARK.md)。
+Eval Dataset 固定在 `eval-datasets/`，不读取当前游戏源码。正式运行只从 `--dependencies` 指定的
+游戏仓库复用已安装的 `game/node_modules`；游戏开发和评测基线互不修改。单 Profile 默认并行
+2 个独立 Worker，公平对比默认 1 个；Oracle 不向 Agent 暴露答案，也不根据指标控制 Agent。
+目录分层、测试前检查、Profile 对比、版本指纹和断点恢复见 [docs/EVAL.md](docs/EVAL.md)。
 
-内置回归样本位于 [test-fixtures](test-fixtures/)，分为可物化的 `agent-evals` 仓库 fixture 和
-不启动模型的 `smoke-tasks` 生命周期 fixture；使用方式、目录约束和新增的续跑/终态 token 指标见
-[Benchmark 文档](docs/BENCHMARK.md#内置-fixture)。
-
-发给模型的临时上下文会优先保留最新游戏/源码证据并对完全重复的工具结果去重，单个临时工具结果
-最多约 2.25 KiB，单轮所有临时工具结果最多约 20 KiB；原始 session 和证据文件不改写。底部状态栏分开显示本轮与会话 input/cache/output 及缓存命中率。
-每条自然语言输入发送前还会刷新 Pi 的上下文用量；预计超过状态栏“安全线”时先同步压缩，压缩后
-仍超线才拒绝发送。安全线同时预留 25% 上下文和当前模型最大输出空间，不新增模型调用。
+模型上下文保留 Pi 原生 Session 历史和 compact。维护器不设置请求级工具次数或 Token 强制上限；
+自动重试、compact、steer、abort 和自然结束保持 Pi 原生语义。每条自然语言输入发送前仍执行
+确定性的上下文预算检查，必要时先使用 Pi compact。

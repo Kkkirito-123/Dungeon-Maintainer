@@ -11,10 +11,6 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { GameDriver } from "../../game/driver.js";
-import type {
-  ArchitectureMap,
-  ArchitectureRoute,
-} from "../../inspection/architecture-map.js";
 import type { EvidenceStore } from "../../evidence/store.js";
 import type { TaskStore } from "../../task/store.js";
 import type { TaskRecord } from "../../task/types.js";
@@ -32,10 +28,6 @@ export interface MaintainerToolContext {
   task: TaskRecord;
   store: TaskStore;
   evidence: EvidenceStore;
-  architectureMap?(): ArchitectureMap | null;
-  architectureRoute?(): ArchitectureRoute | null;
-  /** 由 Extension 的 tool_call 门禁提供同一次调用已计算的 worktree Hash。 */
-  inspectWorktreeHash?(toolCallId: string): string | undefined;
   currentDriver(): GameDriver | null;
   requireDriver(): GameDriver;
   ensureGame(): Promise<GameDriver>;

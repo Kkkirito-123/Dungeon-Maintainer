@@ -34,7 +34,7 @@ src/pi/extension.ts      Pi Provider、工具、命令和生命周期装配
 src/pi/session-policy.ts Pi 会话绑定、模型/会话切换阻断
 src/pi/game-runtime.ts   单 Vite、临时 Chromium 和 GameDriver 生命周期
 src/pi/tool-policy.ts    只读诊断与本轮完整执行的活动工具集合
-src/pi/tools/            十个固定领域工具（含总方案审批与工作树切换）
+src/pi/tools/            十一个固定领域工具（含总方案审批与工作树切换；另加载 Pi 原生 write）
 src/pi/commands/         五个固定用户命令
 src/shell/               Chromium Shell 页面、HTTP/SSE 协议和状态栏
 src/task/                当前 schema v4 任务事实与状态机
@@ -42,6 +42,12 @@ src/workspace/           Git、realpath、补丁、检查、apply 与 worktree
 src/game/                Vite、临时 Chromium、协议客户端与语义驱动
 src/repair/              复现、刷新重放与验证
 src/logging/             低敏事件、脱敏与 500 条语义 Trace
+src/eval/domain/         Dataset、Scenario、Oracle 和 Profile 共用结果契约
+src/eval/execution/      Workspace、预检、单次运行、并行 Suite 和进度事件
+src/eval/profiles/       互不依赖的 Maintainer 与 Pi Baseline
+src/eval/reporting/      运行身份、checkpoint 和结果汇总
+src/eval/ui/             Eval 静态进度页和本地 SSE 服务
+eval-datasets/           冻结评测输入；不读取当前游戏工作树
 tests/                   Node 测试；安全边界优先使用真实临时 Git 仓库
 ```
 
@@ -54,7 +60,7 @@ tests/                   Node 测试；安全边界优先使用真实临时 Git 
 - 只实现当前明确目标，优先最小完整切片；不要为单次调用建立泛化抽象或兼容层。
 - 诊断阶段可以提出精确 write/patch；第一次调用由执行层按目标文件申请用户批准，批准后才真正写入；
   本轮结束必须自动收权。
-- 任意 Bash 不加载；原生 edit/write 也必须经过 detached worktree 的项目相对路径和 realpath 边界。
+- 任意 Bash 不加载；原生 write 也必须经过 detached worktree 的项目相对路径和 realpath 边界。
 - 所有文件访问必须先规范项目相对路径，再通过 `realpath`/最近存在父目录检查符号链接逃逸。
 - `patch` 必须绑定最新 `baseHash`、唯一旧文本和 3 文件/120 行预算；模型调用时复用当前已批准的
   精确写入范围，不得为同一文件重复打断用户。
@@ -101,9 +107,14 @@ dungeon-maintain start --repo <游戏仓库>
 dungeon-maintain resume <task-id>
 ```
 
-Pi 原生工具只加载 `edit/write`；源码读取、搜索、目录和 Diff 统一走安全 `inspect`。领域工具固定为
+Pi 原生工具只加载 `write`；源码读取、搜索、目录和 Diff 统一走安全 `inspect`。维护器共加载
+11 个领域工具和 1 个 Pi 原生工具，领域工具固定为
 `inspect/patch/check/finish/look/go/use/input_sql/query/tree`；用户命令固定为 `/play /diff /verify /apply /discard`。
 新增能力前必须先修改已批准设计，不能通过配置动态扩展。
+
+维护器内部评测统一称为 `Eval`（入口为 `pnpm eval`，代码位于 `src/eval/`）。生产 Eval 不读取
+当前游戏的场景或适配器：场景只来自 `eval-datasets/`；`--dependencies` 只复用游戏的
+`game/node_modules`。游戏合同由独立 `game-contract` 静态检查维护。
 
 任务记录只接受当前 schema v4，不迁移旧格式。状态机为：
 
@@ -145,8 +156,9 @@ Pi 子进程继续使用 RPC/JSONL；游戏由 Playwright 在同一个 Chromium 
 管理员答案、隐藏裁判或浏览器帧。允许本地 HTTP/SSE 仅用于当前任务的 Shell，不得扩展成公网服务。
 
 长模型请求必须通过 `activity` SSE 事件在固定 `role=status` 区域给出即时阶段反馈；反馈只使用
-确定性运行时事件和计时，不得额外请求模型或向聊天记录周期性追加消息。同一任务一次只接受一个
-自然语言输入，完成、拒绝或错误后必须恢复输入控件。
+确定性运行时事件和计时，不得额外请求模型或向聊天记录周期性追加消息。同一任务同一时刻只运行一个
+自然语言回合；回合运行中允许通过 Pi 原生 `steer` 追加文字要求，固定命令仍需等待回合结束。
+用户可通过 Pi 原生 `abort` 停止当前回合；收到 `agent_settled` 或请求明确完成后必须恢复输入控件。
 
 涉及游戏桥时，还要在目标游戏仓库运行聚焦测试、完整游戏测试、架构检查和生产构建，并确认
 `game/dist` 不含 `__DUNGEON_PLAYTEST__`。只报告实际执行的检查，不把静态或 mock 证据称为端到端。

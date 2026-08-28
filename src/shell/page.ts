@@ -7,6 +7,8 @@
  *
  * 令牌只作为当前本机任务的短期 URL 参数使用；页面不会读取 API Key，也不会把隐藏
  * 游戏状态写入 localStorage。分栏宽度是唯一允许持久化到浏览器本地的 UI 偏好。
+ * 运行中允许发送低延迟文字 steer，也允许通过 abort 停止当前回合；这两者都不关闭
+ * Pi 会话、不删除 detached worktree，具体请求门禁仍由 ShellServer 负责。
  */
 
 /** 返回统一 Shell 页面。 */
@@ -28,7 +30,9 @@ export function renderShellPage(): string {
     header strong { color: #93c5fd; }
     header small { color: #94a3b8; }
     header button { margin-left: 0; background: #1f2937; color: #e5e7eb; border: 1px solid #475569; border-radius: 4px; padding: 5px 10px; cursor: pointer; }
-    #settings-button { margin-left: auto; }
+    #abort-button { margin-left: auto; }
+    #abort-button { background: #7f1d1d; border-color: #b91c1c; }
+    #abort-button:disabled { cursor: wait; opacity: .58; }
     main { min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-columns: minmax(320px, 42%) 6px minmax(420px, 1fr); }
     section { min-width: 0; min-height: 0; }
     #chat-panel { overflow: hidden; display: grid; grid-template-rows: minmax(0, 1fr) auto auto 52px; background: #111827; }
@@ -96,11 +100,6 @@ export function renderShellPage(): string {
     dialog menu { display: flex; justify-content: flex-end; gap: 8px; padding: 0; }
     dialog button { padding: 7px 12px; border-radius: 4px; border: 1px solid #475569; background: #1f2937; color: #e5e7eb; cursor: pointer; }
     dialog button.primary { background: #2563eb; border-color: #3b82f6; }
-    .settings-grid { display: grid; grid-template-columns: 140px minmax(0, 1fr); gap: 9px 10px; align-items: center; }
-    .settings-grid label { color: #94a3b8; font-size: 12px; }
-    .settings-grid input, .settings-grid select { width: 100%; min-width: 0; padding: 7px 8px; color: #f8fafc; background: #0f172a; border: 1px solid #475569; border-radius: 4px; }
-    .settings-check { display: flex; align-items: center; gap: 7px; }
-    .settings-check input { width: auto; }
     #input-form button:disabled, #input:disabled { cursor: wait; opacity: .58; }
     @media (prefers-reduced-motion: reduce) { .activity-dot { animation: none; } }
     @media (max-width: 900px) { main { grid-template-columns: minmax(250px, 48%) 6px minmax(280px, 1fr); } footer { font-size: 10px; } .status-row { gap: 7px; padding-inline: 7px; } }
@@ -108,7 +107,7 @@ export function renderShellPage(): string {
 </head>
 <body>
   <div id="shell">
-    <header><strong>Dungeon Maintainer</strong><small id="task-label">加载任务…</small><button id="settings-button" type="button">模型配置</button><button id="close-button" type="button">结束会话</button></header>
+    <header><strong>Dungeon Maintainer</strong><small id="task-label">加载任务…</small><button id="abort-button" type="button" hidden>停止本轮</button><button id="close-button" type="button">结束会话</button></header>
     <main id="main-layout">
       <section id="chat-panel" aria-label="Pi CLI 聊天">
         <div id="messages" aria-live="polite"></div>
@@ -123,7 +122,6 @@ export function renderShellPage(): string {
   </div>
   <aside id="workspace-panel" aria-label="工作树与沙箱" hidden><header><strong>工作树与任务沙箱</strong><button id="workspace-rename" type="button">重命名当前任务</button><button id="workspace-refresh" type="button">刷新</button><button id="workspace-close" type="button">关闭</button></header><div id="workspace-content"><div id="workspace-sources"></div><div id="workspace-files"></div></div></aside>
   <dialog id="approval-dialog"><form method="dialog"><h3 id="approval-title"></h3><pre id="approval-message"></pre><menu><button id="approval-cancel" value="cancel">取消</button><button id="approval-ok" class="primary" value="ok">确认</button></menu></form></dialog>
-  <dialog id="settings-dialog"><form id="settings-form"><h3>OpenAI-compatible 模型档案</h3><div class="settings-grid"><label for="profile-existing">已有档案</label><select id="profile-existing"><option value="">新建档案</option></select><label for="profile-id">档案 ID</label><input id="profile-id" required pattern="[a-z0-9][a-z0-9_-]{0,31}"><label for="profile-name">显示名称</label><input id="profile-name" required maxlength="80"><label for="profile-url">接口地址</label><input id="profile-url" required placeholder="https://api.example.com/v1"><label for="profile-model">模型 ID</label><input id="profile-model" required maxlength="160"><label for="profile-context">上下文窗口</label><input id="profile-context" type="number" min="8000" max="2000000" required><label for="profile-output">输出上限</label><input id="profile-output" type="number" min="256" max="64000" required><label>能力</label><span class="settings-check"><input id="profile-reasoning" type="checkbox"><span>支持 Thinking</span></span><label for="profile-key">API Key</label><input id="profile-key" type="password" autocomplete="new-password" placeholder="留空则保留 Windows 凭据"><label>启用</label><span class="settings-check"><input id="profile-activate" type="checkbox" checked><span>保存后用于当前任务</span></span></div><menu><button id="settings-cancel" type="button">取消</button><button class="primary" type="submit">保存并重启单一 Pi</button></menu></form></dialog>
   <script>
     (() => {
       const params = new URLSearchParams(location.search);
@@ -138,6 +136,7 @@ export function renderShellPage(): string {
       const activity = document.getElementById('activity');
       const activityText = document.getElementById('activity-text');
       const activityTime = document.getElementById('activity-time');
+      const abortButton = document.getElementById('abort-button');
       const statusPrimary = document.getElementById('status-primary');
       const statusSecondary = document.getElementById('status-secondary');
       const workspacePanel = document.getElementById('workspace-panel');
@@ -148,12 +147,12 @@ export function renderShellPage(): string {
       const gameState = document.getElementById('game-state');
       const taskLabel = document.getElementById('task-label');
       const approval = document.getElementById('approval-dialog');
-      const settingsDialog = document.getElementById('settings-dialog');
-      const settingsForm = document.getElementById('settings-form');
       let currentApproval = null;
       let assistantNode = null;
       let activityHideTimer = null;
       let currentStatus = null;
+      let requestBusy = false;
+      let abortRequested = false;
       const toolGroups = new Map();
 
       const addMessage = (kind, text) => {
@@ -199,33 +198,6 @@ export function renderShellPage(): string {
         const workspaceControl = document.createElement('span');
         workspaceControl.className = 'status-control';
         workspaceControl.append('工作树: ', workspaceButton);
-
-        const modelSelect = document.createElement('select');
-        modelSelect.id = 'model-select';
-        for (const model of status.availableModels || []) {
-          const option = document.createElement('option');
-          option.value = JSON.stringify([model.provider, model.id]);
-          option.textContent = model.name + (model.reasoning ? ' · reasoning' : '');
-          if (model.provider === status.modelProvider && model.id === status.model) option.selected = true;
-          modelSelect.appendChild(option);
-        }
-        if (!modelSelect.options.length) {
-          const option = document.createElement('option');
-          option.value = JSON.stringify([status.modelProvider, status.model]);
-          option.textContent = status.model;
-          modelSelect.appendChild(option);
-        }
-        modelSelect.disabled = controlBusy(status);
-        modelSelect.addEventListener('change', () => {
-          const [provider, modelId] = JSON.parse(modelSelect.value);
-          modelSelect.disabled = true;
-          void send('/api/pi/model', { provider, modelId })
-            .then((payload) => renderStatus(payload.status))
-            .catch((error) => { showNotice('error', error.message); renderStatus(currentStatus); });
-        });
-        const modelControl = document.createElement('span');
-        modelControl.className = 'status-control';
-        modelControl.append('模型: ', modelSelect);
 
         const thinkingSelect = document.createElement('select');
         thinkingSelect.id = 'thinking-select';
@@ -273,7 +245,7 @@ export function renderShellPage(): string {
           workspaceControl,
           statusItem('任务', status.taskName + ' · ' + status.activeTaskId.slice(0, 8) + ' · ' + status.taskState),
           statusItem('阶段', status.phase + (status.pendingMessageCount ? ' · 待处理 ' + safeNumber(status.pendingMessageCount) : '')),
-          modelControl,
+          statusItem('模型', status.model),
           thinkingControl,
           contextControl
         );
@@ -282,7 +254,7 @@ export function renderShellPage(): string {
           statusItem('本轮缓存', safeNumber(status.cacheReadTokens) + ' · ' + turnCacheRate),
           statusItem('会话 新/缓/出', safeNumber(sessionFreshTokens) + '/' + safeNumber(status.sessionCacheReadTokens) + '/' + safeNumber(status.sessionOutputTokens)),
           statusItem('会话 Token', safeNumber(status.totalTokens) + ' · 缓存 ' + sessionCacheRate),
-          statusItem('工具预算', safeNumber(status.toolCalls) + '/' + safeNumber(status.toolBudget)),
+          statusItem('工具调用', safeNumber(status.toolCalls)),
           statusItem('运行时', status.viteState + '/' + status.browserState + '/' + status.bridgeState),
           statusItem('Diff', safeNumber(status.diffFiles)),
           statusItem('验证', status.verificationState)
@@ -408,65 +380,6 @@ export function renderShellPage(): string {
           .catch((error) => showNotice('error', error.message))
           .finally(() => { button.disabled = false; });
       });
-      let modelProfiles = [];
-      const fillProfileForm = (profile) => {
-        document.getElementById('profile-id').value = profile?.id || '';
-        document.getElementById('profile-name').value = profile?.name || '';
-        document.getElementById('profile-url').value = profile?.baseUrl || '';
-        document.getElementById('profile-model').value = profile?.modelId || '';
-        document.getElementById('profile-context').value = profile?.contextWindow || 64000;
-        document.getElementById('profile-output').value = profile?.maxOutputTokens || 4096;
-        document.getElementById('profile-reasoning').checked = profile?.reasoning === true;
-        document.getElementById('profile-key').value = '';
-        document.getElementById('profile-key').placeholder = profile?.hasCredential ? '已保存在 Windows 凭据管理器；留空保持' : '请输入 API Key';
-        document.getElementById('profile-activate').checked = profile?.active !== false;
-      };
-      const openSettings = async () => {
-        const payload = await readJson('/api/settings/profiles');
-        modelProfiles = payload.profiles || [];
-        const select = document.getElementById('profile-existing');
-        select.replaceChildren(new Option('新建档案', ''));
-        for (const profile of modelProfiles) {
-          const option = new Option(profile.name + (profile.hasCredential ? ' · Key 已配置' : ' · 缺少 Key'), profile.id);
-          option.selected = profile.active === true;
-          select.appendChild(option);
-        }
-        fillProfileForm(modelProfiles.find((profile) => profile.active) || modelProfiles[0]);
-        settingsDialog.showModal();
-      };
-      document.getElementById('profile-existing').addEventListener('change', (event) => {
-        fillProfileForm(modelProfiles.find((profile) => profile.id === event.target.value));
-      });
-      document.getElementById('settings-button').addEventListener('click', () => {
-        void openSettings().catch((error) => showNotice('error', error.message));
-      });
-      document.getElementById('settings-cancel').addEventListener('click', () => settingsDialog.close());
-      settingsForm.addEventListener('submit', (event) => {
-        event.preventDefault();
-        const body = {
-          id: document.getElementById('profile-id').value.trim(),
-          name: document.getElementById('profile-name').value.trim(),
-          baseUrl: document.getElementById('profile-url').value.trim(),
-          modelId: document.getElementById('profile-model').value.trim(),
-          contextWindow: Number(document.getElementById('profile-context').value),
-          maxOutputTokens: Number(document.getElementById('profile-output').value),
-          reasoning: document.getElementById('profile-reasoning').checked,
-          apiKey: document.getElementById('profile-key').value,
-          activate: document.getElementById('profile-activate').checked
-        };
-        void send('/api/settings/profiles', body)
-          .then((payload) => {
-            settingsDialog.close();
-            if (payload.status) renderStatus(payload.status);
-            showNotice(
-              'info',
-              payload.profile?.restarted
-                ? '模型档案已安全保存，单一 Pi 已按新配置重启。'
-                : '模型档案已安全保存；当前活动 Pi 未重启。'
-            );
-          })
-          .catch((error) => showNotice('error', error.message));
-      });
       const showNotice = (level, text) => addMessage('system', '[' + level + '] ' + text);
       const showActivity = (event) => {
         if (activityHideTimer) clearTimeout(activityHideTimer);
@@ -476,8 +389,13 @@ export function renderShellPage(): string {
         activityText.textContent = event.text;
         activityTime.textContent = event.elapsedSeconds > 0 ? String(event.elapsedSeconds) + 's' : '';
         const busy = event.state === 'waiting' || event.state === 'working' || event.state === 'approval';
-        input.disabled = busy;
-        sendButton.disabled = busy;
+        requestBusy = busy;
+        if (!busy) abortRequested = false;
+        input.disabled = false;
+        sendButton.disabled = abortRequested;
+        abortButton.hidden = !busy;
+        abortButton.disabled = !busy || abortRequested;
+        input.placeholder = busy ? '追加文字要求，或点击“停止本轮”…' : '描述问题，或输入 /play、/verify…';
         input.setAttribute('aria-busy', String(busy));
         if (event.state === 'done') {
           activityHideTimer = setTimeout(() => { activity.hidden = true; input.focus(); }, 1_500);
@@ -584,19 +502,40 @@ export function renderShellPage(): string {
         const text = input.value.trim();
         if (!text) return;
         input.value = '';
+        if (requestBusy && abortRequested) {
+          showNotice('warning', '正在停止当前回合，请稍候');
+          return;
+        }
+        const busyAtSubmit = requestBusy;
         // 用户消息以服务端 SSE 回显为唯一事实源，避免本地预显示与回显各追加一次。
-        const path = text.startsWith('/') ? '/api/command' : '/api/input';
+        const path = requestBusy
+          ? '/api/steer'
+          : text.startsWith('/') ? '/api/command' : '/api/input';
         // 本地先锁定输入并显示固定反馈，不等待 POST 往返或模型首个 Token；服务端
         // activity 随后接管权威阶段和 elapsed 更新。
         showActivity({
           state: 'waiting',
-          text: text.startsWith('/') ? '命令已发送，正在等待 Pi 执行…' : '消息已发送，正在等待 Pi 接收…',
+          text: requestBusy ? '追加要求已发送，正在等待 Pi 接收…' : text.startsWith('/') ? '命令已发送，正在等待 Pi 执行…' : '消息已发送，正在等待 Pi 接收…',
           elapsedSeconds: 0
         });
         void send(path, { text }).catch((error) => {
-          const stillBusy = error.status === 409;
+          const stillBusy = busyAtSubmit || error.status === 409;
           showActivity({ state: stillBusy ? 'waiting' : 'error', text: error.message, elapsedSeconds: 0 });
           showNotice(stillBusy ? 'warning' : 'error', error.message);
+        });
+      });
+      abortButton.addEventListener('click', () => {
+        if (!requestBusy || abortRequested) return;
+        abortRequested = true;
+        abortButton.disabled = true;
+        sendButton.disabled = true;
+        showActivity({ state: 'working', text: '正在停止当前回合…', elapsedSeconds: 0 });
+        void send('/api/abort', {}).catch((error) => {
+          abortRequested = false;
+          abortButton.disabled = false;
+          sendButton.disabled = false;
+          showNotice('error', error.message);
+          showActivity({ state: 'working', text: '停止请求失败，当前回合仍在运行…', elapsedSeconds: 0 });
         });
       });
       document.getElementById('close-button').addEventListener('click', () => { void send('/api/close', {}).finally(() => window.close()); });

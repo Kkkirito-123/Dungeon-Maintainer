@@ -16,10 +16,10 @@
     "build": "pnpm clean && tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint \"src/**/*.ts\" \"tests/**/*.ts\"",
-    "test": "pnpm build && node --test \"dist/tests/*.test.js\"",
-    "test:smoke": "pnpm build && node --test dist/tests/evidence-smoke.test.js dist/tests/loop-guard.test.js",
+    "test": "pnpm build && node --test \"dist/tests/*.test.js\" \"dist/tests/**/*.test.js\"",
+    "test:smoke": "pnpm build && node --test dist/tests/evidence-smoke.test.js",
     "check": "pnpm lint && pnpm typecheck && pnpm test",
-    "benchmark": "pnpm build && node dist/src/benchmark/main.js"
+    "eval": "pnpm build && node dist/src/eval/main.js"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.84.2",

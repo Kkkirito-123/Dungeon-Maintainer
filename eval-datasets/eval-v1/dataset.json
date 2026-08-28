@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "eval-v1",
+  "scenarioIds": [
+    "terminal-action-bug",
+    "accepted-query-without-progress",
+    "final-stage-boss-stuck-at-one-hp",
+    "admin-floor-transition-deadlock",
+    "transition-lost-after-reload",
+    "stale-query-plan-evidence",
+    "duplicate-final-victory-commit"
+  ]
+}

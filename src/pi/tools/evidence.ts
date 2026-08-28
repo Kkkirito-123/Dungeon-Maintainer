@@ -1,10 +1,9 @@
 /**
  * Pi `evidence` 固定证据回读工具。
  *
- * 本工具只查询当前任务 EvidenceStore 的低敏投影，不执行源码搜索、检查或写入，也不
- * 把回读旧事实作为无进展动作交给现有 LoopGuard。`list` 用于按状态和类型定位证据
- * ID；`get` 返回单节点关系和经目录白名单、realpath、二次脱敏及 4 KiB 限制处理后的
- * 工件尾部，不能读取其它任务数据。
+ * 本工具只查询当前任务 EvidenceStore 的低敏投影，不执行源码搜索、检查或写入。
+ * `list` 用于按状态和类型定位证据 ID；`get` 返回单节点关系和经目录白名单、realpath、
+ * 二次脱敏及 4 KiB 限制处理后的工件尾部，不能读取其它任务数据。
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -88,7 +87,7 @@ export function registerEvidenceTool(
     description: "列出当前任务证据，或按 evidence ID 回读关系和安全工件尾部。",
     promptSnippet: "用 evidence 复用当前任务已经取得的证据",
     promptGuidelines: [
-      "先用 evidence(list) 定位最近 active 证据；只有确实需要正文时才 evidence(get)。",
+      "当前上下文已有 evidence ID 时直接 evidence(get)；只有不知道 ID 或需要按类型筛选时才 list。",
       "evidence 只回读现有事实，不代替 inspect、check、复现或 finish(result) 验证。",
       "inspect 返回 ALREADY_SEEN evidence ID 时优先 get，不要重复执行相同搜索或读取。",
       "不要遍历证据节点；列表摘要足以确认根因时直接调用 finish。",

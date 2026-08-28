@@ -16,6 +16,16 @@ function digest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
+function safeInspectQuery(value: string | undefined): string | null {
+  const normalized = value?.replace(/\s+/gu, " ").trim();
+  if (!normalized) return null;
+  // 源码查询通常是符号或症状；若模型误把完整 SQL 当 query，不把 SQL 复制进账本。
+  if (/\b(?:SELECT|WITH|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\s+[\w*(]/iu.test(normalized)) {
+    return "[sensitive-query]";
+  }
+  return normalized.slice(0, 160);
+}
+
 export function inspectActionKey(
   input: InspectInput,
   resolvedScope: readonly string[] = [],
@@ -31,9 +41,6 @@ export function inspectActionKey(
     query: input.query?.replace(/\s+/gu, " ").trim().toLocaleLowerCase("en-US") ?? null,
     startLine: input.action === "read" ? input.startLine ?? 1 : input.startLine ?? null,
     lineCount: input.action === "read" ? input.lineCount ?? 80 : input.lineCount ?? null,
-    partitionId: input.partitionId?.trim().toLocaleLowerCase("en-US") ?? null,
-    featureId: input.featureId?.trim().toLocaleLowerCase("en-US") ?? null,
-    floorId: input.floorId?.trim().toLocaleLowerCase("en-US") ?? null,
     ranges: input.ranges?.map((range) => ({
       path: normalizedPath(range.path),
       startLine: range.startLine ?? 1,
@@ -59,7 +66,9 @@ export function sourceEvidence(
 ): EvidenceCandidate {
   const path = input.path?.replaceAll("\\", "/") ?? null;
   const validityKey = input.action === "read"
-    ? details.baseHash ?? "missing"
+    // 文件内容相同不代表同一位置。路径必须同时进入有效版本和结果身份，否则
+    // 第二个同内容文件会被第一个文件的 evidence ID 吞并，覆盖图永远无法闭合。
+    ? [path ?? "missing-path", details.baseHash ?? "missing"].join("\0")
     : worktreeHash ?? "unknown-worktree";
   const location = path
     ? path + (input.action === "read" ? ":" + String(input.startLine ?? 1) : "")
@@ -67,9 +76,16 @@ export function sourceEvidence(
   return {
     kind: "source",
     actionKey: inspectActionKey(input, resolvedScope),
-    fingerprint: details.contentHash,
+    fingerprint: input.action === "read"
+      ? digest({ path, contentHash: details.contentHash })
+      : details.contentHash,
     status: "active",
-    summary: "inspect " + input.action + " 已取得当前版本证据：" + location,
+    summary: [
+      "inspect " + input.action + " 已取得当前版本证据：" + location,
+      typeof details.matchCount === "number" ? "matches=" + String(details.matchCount) : null,
+      typeof details.bundleWindows === "number"
+        ? "windows=" + String(details.bundleWindows) : null,
+    ].filter((value): value is string => value !== null).join("；"),
     artifactRef: null,
     path,
     startLine: input.action === "read" ? input.startLine ?? 1 : null,
@@ -82,19 +98,16 @@ export function sourceEvidence(
     links: [],
     metadata: {
       action: input.action,
+      // query 只用于状态栏展示已经调查过的范围，不复制完整 SQL。
+      query: safeInspectQuery(input.query),
       lines: details.lines,
       truncated: details.truncated,
       scope: resolvedScope.join("\n") || null,
       matchCount: details.matchCount ?? null,
       complete: details.complete ?? null,
-      expanded: details.expanded ?? null,
-      expansionLevel: details.expansionLevel ?? null,
       bundleWindows: details.bundleWindows ?? null,
       candidateFiles: details.candidateFiles ?? null,
       selectedFiles: details.selectedFiles ?? null,
-      featureRouteLevel: details.featureRouteLevel ?? null,
-      floorRouteLevel: details.floorRouteLevel ?? null,
-      floorScopeCount: details.floorScopeCount ?? null,
       requestedLineCount: input.action === "read" ? input.lineCount ?? null : null,
       eof: input.action === "read"
         && !details.truncated

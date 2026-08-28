@@ -11,6 +11,7 @@
  */
 
 import { appendEvent } from "../logging/events.js";
+import { selectChangeUpstreamIds } from "../evidence/links.js";
 import { changeEvidence } from "../evidence/projector.js";
 import type { EvidenceStore } from "../evidence/store.js";
 import type { TaskStore } from "../task/store.js";
@@ -64,11 +65,11 @@ export async function syncWorktreeChanges(
   task.reversePatchPath = null;
 
   if (evidence) {
+    // 在失效旧源码窗口之前固定诊断父节点；否则 direct write 会把自己的唯一上游先
+    // 标成 stale，再生成一个没有 source/reproduction 父节点的孤儿 change。
+    const links = selectChangeUpstreamIds(await evidence.active(), paths);
     await evidence.invalidatePaths(paths, worktreeHash);
-    const proposed = (await evidence.active("claim"))
-      .filter((record) => record.metadata.finishStatus === "proposed")
-      .at(-1);
-    await evidence.capture(changeEvidence(paths, worktreeHash, proposed ? [proposed.id] : []));
+    await evidence.capture(changeEvidence(paths, worktreeHash, links));
   }
 
   if (

@@ -12,7 +12,7 @@
 import { access, mkdir, open, readdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { MaintainerConfig } from "../config.js";
+import { requireApiKey, type MaintainerConfig } from "../config.js";
 import type { AgentRpcCommand } from "../agent/rpc.js";
 import { PiRpcProcess } from "../pi/rpc-process.js";
 import { FULL_CODING_TOOLS } from "../pi/tool-policy.js";
@@ -32,14 +32,6 @@ import {
 import { resolveRepositoryWorktree } from "../workspace/catalog.js";
 import { inspectDungeonRepository, verifyRuntimeDependencies } from "./repository.js";
 import { assertTaskLocalPaths, cleanupFinishedWorktree } from "./task-lifecycle.js";
-import {
-  defaultModelProfile,
-  ModelProfileStore,
-  profileKeyEnvironmentName,
-  profileProviderId,
-  type ModelProfile,
-} from "../settings/profiles.js";
-import { readProfileCredential, writeProfileCredential } from "../settings/credential.js";
 
 function extensionPath(): string {
   return fileURLToPath(new URL("../pi/extension.js", import.meta.url));
@@ -64,7 +56,7 @@ export function resolvePiCliPath(): string {
  * 构造唯一允许的 Pi CLI 参数。
  *
  * @param task 当前 schema v4 任务。
- * @param config 默认 Provider 和模型配置；活动档案由 task.modelProfileId 选择。
+ * @param config `.env` 解析出的唯一 Provider 和模型配置。
  * @param loadedExtensionPath 编译后的维护器 Extension 路径；测试可显式注入。
  * @returns 不含 API Key 的参数数组。
  */
@@ -72,11 +64,7 @@ export function buildPiArguments(
   task: TaskRecord,
   config: MaintainerConfig,
   loadedExtensionPath = extensionPath(),
-  profiles: readonly ModelProfile[] = [defaultModelProfile(config)],
 ): string[] {
-  const profile = profiles.find((entry) => entry.id === task.modelProfileId)
-    ?? profiles.find((entry) => entry.id === "default")
-    ?? defaultModelProfile(config);
   return [
     "--mode",
     "rpc",
@@ -93,9 +81,9 @@ export function buildPiArguments(
     "-e",
     loadedExtensionPath,
     "--provider",
-    profileProviderId(profile.id),
+    "dungeon-maintainer",
     "--model",
-    profile.modelId,
+    config.model,
     // Thinking 以任务记录为唯一事实源。新任务默认 off；用户在 Shell 显式切换后，
     // resume 会恢复该选择，不继承 Pi 的全局或模型级隐式默认值。
     "--thinking",
@@ -130,9 +118,6 @@ export async function runPiProcess(
  */
 export class AppController {
   private readonly store: TaskStore;
-  private readonly profileStore: ModelProfileStore;
-  private profiles: ModelProfile[] = [];
-  private readonly profileKeys = new Map<string, string>();
   private activeTask: TaskRecord;
   private rpc: PiRpcProcess | null = null;
   private shell: ShellHandle | null = null;
@@ -155,32 +140,22 @@ export class AppController {
   ) {
     this.activeTask = initialTask;
     this.store = new TaskStore(config.dataDir);
-    this.profileStore = new ModelProfileStore(
-      config.dataDir,
-      defaultModelProfile(config),
-    );
     this.visitedTaskIds.add(initialTask.id);
   }
 
   /** 启动固定 Shell 与首个 Pi，并等待用户关闭或当前 Pi 自然退出。 */
   async run(): Promise<number> {
-    await this.reloadProfiles();
-    const activeProfile = this.profileForTask(this.activeTask);
     this.shell = await startShellServer({
       task: this.activeTask,
-      model: activeProfile.modelId,
-      contextWindow: activeProfile.contextWindow,
-      maxOutputTokens: activeProfile.maxOutputTokens,
+      model: this.config.model,
+      contextWindow: this.config.contextWindow,
+      maxOutputTokens: this.config.maxOutputTokens,
       store: this.store,
       readEvidenceSnapshot: async () => (
         await buildEvidenceSnapshot(new EvidenceStore(this.config.dataDir, this.activeTask))
       ),
       sendPiCommand: async (command: AgentRpcCommand) => await this.send(command),
       onSwitchTask: async (request) => await this.switchTask(request),
-      listModelProfiles: () => Promise.resolve(this.modelProfileSummaries()),
-      saveModelProfile: async (profile, apiKey, activate) => (
-        await this.saveModelProfile(profile, apiKey, activate)
-      ),
       onClose: async () => await this.close(0),
     });
     try {
@@ -204,127 +179,23 @@ export class AppController {
     }
   }
 
-  private profileForTask(task: TaskRecord): ModelProfile {
-    return this.profiles.find((profile) => profile.id === task.modelProfileId)
-      ?? this.profiles.find((profile) => profile.id === "default")
-      ?? defaultModelProfile(this.config);
-  }
-
-  private registeredProfiles(): ModelProfile[] {
-    return this.profiles.filter((profile) => this.profileKeys.has(profile.id));
-  }
-
-  private async reloadProfiles(): Promise<void> {
-    this.profiles = await this.profileStore.list();
-    this.profileKeys.clear();
-    for (const profile of this.profiles) {
-      const environment = profile.id === "default" && this.config.apiKey
-        ? { ...process.env, MAINTAINER_API_KEY: this.config.apiKey }
-        : process.env;
-      const key = await readProfileCredential(profile.id, environment);
-      if (key) this.profileKeys.set(profile.id, key);
-    }
-  }
-
-  private modelProfileSummaries(): Array<ModelProfile & {
-    hasCredential: boolean;
-    active: boolean;
-  }> {
-    return this.profiles.map((profile) => ({
-      ...profile,
-      hasCredential: this.profileKeys.has(profile.id),
-      active: profile.id === this.activeTask.modelProfileId,
-    }));
-  }
-
-  private async saveModelProfile(
-    value: unknown,
-    apiKey: string | null,
-    activate: boolean,
-  ): Promise<ModelProfile & {
-    hasCredential: boolean;
-    active: boolean;
-    restarted: boolean;
-  }> {
-    const previousProfile = this.profileForTask(this.activeTask);
-    const previousProfileId = this.activeTask.modelProfileId;
-    const hadActivePi = this.rpc !== null;
-    const profile = await this.profileStore.save(value);
-    if (apiKey) await writeProfileCredential(profile.id, apiKey);
-    await this.reloadProfiles();
-    if (activate && !this.profileKeys.has(profile.id)) {
-      throw new Error("模型档案缺少 API Key，旧 Pi 保持运行");
-    }
-    const activeProfileChanged = profile.id === previousProfileId;
-    const needsRestart = activate || activeProfileChanged;
-    if (!needsRestart) {
-      return {
-        ...profile,
-        hasCredential: this.profileKeys.has(profile.id),
-        active: false,
-        restarted: false,
-      };
-    }
-    if (activate) {
-      this.activeTask.modelProfileId = profile.id;
-      await this.store.save(this.activeTask);
-    }
-    this.switching = true;
-    try {
-      await this.stopActivePi();
-      await this.startActivePi();
-    } catch (error) {
-      if (hadActivePi) {
-        this.activeTask.modelProfileId = previousProfileId;
-        await this.store.save(this.activeTask);
-        if (activeProfileChanged) await this.profileStore.save(previousProfile);
-        await this.reloadProfiles();
-        try {
-          if (!this.rpc) await this.startActivePi();
-        } catch (recoveryError) {
-          throw new Error(
-            "新模型启动失败，原 Pi 恢复也失败："
-            + (recoveryError instanceof Error ? recoveryError.message : "未知错误"),
-            { cause: error },
-          );
-        }
-      }
-      throw error;
-    } finally {
-      this.switching = false;
-    }
-    return {
-      ...profile,
-      hasCredential: this.profileKeys.has(profile.id),
-      active: profile.id === this.activeTask.modelProfileId,
-      restarted: true,
-    };
-  }
-
   private environment(task: TaskRecord): NodeJS.ProcessEnv {
     if (!this.shell) throw new Error("统一 Shell 尚未启动");
-    const profile = this.profileForTask(task);
-    const apiKey = this.profileKeys.get(profile.id);
-    if (!apiKey) throw new Error("活动模型档案缺少 API Key");
-    const profiles = this.registeredProfiles();
+    const apiKey = requireApiKey(this.config);
     const environment: NodeJS.ProcessEnv = {
       ...process.env,
       MAINTAINER_API_KEY: apiKey,
-      MAINTAINER_BASE_URL: profile.baseUrl,
-      MAINTAINER_MODEL: profile.modelId,
-      MAINTAINER_CONTEXT_WINDOW: String(profile.contextWindow),
-      MAINTAINER_MAX_TOKENS: String(profile.maxOutputTokens),
-      MAINTAINER_REASONING: String(profile.reasoning),
-      DUNGEON_MAINTAINER_MODEL_PROFILES: JSON.stringify(profiles),
+      MAINTAINER_BASE_URL: this.config.baseUrl,
+      MAINTAINER_MODEL: this.config.model,
+      MAINTAINER_CONTEXT_WINDOW: String(this.config.contextWindow),
+      MAINTAINER_MAX_TOKENS: String(this.config.maxOutputTokens),
+      MAINTAINER_REASONING: String(this.config.reasoning),
       DUNGEON_MAINTAINER_TASK_ID: task.id,
       DUNGEON_MAINTAINER_DATA_DIR: this.config.dataDir,
       DUNGEON_MAINTAINER_WORKTREE: task.worktreeRoot,
       DUNGEON_MAINTAINER_SHELL_URL: this.shell.url,
       DUNGEON_MAINTAINER_ENTRY: fileURLToPath(new URL("../main.js", import.meta.url)),
     };
-    for (const registered of profiles) {
-      environment[profileKeyEnvironmentName(registered.id)] = this.profileKeys.get(registered.id);
-    }
     return environment;
   }
 
@@ -386,12 +257,7 @@ export class AppController {
     const generation = ++this.generation;
     const rpc = new PiRpcProcess(
       resolvePiCliPath(),
-      buildPiArguments(
-        this.activeTask,
-        this.config,
-        extensionPath(),
-        this.registeredProfiles(),
-      ),
+      buildPiArguments(this.activeTask, this.config, extensionPath()),
       this.environment(this.activeTask),
       (event) => this.handlePiEvent(rpc, generation, event),
     );

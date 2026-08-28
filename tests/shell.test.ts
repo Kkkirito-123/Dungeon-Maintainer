@@ -97,17 +97,20 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
         assert.match(page, /else if \(data\.type === 'chat\.tool'\) showTool\(data\)/u);
         assert.match(page, /id="activity" role="status" aria-live="polite"/u);
         assert.match(page, /else if \(data\.type === 'activity'\) showActivity\(data\)/u);
-        assert.match(page, /input\.disabled = busy/u);
+        assert.match(page, /input\.disabled = false/u);
+        assert.match(page, /id="abort-button"/u);
+        assert.match(page, /\/api\/steer/u);
+        assert.match(page, /\/api\/abort/u);
         assert.match(page, /消息已发送，正在等待 Pi 接收/u);
         assert.match(page, /statusItem\('本轮 Token'/u);
         assert.match(page, /statusItem\('本轮缓存'/u);
         assert.match(page, /statusItem\('会话 新\/缓\/出'/u);
         assert.match(page, /statusItem\('会话 Token'/u);
-        assert.match(page, /send\('\/api\/pi\/model'/u);
+        assert.match(page, /statusItem\('工具调用'/u);
+        assert.doesNotMatch(page, /send\('\/api\/pi\/model'|model-select/u);
         assert.match(page, /send\('\/api\/pi\/thinking'/u);
         assert.match(page, /send\('\/api\/pi\/compact'/u);
-        assert.match(page, /单一 Pi 已按新配置重启/u);
-        assert.match(page, /当前活动 Pi 未重启/u);
+        assert.doesNotMatch(page, /模型档案|settings-dialog|profile-/u);
         assert.match(page, /request\.kind === 'editor'/u);
         assert.match(page, /value: currentApproval\.message/u);
         assert.match(page, /Shell 事件渲染失败/u);
@@ -230,6 +233,7 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
             sessionCacheWriteTokens: number;
             totalTokens: number;
             contextUsed: number;
+            toolCalls: number;
           };
         };
         assert.equal(state.status.taskState, "created");
@@ -244,6 +248,7 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
         assert.equal(state.status.sessionCacheWriteTokens, 222);
         assert.equal(state.status.totalTokens, 123_456);
         assert.equal(state.status.contextUsed, 40_012);
+        assert.equal(state.status.toolCalls, 1);
 
         const badState = await fetch(
           shell.url.replace("/?", "/api/state?").replace("token=", "token=bad-"),
@@ -259,6 +264,13 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
         const promptCommand = commands.find((command) => command.type === "prompt");
         assert.ok(promptCommand);
         assert.equal(promptCommand.message, "定位问题");
+        const resetStateResponse = await fetch(shell.url.replace("/?", "/api/state?"));
+        const resetState = await resetStateResponse.json() as {
+          status: {
+            toolCalls: number;
+          };
+        };
+        assert.equal(resetState.status.toolCalls, 0);
 
         const busyInputResponse = await fetch(shell.url.replace("/?", "/api/input?"), {
           method: "POST",
@@ -290,12 +302,57 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
           body: JSON.stringify({ text: "/play" }),
         });
         assert.equal(playResponse.status, 200);
-        const afterCommandResponse = await fetch(shell.url.replace("/?", "/api/input?"), {
+        const afterCommandState = await (
+          await fetch(shell.url.replace("/?", "/api/state?"))
+        ).json() as {
+          status: {
+            toolCalls: number;
+          };
+        };
+        assert.equal(afterCommandState.status.toolCalls, 0);
+        const steeringResponse = await fetch(shell.url.replace("/?", "/api/steer?"), {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ text: "命令返回后可以继续" }),
+          body: JSON.stringify({ text: "命令执行中请停止低价值搜索" }),
         });
-        assert.equal(afterCommandResponse.status, 200);
+        assert.equal(steeringResponse.status, 409);
+        const naturalInputResponse = await fetch(shell.url.replace("/?", "/api/input?"), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text: "开始一轮可被追加的调查" }),
+        });
+        assert.equal(naturalInputResponse.status, 200);
+        const steeringDuringInputResponse = await fetch(shell.url.replace("/?", "/api/steer?"), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text: "请停止低价值搜索" }),
+        });
+        assert.equal(steeringDuringInputResponse.status, 200);
+        assert.ok(commands.some((command) => (
+          command.type === "prompt"
+          && command.streamingBehavior === "steer"
+          && command.message === "请停止低价值搜索"
+        )));
+        const busyAfterSteerResponse = await fetch(shell.url.replace("/?", "/api/input?"), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text: "当前回合仍未收尾" }),
+        });
+        assert.equal(busyAfterSteerResponse.status, 409);
+        const abortResponse = await fetch(shell.url.replace("/?", "/api/abort?"), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{}",
+        });
+        assert.equal(abortResponse.status, 200);
+        assert.ok(commands.some((command) => command.type === "abort"));
+        shell.handlePiEvent({ type: "agent_settled" });
+        const afterAbortResponse = await fetch(shell.url.replace("/?", "/api/input?"), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text: "停止后可以追加" }),
+        });
+        assert.equal(afterAbortResponse.status, 200);
         shell.handlePiEvent({ type: "agent_settled" });
 
         const runtimeUrl = new URL("/api/runtime", shell.url);
@@ -320,7 +377,7 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
     }
   });
 
-  it("模型、Thinking、压缩和上下文统计使用真实 Pi RPC", async () => {
+  it("固定模型、Thinking、压缩和上下文统计使用真实 Pi RPC", async () => {
     const repository = await createTemporaryGitRepository({ "README.md": "test\n" });
     try {
       const config = loadConfig({
@@ -339,7 +396,6 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
         piSessionDir: join(store.taskDir("shell-pi-controls"), "pi"),
       });
       const commands: Array<Record<string, unknown>> = [];
-      let currentModel = "model-a";
       let thinkingLevel = "off";
       let compacted = false;
       const shell = await startShellServer({
@@ -349,14 +405,6 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
         store,
         sendPiCommand: async (command) => {
           commands.push(command);
-          if (command.type === "set_model") {
-            currentModel = String(command.modelId);
-            return {
-              provider: "dungeon-maintainer",
-              id: currentModel,
-              name: currentModel,
-            };
-          }
           if (command.type === "set_thinking_level") {
             thinkingLevel = String(command.level);
             return undefined;
@@ -369,23 +417,13 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
             return {
               model: {
                 provider: "dungeon-maintainer",
-                id: currentModel,
-                name: currentModel,
+                id: "model-a",
+                name: "model-a",
                 reasoning: true,
               },
               thinkingLevel,
               autoCompactionEnabled: true,
               pendingMessageCount: 0,
-            };
-          }
-          if (command.type === "get_available_models") {
-            return {
-              models: ["model-a", "model-b"].map((id) => ({
-                provider: "dungeon-maintainer",
-                id,
-                name: id,
-                reasoning: true,
-              })),
             };
           }
           if (command.type === "get_available_thinking_levels") {
@@ -427,17 +465,6 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
         assert.equal(initialBody.status.contextUsed, 32_000);
         assert.equal(initialBody.status.contextPercent, 50);
 
-        const modelResponse = await fetch(shell.url.replace("/?", "/api/pi/model?"), {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            provider: "dungeon-maintainer",
-            modelId: "model-b",
-          }),
-        });
-        assert.equal(modelResponse.status, 200);
-        assert.equal((await modelResponse.json() as { status: { model: string } }).status.model, "model-b");
-
         const thinkingResponse = await fetch(shell.url.replace("/?", "/api/pi/thinking?"), {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -460,7 +487,7 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
         };
         assert.equal(compactBody.status.contextUsed, null);
         assert.equal(compactBody.status.contextPercent, null);
-        assert.ok(commands.some((command) => command.type === "set_model"));
+        assert.ok(!commands.some((command) => command.type === "set_model"));
         assert.ok(commands.some((command) => command.type === "set_thinking_level"));
         assert.ok(commands.some((command) => command.type === "compact"));
         const persisted = await store.read(task.id);
@@ -550,7 +577,7 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
     }
   });
 
-  it("工作树目录、沙箱标记、任务切换和模型档案 API 使用真实本地事实", async () => {
+  it("工作树目录、沙箱标记和任务切换使用真实本地事实", async () => {
     const repository = await createTemporaryGitRepository({
       ".maintainer/project.json": JSON.stringify({
         schemaVersion: 1,
@@ -613,8 +640,6 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
         piSessionDir: join(store.taskDir("shell-catalog-recoverable"), "pi"),
       });
       let switchRequest: unknown = null;
-      let savedProfile: unknown = null;
-      let savedApiKey: string | null = null;
       const shell = await startShellServer({
         task,
         model: "model-a",
@@ -632,27 +657,6 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
         onSwitchTask: async (request) => {
           switchRequest = request;
           return recoverable;
-        },
-        listModelProfiles: () => Promise.resolve([{
-          id: "default",
-          name: "model-a",
-          baseUrl: "https://api.example/v1",
-          modelId: "model-a",
-          contextWindow: 64_000,
-          maxOutputTokens: 4_096,
-          reasoning: true,
-          hasCredential: true,
-          active: true,
-        }]),
-        saveModelProfile: (profile, apiKey, activate) => {
-          savedProfile = { profile, activate };
-          savedApiKey = apiKey;
-          return Promise.resolve({
-            ...(profile as Record<string, unknown>),
-            hasCredential: !!apiKey,
-            active: activate,
-            restarted: false,
-          });
         },
         onClose: async () => undefined,
       });
@@ -711,48 +715,6 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
           validation: "failed",
         });
         assert.equal(tree.files.find((entry) => entry.path === ".env")?.denied, true);
-
-        const profilesResponse = await fetch(shell.url.replace("/?", "/api/settings/profiles?"));
-        assert.equal(profilesResponse.status, 200);
-        const profilesText = await profilesResponse.text();
-        assert.match(profilesText, /model-a/u);
-
-        const profileKey = "benchmark-profile-secret";
-        const saveResponse = await fetch(shell.url.replace("/?", "/api/settings/profiles?"), {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            id: "local",
-            name: "Local Model",
-            baseUrl: "https://local.example/v1",
-            modelId: "local-model",
-            contextWindow: 32_000,
-            maxOutputTokens: 2_048,
-            reasoning: false,
-            apiKey: profileKey,
-            activate: false,
-          }),
-        });
-        assert.equal(saveResponse.status, 200);
-        const saveText = await saveResponse.text();
-        const saveBody = JSON.parse(saveText) as {
-          profile: { restarted: boolean };
-        };
-        assert.doesNotMatch(saveText, new RegExp(profileKey, "u"));
-        assert.equal(saveBody.profile.restarted, false);
-        assert.equal(savedApiKey, profileKey);
-        assert.deepEqual(savedProfile, {
-          profile: {
-            id: "local",
-            name: "Local Model",
-            baseUrl: "https://local.example/v1",
-            modelId: "local-model",
-            contextWindow: 32_000,
-            maxOutputTokens: 2_048,
-            reasoning: false,
-          },
-          activate: false,
-        });
 
         const switchResponse = await fetch(shell.url.replace("/?", "/api/tasks/switch?"), {
           method: "POST",
@@ -866,7 +828,7 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
     }
   });
 
-  it("editor 只读查看器回传 value，命令完成后立即解锁", async () => {
+  it("editor 只读查看器回传 value，命令返回后解锁", async () => {
     const repository = await createTemporaryGitRepository({ "README.md": "test\n" });
     try {
       const config = loadConfig({

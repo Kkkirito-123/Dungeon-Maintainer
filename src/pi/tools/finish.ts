@@ -173,88 +173,6 @@ function assertExpectedBoolean(
   }
 }
 
-function metadataText(
-  metadata: Record<string, string | number | boolean | null>,
-  key: string,
-): string | null {
-  const value = metadata[key];
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-/**
- * 把已通过固定验证的结果保存为同项目后续任务可搜索的低敏方案。
- *
- * Solution 索引是诊断加速层，不是 ready_to_apply 的权威门禁；索引写入失败只记录
- * 低敏事件，不能推翻已经通过的代码验证或重新开放写权限。
- */
-async function saveVerifiedSolution(
-  context: FinishToolContext,
-  summary: string,
-  verification: VerificationResult,
-  terminalClaimId: string,
-): Promise<string | null> {
-  try {
-    const active = await context.evidence.active();
-    const proposal = active.filter((record) => (
-      record.kind === "claim" && record.metadata.finishStatus === "proposed"
-    )).at(-1) ?? null;
-    const reproduction = active.filter((record) => record.kind === "reproduction").at(-1) ?? null;
-    const planTitle = proposal ? metadataText(proposal.metadata, "planTitle") : null;
-    const planSteps = proposal ? metadataText(proposal.metadata, "planSteps") : null;
-    const planVerification = proposal ? metadataText(proposal.metadata, "verification") : null;
-    const relatedPaths = [...new Set(verification.changedPaths)].sort();
-    const evidenceRefs = [...new Set([
-      terminalClaimId,
-      ...(proposal ? [proposal.id] : []),
-      ...active.filter((record) => (
-        record.kind === "reproduction"
-        || (
-          (record.kind === "change"
-            || record.kind === "check"
-            || record.kind === "verification")
-          && record.worktreeHash === verification.record.worktreeHash
-        )
-      )).map((record) => record.id),
-    ])].slice(0, 32);
-    const id = createHash("sha256").update([
-      context.evidence.projectKey,
-      verification.record.worktreeHash,
-      ...relatedPaths,
-    ].join("\0")).digest("hex").slice(0, 16);
-    await context.evidence.saveSolution({
-      id,
-      taskId: context.task.id,
-      title: planTitle ?? summary,
-      symptom: reproduction?.summary ?? context.task.objective,
-      rootCause: proposal?.summary ?? summary,
-      planTitle: planTitle ?? summary,
-      steps: planSteps?.split("\n").filter(Boolean) ?? [summary],
-      verification: planVerification ?? [
-        "固定检查：" + verification.record.checkIds.join(", "),
-        "重放：" + (verification.record.replayPassed ? "通过" : "未通过"),
-      ].join("；"),
-      relatedPaths,
-      evidenceRefs,
-      buggyHashes: { ...context.task.baseHashes },
-      fixedHashes: { worktree: verification.record.worktreeHash },
-      createdAt: verification.record.verifiedAt,
-    });
-    await appendEvent(context.store, context.task.id, "evidence.solution_saved", {
-      outcome: "saved",
-      solutionId: id,
-      pathCount: relatedPaths.length,
-      evidenceCount: evidenceRefs.length,
-    }).catch(() => undefined);
-    return id;
-  } catch {
-    await appendEvent(context.store, context.task.id, "evidence.solution_saved", {
-      outcome: "failed",
-      reasonCode: "solution-index-write-failed",
-    }).catch(() => undefined);
-    return null;
-  }
-}
-
 /**
  * proposed 阶段的证据软提示。
  *
@@ -388,7 +306,6 @@ export function registerFinishTool(
       let planVerification: string | undefined;
       let planAllowedPaths: string[] | undefined;
       let evidenceWarnings: string[] = [];
-      let savedSolutionId: string | null = null;
       if (input.status === "proposed" && input.plan) {
         const title = plain(input.plan.title, 160);
         const steps = input.plan.steps.map((step) => plain(
@@ -498,29 +415,18 @@ export function registerFinishTool(
         await context.store.closeWriteScope(context.task);
       }
 
-      let terminalClaimId: string | null = null;
       if (input.status === "result" || input.status === "blocked" || input.status === "diagnosed") {
         const terminalLinks = input.status === "result"
           ? (await context.evidence.active("verification")).map((record) => record.id)
           : (await context.evidence.active())
             .filter((record) => record.kind !== "claim")
             .map((record) => record.id);
-        const terminalClaim = await context.evidence.capture(claimEvidence({
+        await context.evidence.capture(claimEvidence({
           status: input.status,
           summary,
           risk,
           links: terminalLinks,
         }));
-        terminalClaimId = terminalClaim.record.id;
-      }
-
-      if (input.status === "result" && verification && terminalClaimId) {
-        savedSolutionId = await saveVerifiedSolution(
-          context,
-          summary,
-          verification,
-          terminalClaimId,
-        );
       }
 
       if (input.status === "blocked" && context.task.state !== "blocked") {
@@ -532,7 +438,6 @@ export function registerFinishTool(
         status: input.status,
         reproductionId,
         verificationPassed: verification !== null,
-        solutionSaved: savedSolutionId !== null,
       });
       const visibleConclusion = [
         summary,

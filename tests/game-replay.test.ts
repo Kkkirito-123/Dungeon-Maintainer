@@ -3,7 +3,11 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { GameBrowser, GameBrowserError } from "../src/game/browser.js";
+import {
+  GameBrowser,
+  GameBrowserError,
+  isOptionalPresenceError,
+} from "../src/game/browser.js";
 import { GameDriver } from "../src/game/driver.js";
 import type {
   PlayJudge,
@@ -23,6 +27,16 @@ import {
   requiredChecks,
 } from "../src/workspace/check.js";
 import { createTaskRecordFixture } from "./testSupport.js";
+
+describe("试玩页可选服务错误分类", () => {
+  it("只忽略同源 /api/presence，不吞掉其它控制台错误", () => {
+    const gameUrl = "http://127.0.0.1:4173";
+    assert.equal(isOptionalPresenceError(gameUrl, gameUrl + "/api/presence"), true);
+    assert.equal(isOptionalPresenceError(gameUrl, gameUrl + "/api/game"), false);
+    assert.equal(isOptionalPresenceError(gameUrl, "http://127.0.0.1:4174/api/presence"), false);
+    assert.equal(isOptionalPresenceError(gameUrl, "not-a-url"), false);
+  });
+});
 
 function playView(overrides: Partial<PlayView> = {}): PlayView {
   return {
@@ -831,7 +845,6 @@ describe("固定检查白名单", () => {
       "game-related-test",
     ]);
     assert.deepEqual(requiredChecks(["game/tests/session.test.ts"]), ["game-related-test"]);
-    assert.deepEqual(requiredChecks([".maintainer/architecture-map.json"]), ["game-architecture"]);
     assert.deepEqual(requiredChecks(["README.md"]), []);
     assert.deepEqual(requiredApplyChecks(["game/src/domain/session.ts"]), [
       "game-test",

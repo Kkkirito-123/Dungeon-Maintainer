@@ -2,9 +2,7 @@ import assert from "node:assert/strict";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { buildEvidenceCard } from "../src/evidence/card.js";
 import { EvidenceStore } from "../src/evidence/store.js";
-import type { EvidenceKind, EvidenceRecord } from "../src/evidence/types.js";
 import { checkEvidence, sourceEvidence } from "../src/evidence/projector.js";
 import {
   buildEvidenceSnapshot,
@@ -21,52 +19,6 @@ describe("Evidence Graph 低敏投影", () => {
     assert.equal(EvidenceParameters.type, "object");
     assert.equal("anyOf" in EvidenceParameters, false);
     assert.equal("oneOf" in EvidenceParameters, false);
-  });
-
-  it("模型证据卡按闭环类型保留最新事实，再用最新源码补足八条和 2 KiB", () => {
-    let sequence = 0;
-    const record = (kind: EvidenceKind, id: string, summary = id): EvidenceRecord => ({
-      schemaVersion: 1,
-      id,
-      taskId: "card-budget",
-      kind,
-      actionKey: null,
-      fingerprint: id,
-      actionAliases: [],
-      status: "active",
-      summary,
-      artifactRef: null,
-      path: kind === "source" ? "src/" + id + ".ts" : null,
-      startLine: kind === "source" ? 1 : null,
-      lineCount: kind === "source" ? 24 : null,
-      baseHash: kind === "source" ? "base-" + id : null,
-      worktreeHash: null,
-      validityKey: id,
-      links: [],
-      metadata: {},
-      createdAt: new Date(sequence++ * 1_000).toISOString(),
-    });
-    const records = [
-      record("claim", "old-claim"),
-      record("reproduction", "latest-reproduction"),
-      record("claim", "latest-claim"),
-      record("change", "latest-change"),
-      record("check", "latest-check"),
-      record("verification", "latest-verification"),
-      record("game", "noisy-game-snapshot"),
-      ...Array.from({ length: 10 }, (_value, index) => record("source", "source-" + String(index))),
-    ];
-
-    const card = buildEvidenceCard(records);
-    assert.ok(Buffer.byteLength(card, "utf8") <= 2 * 1024);
-    assert.ok(card.split("\n").length <= 8);
-    assert.match(card, /latest-reproduction/u);
-    assert.match(card, /latest-claim/u);
-    assert.match(card, /latest-change/u);
-    assert.match(card, /latest-check/u);
-    assert.match(card, /latest-verification/u);
-    assert.match(card, /source-9/u);
-    assert.doesNotMatch(card, /old-claim|noisy-game-snapshot|source-0/u);
   });
 
   it("按节点关系返回 list/get，并限制工件尾部和敏感正文", async () => {
@@ -140,11 +92,6 @@ describe("Evidence Graph 低敏投影", () => {
       const snapshot = await buildEvidenceSnapshot(evidence);
       assert.equal(snapshot.taskId, task.id);
       assert.equal(snapshot.revision, evidence.revision);
-      const card = buildEvidenceCard(await evidence.active());
-      assert.match(card, /claim\/active/u);
-      assert.match(card, /downstream=/u);
-      assert.ok(Buffer.byteLength(card, "utf8") <= 2 * 1024);
-      assert.doesNotMatch(card, /SELECT hidden_answer/iu);
       assert.equal(await readFile(join(dataDir, "tasks", task.id, "evidence.jsonl"), "utf8").then((text) => text.includes("SELECT hidden_answer")), false);
     } finally {
       await repository.dispose();
