@@ -29,17 +29,18 @@ import {
   evalFailureCode,
   provisionEvalDependencies,
   releaseEvalDependencies,
-  runEvalBrowserOracle,
   type EvalDependencyLease,
-  type EvalOracleDiagnostic,
 } from "./browser-oracle.js";
-import { EVAL_ORACLE_VERSION } from "../domain/oracle.js";
+import { EVAL_JUDGE_VERSION } from "../config.js";
 import {
-  isEvalPreflightCertificateCurrent,
   loadEvalScenario,
   resolveEvalRunIdentity,
-  type EvalPreflightCertificate,
 } from "./preflight.js";
+import {
+  runEvalJudge,
+  type EvalJudgeReasonCode,
+  type EvalJudgeResult,
+} from "./llm-judge.js";
 import { createEvalWorkspace } from "./workspace.js";
 
 const executeFile = promisify(execFile);
@@ -49,25 +50,23 @@ export type EvalRunProfile = "pi-baseline" | "maintainer";
 
 /** 一次真实模型游戏修复 Eval 的统一低敏结果。 */
 export interface EvalRunResult {
-  readonly schemaVersion: 5;
+  readonly schemaVersion: 6;
   readonly runId: string;
   readonly scenarioId: string;
   readonly profile: EvalRunProfile;
   readonly repetition: number;
   readonly status: "passed" | "failed" | "infra_error";
-  readonly failureClass: "none" | "agent" | "oracle" | "infrastructure";
+  readonly failureClass: "none" | "agent" | "judge" | "infrastructure";
   readonly externalCorrectness: {
-    readonly initialFailureMatched: boolean;
-    readonly afterOracleMatched: boolean | null;
+    readonly sourcePatchMaterialized: boolean;
+    readonly judgePassed: boolean | null;
     readonly forbiddenPathsUntouched: boolean | null;
     readonly headUnchanged: boolean | null;
+    readonly effectiveChange: boolean | null;
   };
   readonly workflowClosure: ProfileWorkflowClosure;
   readonly agentResult: ProfileRunMetrics & {
     readonly totalDurationMs: number;
-    readonly beforeActionCount: number;
-    readonly afterActionCount: number;
-    readonly browserErrorCount: number;
     readonly changedFileCount: number;
     readonly changedPaths: readonly string[];
     readonly changedPathDigests: Readonly<Record<string, string | null>>;
@@ -76,14 +75,19 @@ export interface EvalRunResult {
     readonly status: "passed" | "failed" | "infra_error";
     readonly externalCorrectnessPassed: boolean;
     readonly workflowClosurePassed: boolean | null;
+    readonly verdict: "passed" | "failed" | null;
+    readonly reasonCode: EvalJudgeReasonCode | null;
+    readonly modelId: string | null;
+    readonly inputTokens: number;
+    readonly outputTokens: number;
+    readonly totalTokens: number;
+    readonly durationMs: number;
   };
   readonly modelId: string | null;
   readonly identity: EvalResultIdentity | null;
   readonly agentFailureCode: string | null;
   readonly judgeFailureCode: string | null;
   readonly diagnostics: {
-    readonly beforeOracle: EvalOracleDiagnostic | null;
-    readonly afterOracle: EvalOracleDiagnostic | null;
     readonly lastToolName: string | null;
     readonly lastFinishStatus: string | null;
     readonly evidenceGraph: ProfileRunDiagnostics["evidenceGraph"];
@@ -103,8 +107,7 @@ export interface EvalRunOptions {
   readonly repetition: number;
   readonly archiveRoot?: string;
   readonly timeoutMs?: number;
-  readonly preflightCertificate?: EvalPreflightCertificate;
-  /** 与预检证书、checkpoint 和最终 EvalSuite 汇总共享的运行身份。 */
+  /** 与 checkpoint 和最终 EvalSuite 汇总共享的运行身份。 */
   readonly runIdentity?: EvalRunIdentity;
   /** 仅转发当前模型的可见文本和工具名，不参与判分或归档。 */
   readonly onLiveEvent?: (event: PiMaintainerLiveEvent) => void;
@@ -119,38 +122,43 @@ export function classifyEvalFailure(input: {
   if (input.status === "passed") return "none";
   if (input.status === "infra_error") return "infrastructure";
   if (input.agentFailureCode !== null || input.workflowClosurePassed === false) return "agent";
-  return "oracle";
+  return "judge";
 }
 
 /**
- * 判定一次游戏修复是否通过外部任务 Oracle。
+ * 判定一次游戏修复是否通过 LLM Judge 与 Git 安全门。
  *
- * @param input 初始故障、修复后 Oracle 与 Git 安全边界事实。
- * @returns 仅当任务故障被复现、修复后目标满足且未改提交/禁写路径时为 true；不执行测试或构建。
+ * @param input 已物化故障、LLM 功能判定、有效 Diff 与 Git 安全边界事实。
+ * @returns 仅当候选修复通过宽松功能判断且满足廉价安全门时为 true。
  */
 export function evalExternalCorrectnessPassed(input: {
-  readonly initialFailureMatched: boolean;
-  readonly afterOracleMatched: boolean | null;
+  readonly sourcePatchMaterialized: boolean;
+  readonly judgePassed: boolean | null;
   readonly forbiddenPathsUntouched: boolean | null;
   readonly headUnchanged: boolean | null;
+  readonly effectiveChange: boolean | null;
 }): boolean {
-  return input.initialFailureMatched
-    && input.afterOracleMatched === true
+  return input.sourcePatchMaterialized
+    && input.judgePassed === true
     && input.forbiddenPathsUntouched === true
-    && input.headUnchanged === true;
+    && input.headUnchanged === true
+    && input.effectiveChange === true;
 }
 
 /**
- * 用同一外部结果规则判定所有 Profile；工作流闭环只保留为诊断字段。
+ * 用同一 LLM 功能结果和 Git 安全规则判定所有 Profile；工作流闭环只保留为诊断字段。
  *
  * Pi 的 settled、Maintainer 的 ready_to_apply 和运行超时都不声明功能正确性。只要评测
- * 基础设施可用，最终状态完全由外部 Oracle 与 Git 安全边界决定。
+ * 基础设施可用，最终状态完全由 LLM Judge 与 Git 安全边界决定。
  */
 export function evalJudgeOutcome(input: {
   readonly infrastructureFailure: boolean;
   readonly externalCorrectnessPassed: boolean;
   readonly workflowClosurePassed: boolean | null;
-}): EvalRunResult["judgeOutcome"] {
+}): Pick<
+  EvalRunResult["judgeOutcome"],
+  "status" | "externalCorrectnessPassed" | "workflowClosurePassed"
+> {
   const status = input.infrastructureFailure
     ? "infra_error"
     : input.externalCorrectnessPassed ? "passed" : "failed";
@@ -239,23 +247,21 @@ export async function runEvalScenario(
   let temporaryRoot: string | null = null;
   let workspaceRoot: string | null = null;
   let dependencyLease: EvalDependencyLease | null = null;
-  let initialFailureMatched = false;
-  let afterOracleMatched: boolean | null = null;
-  let browserErrorCount = 0;
-  let beforeActionCount = 0;
-  let afterActionCount = 0;
+  let sourcePatchMaterialized = false;
+  let judgePassed: boolean | null = null;
   let changedFileCount = 0;
   let retainedChangedPaths: string[] = [];
   let retainedChangedPathDigests: Record<string, string | null> = {};
   let forbiddenPathsUntouched: boolean | null = null;
   let headUnchanged: boolean | null = null;
+  let effectiveChange: boolean | null = null;
   let agentStarted = false;
   let agentStartedAt: number | null = null;
   let infrastructureFailure = false;
   let agentFailureCode: string | null = null;
   let judgeFailureCode: string | null = null;
-  let beforeDiagnostic: EvalOracleDiagnostic | null = null;
-  let afterDiagnostic: EvalOracleDiagnostic | null = null;
+  let judgeReasonCode: EvalJudgeReasonCode | null = null;
+  let judgeResult: EvalJudgeResult | null = null;
   let runDiagnostics: ProfileRunDiagnostics = {
     lastToolName: null,
     lastFinishStatus: null,
@@ -314,7 +320,11 @@ export async function runEvalScenario(
   };
   try {
     scenario = await loadEvalScenario(options);
-    runIdentity = await resolveEvalRunIdentity(options.datasetFingerprint, options.runIdentity);
+    runIdentity = await resolveEvalRunIdentity(
+      options.datasetFingerprint,
+      options.runIdentity,
+      EVAL_JUDGE_VERSION,
+    );
     const timeoutMs = Math.min(
       options.timeoutMs ?? scenario.publicCase.timeoutMs,
       EVAL_TIMEOUT_MAX_MS,
@@ -326,46 +336,18 @@ export async function runEvalScenario(
       ...(options.datasetRoot ? { datasetRoot: options.datasetRoot } : {}),
       destination: workspaceRoot,
     });
+    sourcePatchMaterialized = true;
     dependencyLease = await provisionEvalDependencies({
       repositoryRoot: workspaceRoot,
       dependencyRepoRoot: options.dependencyRepoRoot,
     });
     const baseHead = (await gitOutput(workspaceRoot, ["rev-parse", "HEAD"])).trim();
-    if (options.preflightCertificate) {
-      if (!isEvalPreflightCertificateCurrent({
-        certificate: options.preflightCertificate,
-        scenarioId: scenario.publicCase.scenarioId,
-        buggyHead: baseHead,
-        dependencyRepoRoot: options.dependencyRepoRoot,
-        runFingerprint: runIdentity.runFingerprint,
-      })) throw new Error("preflight-certificate-mismatch");
-      initialFailureMatched = true;
-    } else {
-      const before = await runEvalBrowserOracle({
-        repositoryRoot: workspaceRoot,
-        scenario,
-        phase: "before",
-        timeoutMs,
-      });
-      initialFailureMatched = before.matched;
-      beforeDiagnostic = before.diagnostic;
-      beforeActionCount = before.actionCount;
-      browserErrorCount += before.browserErrorCount;
-      if (before.failureCode) {
-        infrastructureFailure = true;
-        throw new Error(before.failureCode);
-      }
-      if (!initialFailureMatched) {
-        infrastructureFailure = true;
-        throw new Error("initial-failure-not-matched");
-      }
-    }
     identity = await collectEvalResultIdentity({
       repositoryRoot: workspaceRoot,
       profile: options.profile,
       publicPrompt: scenario.publicCase.prompt,
       datasetFingerprint: runIdentity.datasetFingerprint,
-      oracleVersion: EVAL_ORACLE_VERSION,
+      oracleVersion: EVAL_JUDGE_VERSION,
       runIdentity,
     });
     agentStarted = true;
@@ -391,20 +373,6 @@ export async function runEvalScenario(
     runDiagnostics = profileOutcome.diagnostics;
     if (piMetrics.failureCode) agentFailureCode = piMetrics.failureCode;
     if (piMetrics.status === "infra_error") infrastructureFailure = true;
-    const after = await runEvalBrowserOracle({
-      repositoryRoot: evaluationRoot,
-      scenario,
-      phase: "after",
-      timeoutMs,
-    });
-    afterOracleMatched = after.matched;
-    afterDiagnostic = after.diagnostic;
-    afterActionCount = after.actionCount;
-    browserErrorCount += after.browserErrorCount;
-    if (after.failureCode) {
-      infrastructureFailure = true;
-      judgeFailureCode ??= after.failureCode;
-    }
     const paths = await changedPaths(evaluationRoot);
     changedFileCount = paths.length;
     retainedChangedPaths = paths;
@@ -412,9 +380,48 @@ export async function runEvalScenario(
     forbiddenPathsUntouched = !touchesForbiddenPath(paths, scenario.expected.forbiddenPaths);
     const finalHead = (await gitOutput(evaluationRoot, ["rev-parse", "HEAD"])).trim();
     headUnchanged = baseHead === finalHead;
-    if (!afterOracleMatched) judgeFailureCode ??= "after-oracle-not-matched";
-    if (!forbiddenPathsUntouched) judgeFailureCode ??= "forbidden-path-changed";
-    if (!headUnchanged) judgeFailureCode ??= "unexpected-commit";
+    const untrackedPaths = (await gitOutput(evaluationRoot, [
+      "ls-files",
+      "-z",
+      "--others",
+      "--exclude-standard",
+    ])).split("\0").filter(Boolean);
+    if (untrackedPaths.length > 0) {
+      await gitOutput(evaluationRoot, ["add", "--intent-to-add", "--", ...untrackedPaths]);
+    }
+    const candidateDiff = await gitOutput(evaluationRoot, [
+      "diff",
+      "--no-ext-diff",
+      "--unified=40",
+      "HEAD",
+      "--",
+    ]);
+    effectiveChange = paths.length > 0 && candidateDiff.trim().length > 0;
+    if (!forbiddenPathsUntouched) {
+      judgePassed = false;
+      judgeFailureCode ??= "forbidden-path-changed";
+    } else if (!headUnchanged) {
+      judgePassed = false;
+      judgeFailureCode ??= "unexpected-commit";
+    } else if (!effectiveChange) {
+      judgePassed = false;
+      judgeReasonCode = "no-effective-change";
+      judgeFailureCode ??= judgeReasonCode;
+    } else if (!infrastructureFailure) {
+      try {
+        judgeResult = await runEvalJudge({
+          publicTask: scenario.publicCase.prompt,
+          sourcePatch: await readFile(join(scenario.directory, "source.patch"), "utf8"),
+          candidateDiff,
+        });
+        judgeReasonCode = judgeResult.reasonCode;
+        judgePassed = judgeResult.verdict === "passed";
+        if (!judgePassed) judgeFailureCode ??= judgeResult.reasonCode;
+      } catch (error) {
+        infrastructureFailure = true;
+        judgeFailureCode ??= evalFailureCode(error);
+      }
+    }
   } catch (error) {
     infrastructureFailure = true;
     const failureCode = evalFailureCode(error);
@@ -447,10 +454,11 @@ export async function runEvalScenario(
     }
   }
   const externalCorrectnessPassed = evalExternalCorrectnessPassed({
-    initialFailureMatched,
-    afterOracleMatched,
+    sourcePatchMaterialized,
+    judgePassed,
     forbiddenPathsUntouched,
     headUnchanged,
+    effectiveChange,
   });
   const workflowClosurePassed = workflowClosure.applicable
     ? workflowClosure.proposed === true
@@ -458,13 +466,23 @@ export async function runEvalScenario(
       && workflowClosure.verified === true
       && workflowClosure.readyToApply === true
     : null;
-  const judgeOutcome = evalJudgeOutcome({
+  const outcome = evalJudgeOutcome({
     infrastructureFailure,
     externalCorrectnessPassed,
     workflowClosurePassed,
   });
+  const judgeOutcome: EvalRunResult["judgeOutcome"] = {
+    ...outcome,
+    verdict: judgeResult?.verdict ?? (judgeReasonCode ? "failed" : null),
+    reasonCode: judgeReasonCode,
+    modelId: judgeResult?.modelId ?? null,
+    inputTokens: judgeResult?.inputTokens ?? 0,
+    outputTokens: judgeResult?.outputTokens ?? 0,
+    totalTokens: judgeResult?.totalTokens ?? 0,
+    durationMs: judgeResult?.durationMs ?? 0,
+  };
   const resultWithoutArchive: EvalRunResult = {
-    schemaVersion: 5,
+    schemaVersion: 6,
     runId,
     scenarioId: options.scenarioId,
     profile: options.profile,
@@ -476,18 +494,16 @@ export async function runEvalScenario(
       workflowClosurePassed,
     }),
     externalCorrectness: {
-      initialFailureMatched,
-      afterOracleMatched,
+      sourcePatchMaterialized,
+      judgePassed,
       forbiddenPathsUntouched,
       headUnchanged,
+      effectiveChange,
     },
     workflowClosure,
     agentResult: {
       ...piMetrics,
       totalDurationMs: Math.round(performance.now() - startedAt),
-      beforeActionCount,
-      afterActionCount,
-      browserErrorCount,
       changedFileCount,
       changedPaths: retainedChangedPaths,
       changedPathDigests: retainedChangedPathDigests,
@@ -498,8 +514,6 @@ export async function runEvalScenario(
     agentFailureCode,
     judgeFailureCode,
     diagnostics: {
-      beforeOracle: beforeDiagnostic,
-      afterOracle: afterDiagnostic,
       lastToolName: runDiagnostics.lastToolName,
       lastFinishStatus: runDiagnostics.lastFinishStatus,
       evidenceGraph: runDiagnostics.evidenceGraph,

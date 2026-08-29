@@ -21,6 +21,53 @@ export interface MaintainerInspectSummary {
   readonly receiptRatio: number;
 }
 
+/** 一整套 Eval 的 Agent、Judge、工具与时间汇总。 */
+export interface EvalUsageSummary {
+  readonly agentTokens: number;
+  readonly judgeTokens: number;
+  readonly totalTokens: number;
+  readonly toolCalls: number;
+  readonly sumAgentDurationMs: number;
+  readonly sumRunDurationMs: number;
+  readonly suiteWallDurationMs: number;
+}
+
+/**
+ * 汇总用户关心的 Token、工具调用和时间，不读取模型正文或工具参数。
+ *
+ * @param results 已完成的低敏场景结果。
+ * @param suiteWallDurationMs 从 Suite 开始到汇总的墙钟时间。
+ * @returns Agent/Judge 分项 Token、工具次数和三种明确口径的毫秒耗时。
+ */
+export function summarizeEvalUsage(
+  results: readonly EvalRunResult[],
+  suiteWallDurationMs: number,
+): EvalUsageSummary {
+  const agentTokens = results.reduce(
+    (sum, result) => sum + result.agentResult.totalTokens,
+    0,
+  );
+  const judgeTokens = results.reduce(
+    (sum, result) => sum + result.judgeOutcome.totalTokens,
+    0,
+  );
+  return {
+    agentTokens,
+    judgeTokens,
+    totalTokens: agentTokens + judgeTokens,
+    toolCalls: results.reduce((sum, result) => sum + result.agentResult.toolCalls, 0),
+    sumAgentDurationMs: results.reduce(
+      (sum, result) => sum + result.agentResult.durationMs,
+      0,
+    ),
+    sumRunDurationMs: results.reduce(
+      (sum, result) => sum + result.agentResult.totalDurationMs,
+      0,
+    ),
+    suiteWallDurationMs: Math.max(0, Math.round(suiteWallDurationMs)),
+  };
+}
+
 export function summarizeMaintainerInspect(
   results: readonly EvalRunResult[],
 ): MaintainerInspectSummary {
@@ -84,7 +131,6 @@ function classifyEvalSuiteRun(
  * @returns 各 Profile 的互斥计数，以及仅在全部期望运行都通过时为 `passed` 的总状态。
  */
 export function summarizeEvalSuiteRuns(input: {
-  readonly preflightPassed: boolean;
   readonly expectedRuns: number;
   readonly results: readonly ClassifiableEvalRunResult[];
   readonly runFailures: readonly { readonly profile: EvalRunProfile }[];
@@ -115,7 +161,7 @@ export function summarizeEvalSuiteRuns(input: {
     && input.runFailures.length === 0
     && input.results.every((result) => result.status === "passed");
   return {
-    status: input.preflightPassed && allExpectedRunsPassed ? "passed" : "failed",
+    status: allExpectedRunsPassed ? "passed" : "failed",
     byProfile,
     runByProfile,
   };

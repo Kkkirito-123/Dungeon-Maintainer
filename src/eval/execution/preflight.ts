@@ -99,6 +99,7 @@ export async function loadEvalScenario(options: {
 export async function resolveEvalRunIdentity(
   datasetFingerprint: string,
   provided: EvalRunIdentity | undefined,
+  judgingVersion = EVAL_ORACLE_VERSION,
 ): Promise<EvalRunIdentity> {
   if (!/^[0-9a-f]{64}$/u.test(datasetFingerprint)) {
     throw new Error("eval-run-fingerprint-mismatch");
@@ -107,7 +108,7 @@ export async function resolveEvalRunIdentity(
     if (
       !evalRunIdentityIsCurrent(provided)
       || provided.datasetFingerprint !== datasetFingerprint
-      || provided.oracleVersion !== EVAL_ORACLE_VERSION
+      || provided.oracleVersion !== judgingVersion
     ) {
       throw new Error("eval-run-fingerprint-mismatch");
     }
@@ -115,7 +116,7 @@ export async function resolveEvalRunIdentity(
   }
   return await collectEvalRunIdentity({
     datasetFingerprint,
-    oracleVersion: EVAL_ORACLE_VERSION,
+    oracleVersion: judgingVersion,
   });
 }
 

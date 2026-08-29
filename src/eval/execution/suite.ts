@@ -13,6 +13,7 @@ import {
   readEvalDataset,
 } from "../domain/dataset.js";
 import { EVAL_ORACLE_VERSION } from "../domain/oracle.js";
+import { EVAL_JUDGE_VERSION } from "../config.js";
 import { runEvalPreflight, type EvalPreflightResult } from "./preflight.js";
 import { runEvalScenario, type EvalRunProfile, type EvalRunResult } from "./run.js";
 import type { EvalProgressEvent } from "./progress.js";
@@ -20,15 +21,16 @@ import { collectEvalRunIdentity, type EvalRunIdentity } from "../reporting/ident
 import {
   evalSuiteCheckpointIsCompatible,
   readEvalSuiteCheckpoint,
-  readSavedEvalPreflights,
   writeEvalSuiteCheckpoint,
 } from "../reporting/checkpoint.js";
 import {
   summarizeEfficiency,
+  summarizeEvalUsage,
   summarizeEvalSuiteRuns,
   summarizeMaintainerInspect,
   type EvalSuiteResultSummary,
   type EvalSuiteRunSummary,
+  type EvalUsageSummary,
   type MaintainerInspectSummary,
   type PairedEfficiencySummary,
 } from "../reporting/report.js";
@@ -65,7 +67,7 @@ export interface EvalSuitePreflightResult {
 
 /** 完整 Suite 报告。 */
 export interface EvalSuiteResult {
-  readonly schemaVersion: 5;
+  readonly schemaVersion: 6;
   readonly status: "passed" | "failed";
   readonly datasetId: string;
   readonly datasetFingerprint: string;
@@ -75,7 +77,6 @@ export interface EvalSuiteResult {
   readonly workers: number;
   readonly timingComparable: boolean;
   readonly archiveDirectory: string;
-  readonly preflightPassed: boolean;
   readonly expectedRuns: number;
   readonly completedRuns: number;
   readonly runFailures: readonly EvalRunFailure[];
@@ -84,6 +85,7 @@ export interface EvalSuiteResult {
   readonly runByProfile: Readonly<Record<EvalRunProfile, EvalSuiteRunSummary>>;
   readonly efficiency: PairedEfficiencySummary;
   readonly maintainerInspect: MaintainerInspectSummary;
+  readonly usage: EvalUsageSummary;
   readonly note: string;
 }
 
@@ -273,8 +275,9 @@ export async function runEvalSuitePreflight(
   return output;
 }
 
-/** 预检通过后运行 Dataset 中的全部场景。 */
+/** 运行 Dataset 中的全部场景；浏览器预检仅由显式命令单独执行。 */
 export async function runEvalSuite(options: EvalSuiteOptions): Promise<EvalSuiteResult> {
+  const suiteStartedAt = performance.now();
   const selectedProfile = options.profile ?? "maintainer";
   const workers = normalizeEvalWorkers(options.workers, selectedProfile === "both" ? 1 : 2);
   const dataset = await readEvalDataset(
@@ -283,7 +286,7 @@ export async function runEvalSuite(options: EvalSuiteOptions): Promise<EvalSuite
   );
   const runIdentity = await collectEvalRunIdentity({
     datasetFingerprint: dataset.fingerprint,
-    oracleVersion: EVAL_ORACLE_VERSION,
+    oracleVersion: EVAL_JUDGE_VERSION,
   });
   const selectedProfileCount = selectedProfile === "both" ? 2 : 1;
   const expectedRuns = dataset.scenarioIds.length * selectedProfileCount * options.repetitions;
@@ -291,26 +294,6 @@ export async function runEvalSuite(options: EvalSuiteOptions): Promise<EvalSuite
     ? resolve(options.resumeDirectory)
     : uniqueArchiveDirectory(options.archiveRoot, "suite");
   await mkdir(archiveDirectory, { recursive: true });
-  const preflightResults = options.resumeDirectory
-    ? await readSavedEvalPreflights(archiveDirectory, dataset.scenarioIds, runIdentity.runFingerprint)
-      ?? await runEvalPreflights({
-        options,
-        datasetRoot: dataset.root,
-        scenarioIds: dataset.scenarioIds,
-        archiveRoot: join(archiveDirectory, "preflight"),
-        runIdentity,
-      })
-    : await runEvalPreflights({
-      options,
-      datasetRoot: dataset.root,
-      scenarioIds: dataset.scenarioIds,
-      archiveRoot: join(archiveDirectory, "preflight"),
-      runIdentity,
-    });
-  const certificates = new Map(preflightResults.flatMap((entry) => (
-    entry.certificate ? [[entry.scenarioId, entry.certificate] as const] : []
-  )));
-  const preflightPassed = preflightResults.every((entry) => entry.status === "passed");
   const priorCheckpoint = options.resumeDirectory
     ? await readEvalSuiteCheckpoint(join(archiveDirectory, "checkpoint.json"))
     : null;
@@ -353,66 +336,65 @@ export async function runEvalSuite(options: EvalSuiteOptions): Promise<EvalSuite
     }));
     return checkpointWrite;
   };
-  if (preflightPassed) {
-    const completedKeys = new Set([
+  const completedKeys = new Set([
       ...results.map(jobKey),
       ...runFailures.map(jobKey),
-    ]);
-    const pendingJobs = jobs.filter((job) => !completedKeys.has(jobKey(job)));
-    await persistCheckpoint();
-    const totals = () => ({
-      completed: results.length + runFailures.length,
-      cumulativeTokens: results.reduce((sum, item) => sum + item.agentResult.totalTokens, 0),
-      cumulativeToolCalls: results.reduce((sum, item) => sum + item.agentResult.toolCalls, 0),
-    });
-    await runEvalWorkerPool(pendingJobs, workers, async (job, workerId) => {
-      const startedAt = new Date().toISOString();
-      const publish = (
-        status: EvalProgressEvent["status"],
-        live: Partial<Pick<EvalProgressEvent, "liveKind" | "toolName" | "assistantText">> = {},
-      ): void => options.onProgress?.({ phase: "run", scenarioId: job.scenarioId,
-        profile: job.profile, repetition: job.repetition, ...totals(), total: jobs.length,
-        status, startedAt, workerId, workerCount: workers, ...live });
-      publish("running", { liveKind: "start", toolName: null, assistantText: "" });
-      try {
-        const certificate = certificates.get(job.scenarioId);
-        const run = await runEvalScenario({
-          scenarioId: job.scenarioId,
-          datasetRoot: dataset.root,
-          datasetFingerprint: dataset.fingerprint,
-          dependencyRepoRoot: options.dependencyRepoRoot,
-          profile: job.profile,
-          repetition: job.repetition,
-          archiveRoot: join(archiveDirectory, "runs"),
-          ...(certificate ? { preflightCertificate: certificate } : {}),
-          ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
-          runIdentity,
-          ...(job.profile === "maintainer" ? { onLiveEvent: (event: { kind: "tool"; toolName: string } | { kind: "assistant"; text: string }) => {
-            if (event.kind === "tool") publish("running", { liveKind: "tool", toolName: event.toolName });
-            else publish("running", { liveKind: "assistant", assistantText: event.text });
-          } } : {}),
-        });
-        results.push(run);
-        await persistCheckpoint();
-        publish(run.status === "passed" ? "passed" : "failed", { liveKind: "finish" });
-      } catch (error) {
-        runFailures.push({
-          scenarioId: job.scenarioId,
-          profile: job.profile,
-          repetition: job.repetition,
-          code: runFailureCode(error),
-        });
-        await persistCheckpoint();
-        publish("failed", { liveKind: "finish" });
-      }
-    });
-    await checkpointWrite;
-  }
+  ]);
+  const pendingJobs = jobs.filter((job) => !completedKeys.has(jobKey(job)));
+  await persistCheckpoint();
+  const totals = () => ({
+    completed: results.length + runFailures.length,
+    cumulativeTokens: results.reduce(
+      (sum, item) => sum + item.agentResult.totalTokens + item.judgeOutcome.totalTokens,
+      0,
+    ),
+    cumulativeToolCalls: results.reduce((sum, item) => sum + item.agentResult.toolCalls, 0),
+  });
+  await runEvalWorkerPool(pendingJobs, workers, async (job, workerId) => {
+    const startedAt = new Date().toISOString();
+    const publish = (
+      status: EvalProgressEvent["status"],
+      live: Partial<Pick<EvalProgressEvent, "liveKind" | "toolName" | "assistantText">> = {},
+    ): void => options.onProgress?.({ phase: "run", scenarioId: job.scenarioId,
+      profile: job.profile, repetition: job.repetition, ...totals(), total: jobs.length,
+      status, startedAt, workerId, workerCount: workers, ...live });
+    publish("running", { liveKind: "start", toolName: null, assistantText: "" });
+    try {
+      const run = await runEvalScenario({
+        scenarioId: job.scenarioId,
+        datasetRoot: dataset.root,
+        datasetFingerprint: dataset.fingerprint,
+        dependencyRepoRoot: options.dependencyRepoRoot,
+        profile: job.profile,
+        repetition: job.repetition,
+        archiveRoot: join(archiveDirectory, "runs"),
+        ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+        runIdentity,
+        ...(job.profile === "maintainer" ? { onLiveEvent: (event: { kind: "tool"; toolName: string } | { kind: "assistant"; text: string }) => {
+          if (event.kind === "tool") publish("running", { liveKind: "tool", toolName: event.toolName });
+          else publish("running", { liveKind: "assistant", assistantText: event.text });
+        } } : {}),
+      });
+      results.push(run);
+      await persistCheckpoint();
+      publish(run.status === "passed" ? "passed" : "failed", { liveKind: "finish" });
+    } catch (error) {
+      runFailures.push({
+        scenarioId: job.scenarioId,
+        profile: job.profile,
+        repetition: job.repetition,
+        code: runFailureCode(error),
+      });
+      await persistCheckpoint();
+      publish("failed", { liveKind: "finish" });
+    }
+  });
+  await checkpointWrite;
   sortByOrder(results);
   sortByOrder(runFailures);
-  const summary = summarizeEvalSuiteRuns({ preflightPassed, expectedRuns, results, runFailures });
+  const summary = summarizeEvalSuiteRuns({ expectedRuns, results, runFailures });
   const output: EvalSuiteResult = {
-    schemaVersion: 5,
+    schemaVersion: 6,
     status: summary.status,
     datasetId: dataset.id,
     datasetFingerprint: dataset.fingerprint,
@@ -422,7 +404,6 @@ export async function runEvalSuite(options: EvalSuiteOptions): Promise<EvalSuite
     workers,
     timingComparable: workers === 1,
     archiveDirectory,
-    preflightPassed,
     expectedRuns,
     completedRuns: results.length,
     runFailures,
@@ -431,9 +412,10 @@ export async function runEvalSuite(options: EvalSuiteOptions): Promise<EvalSuite
     runByProfile: summary.runByProfile,
     efficiency: summarizeEfficiency(results),
     maintainerInspect: summarizeMaintainerInspect(results),
+    usage: summarizeEvalUsage(results, performance.now() - suiteStartedAt),
     note: workers === 1
-      ? "功能结果由相同 Dataset 和外部 Oracle 判定；单 Worker 的耗时可用于 Profile 对比。"
-      : "功能结果可比较；多 Worker 会共享本机资源，因此耗时不用于 Profile 对比。",
+      ? "功能结果由相同 Dataset 和一次 Flash LLM Judge 判定；单 Worker 的耗时可用于 Profile 对比。"
+      : "功能结果由一次 Flash LLM Judge 判定；多 Worker 会共享本机资源，因此耗时不用于 Profile 对比。",
   };
   await writeFile(join(archiveDirectory, "summary.json"), JSON.stringify({
     ...output,
@@ -442,7 +424,7 @@ export async function runEvalSuite(options: EvalSuiteOptions): Promise<EvalSuite
   }, null, 2) + "\n", "utf8");
   options.onProgress?.({ phase: "complete", scenarioId: null, profile: selectedProfile,
     repetition: null, completed: results.length + runFailures.length, total: expectedRuns,
-    status: output.status, cumulativeTokens: results.reduce((sum, item) => sum + item.agentResult.totalTokens, 0),
+    status: output.status, cumulativeTokens: output.usage.totalTokens,
     cumulativeToolCalls: results.reduce((sum, item) => sum + item.agentResult.toolCalls, 0),
     startedAt: new Date().toISOString(), workerId: null, workerCount: workers });
   return output;

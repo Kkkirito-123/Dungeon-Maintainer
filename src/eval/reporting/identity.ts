@@ -10,7 +10,8 @@ import { createHash } from "node:crypto";
 import { lstat, readFile, readdir } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadConfig, type MaintainerConfig } from "../../config.js";
+import type { MaintainerConfig } from "../../config.js";
+import { loadEvalConfig } from "../config.js";
 import { buildDungeonMaintainerPrompt } from "../../pi/prompt.js";
 import { FULL_CODING_TOOLS } from "../../pi/tool-policy.js";
 import { hashWorktree, runGitRaw } from "../../workspace/git.js";
@@ -167,7 +168,7 @@ export async function collectEvalRunIdentity(input: {
   readonly oracleVersion: string;
 }): Promise<EvalRunIdentity> {
   const projectRoot = evalProjectRoot();
-  const model = evalModelFingerprint(loadConfig());
+  const model = evalModelFingerprint(loadEvalConfig());
   return createEvalRunIdentity({
     evalCommit: (await runGitRaw(projectRoot, ["rev-parse", "HEAD"])).trim(),
     evalWorktreeHash: await hashWorktree(projectRoot),

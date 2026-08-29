@@ -10,7 +10,8 @@
 import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { buildPiArguments, resolvePiCliPath } from "../../app/pi-process.js";
-import { loadConfig, requireApiKey } from "../../config.js";
+import { requireApiKey } from "../../config.js";
+import { loadEvalConfig } from "../config.js";
 import { PiRpcProcess } from "../../pi/rpc-process.js";
 import { startShellServer, type ShellHandle } from "../../shell/server.js";
 import { TaskStore } from "../../task/store.js";
@@ -174,7 +175,7 @@ export function evalShellEndpoint(shellUrl: string, path: string): string {
 
 /**
  * 第一个真实 `agent_settled` 即表示本次自然请求的 Pi Agent Loop 已结束。
- * TaskState 只补充真实 blocked 分类；修复是否成功由随后独立运行的外部 Oracle 判断，
+ * TaskState 只补充真实 blocked 分类；修复是否成功由随后独立运行的 LLM Judge 判断，
  * 不能再等待内部 Queue、paused 或 ready_to_apply 来替 Eval 判卷。
  */
 export function evalSettledDecision(input: {
@@ -265,7 +266,7 @@ export async function runPiMaintainer(
     worktreeRoot: snapshot.root,
     piSessionDir: sessionDirectory,
   });
-  const config = loadConfig();
+  const config = loadEvalConfig();
   const apiKey = requireApiKey(config);
   let turns = 0;
   let toolCalls = 0;

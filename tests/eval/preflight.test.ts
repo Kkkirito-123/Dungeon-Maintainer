@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { describe, it } from "node:test";
 import { EVAL_ORACLE_VERSION } from "../../src/eval/domain/oracle.js";
+import { EVAL_JUDGE_VERSION } from "../../src/eval/config.js";
 import {
   isEvalPreflightCertificateCurrent,
   resolveEvalRunIdentity,
@@ -50,6 +51,25 @@ describe("EvalPreflight certificate", () => {
     assert.equal(await resolveEvalRunIdentity(identity.datasetFingerprint, identity), identity);
     await assert.rejects(
       resolveEvalRunIdentity("e".repeat(64), identity),
+      /eval-run-fingerprint-mismatch/u,
+    );
+  });
+
+  it("显式接受 LLM Judge 版本并拒绝把它当作浏览器 Oracle 身份", async () => {
+    const identity = createEvalRunIdentity({
+      evalCommit: "a".repeat(40),
+      evalWorktreeHash: "b".repeat(64),
+      datasetFingerprint: "c".repeat(64),
+      oracleVersion: EVAL_JUDGE_VERSION,
+      modelId: "deepseek-v4-flash",
+      modelConfigHash: "d".repeat(64),
+    });
+    assert.equal(
+      await resolveEvalRunIdentity(identity.datasetFingerprint, identity, EVAL_JUDGE_VERSION),
+      identity,
+    );
+    await assert.rejects(
+      resolveEvalRunIdentity(identity.datasetFingerprint, identity),
       /eval-run-fingerprint-mismatch/u,
     );
   });

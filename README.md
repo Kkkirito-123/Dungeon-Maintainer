@@ -268,9 +268,9 @@ Shell 只展示低敏摘要，不传输 API Key、完整 Prompt、thinking、SQL
 
 ## 内置 Eval
 
-`pnpm eval` 把真实故障场景物化到独立仓库，先由外部 Oracle 确认故障存在，再启动正常 Maintainer
-修复，最后由同一个 Oracle 判卷。现场演示和 CI 共用一个 Runner；演示模式显示场景、预检、运行、
-结果、耗时、Token 和工具调用，CI 模式输出 JSON 与退出码。
+`pnpm eval` 把真实故障场景物化到独立仓库，启动正常 Maintainer 修复，通过 `HEAD`、禁写路径和
+有效 Diff 三个 Git 门禁后，只调用一次 Flash LLM Judge 做宽松功能验收。现场演示和 CI 共用一个
+Runner；结果 schema v6 分开统计 Agent/Judge Token、Agent 工具调用和 Agent/Run/Suite 三种耗时。
 
 ```powershell
 pnpm eval -- suite `
@@ -283,8 +283,10 @@ pnpm eval -- suite `
 
 Eval Dataset 固定在 `eval-datasets/`，不读取当前游戏源码。正式运行只从 `--dependencies` 指定的
 游戏仓库复用已安装的 `game/node_modules`；游戏开发和评测基线互不修改。单 Profile 默认并行
-2 个独立 Worker，公平对比默认 1 个；Oracle 不向 Agent 暴露答案，也不根据指标控制 Agent。
-目录分层、测试前检查、Profile 对比、版本指纹和断点恢复见 [docs/EVAL.md](docs/EVAL.md)。
+2 个独立 Worker，公平对比默认 1 个。Eval 复用当前 Key 与 Base URL，并为 Agent、Pi Baseline 和
+Judge 固定 `deepseek-v4-flash`、关闭 reasoning，不改变生产默认模型。`preflight` 保留为显式的
+零模型浏览器诊断，但不阻塞 `run`、`suite` 或 `compare`；Suite 通过不等于浏览器端到端通过。
+目录分层、判定边界、统计口径、版本指纹和断点恢复见 [docs/EVAL.md](docs/EVAL.md)。
 
 模型上下文保留 Pi 原生 Session 历史和 compact。维护器不设置请求级工具次数或 Token 强制上限；
 自动重试、compact、steer、abort 和自然结束保持 Pi 原生语义。每条自然语言输入发送前仍执行

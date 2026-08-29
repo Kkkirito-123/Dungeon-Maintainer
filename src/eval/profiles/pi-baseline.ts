@@ -13,7 +13,8 @@
 import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadConfig, requireApiKey } from "../../config.js";
+import { requireApiKey } from "../../config.js";
+import { loadEvalConfig } from "../config.js";
 import { resolvePiCliPath } from "../../app/pi-process.js";
 import { PiRpcProcess } from "../../pi/rpc-process.js";
 import { PI_BASELINE_PROVIDER_ID } from "./pi-baseline-provider.js";
@@ -118,7 +119,7 @@ export async function runPiBaseline(
     mkdir(sessionDirectory, { recursive: true }),
     mkdir(configDirectory, { recursive: true }),
   ]);
-  const config = loadConfig();
+  const config = loadEvalConfig();
   const apiKey = requireApiKey(config);
   let turns = 0;
   let toolCalls = 0;

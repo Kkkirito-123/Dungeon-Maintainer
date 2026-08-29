@@ -9,7 +9,7 @@
 import type { PlayJudge, PlayView } from "../../game/protocol.js";
 import type { EvalScenarioStep } from "./scenario.js";
 
-/** 证书与运行身份共同绑定的 Oracle 规则版本。 */
+/** 显式浏览器预检及其证书绑定的精确 Oracle 版本。 */
 export const EVAL_ORACLE_VERSION = "oracle-exact-final-state";
 
 export type EvalOraclePlanClass = "scan" | "search" | "placeholder" | "none";

@@ -42,12 +42,31 @@ function positiveInteger(value: unknown): boolean {
   return Number.isSafeInteger(value) && Number(value) >= 1;
 }
 
+function nonNegativeInteger(value: unknown): boolean {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function booleanOrNull(value: unknown): boolean {
+  return typeof value === "boolean" || value === null;
+}
+
+function judgeReasonCode(value: unknown): boolean {
+  return value === null
+    || value === "function-restored"
+    || value === "no-effective-change"
+    || value === "function-not-restored"
+    || value === "obvious-regression";
+}
+
 function isRunResult(value: unknown, runFingerprint: string): value is EvalRunResult {
   const result = record(value);
   const agentResult = record(result?.agentResult);
+  const externalCorrectness = record(result?.externalCorrectness);
+  const workflowClosure = record(result?.workflowClosure);
+  const judgeOutcome = record(result?.judgeOutcome);
   const identity = result?.identity === null ? null : record(result?.identity);
   return result !== null
-    && result.schemaVersion === 5
+    && result.schemaVersion === 6
     && typeof result.runId === "string"
     && typeof result.scenarioId === "string"
     && profile(result.profile)
@@ -55,8 +74,32 @@ function isRunResult(value: unknown, runFingerprint: string): value is EvalRunRe
     && (result.status === "passed" || result.status === "failed" || result.status === "infra_error")
     && agentResult !== null
     && (agentResult.status === "settled" || agentResult.status === "timeout" || agentResult.status === "infra_error")
-    && typeof agentResult.totalTokens === "number"
-    && typeof agentResult.toolCalls === "number"
+    && nonNegativeInteger(agentResult.durationMs)
+    && nonNegativeInteger(agentResult.totalDurationMs)
+    && nonNegativeInteger(agentResult.totalTokens)
+    && nonNegativeInteger(agentResult.toolCalls)
+    && nonNegativeInteger(agentResult.inspectCalls)
+    && nonNegativeInteger(agentResult.inspectExecutions)
+    && nonNegativeInteger(agentResult.inspectReceiptHits)
+    && nonNegativeInteger(agentResult.readCalls)
+    && (agentResult.diagnosisMs === null || nonNegativeInteger(agentResult.diagnosisMs))
+    && externalCorrectness !== null
+    && typeof externalCorrectness.sourcePatchMaterialized === "boolean"
+    && booleanOrNull(externalCorrectness.judgePassed)
+    && booleanOrNull(externalCorrectness.effectiveChange)
+    && workflowClosure !== null
+    && booleanOrNull(workflowClosure.paused)
+    && judgeOutcome !== null
+    && (judgeOutcome.status === "passed" || judgeOutcome.status === "failed" || judgeOutcome.status === "infra_error")
+    && typeof judgeOutcome.externalCorrectnessPassed === "boolean"
+    && booleanOrNull(judgeOutcome.workflowClosurePassed)
+    && (judgeOutcome.verdict === "passed" || judgeOutcome.verdict === "failed" || judgeOutcome.verdict === null)
+    && judgeReasonCode(judgeOutcome.reasonCode)
+    && (typeof judgeOutcome.modelId === "string" || judgeOutcome.modelId === null)
+    && nonNegativeInteger(judgeOutcome.inputTokens)
+    && nonNegativeInteger(judgeOutcome.outputTokens)
+    && nonNegativeInteger(judgeOutcome.totalTokens)
+    && nonNegativeInteger(judgeOutcome.durationMs)
     && (identity === null || identity.runFingerprint === runFingerprint);
 }
 
