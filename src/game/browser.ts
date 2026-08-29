@@ -1,9 +1,8 @@
 /**
- * Playwright Chromium 与协议 v3 页面客户端。
+ * Playwright Chromium 与协议 1.0 页面客户端。
  *
  * 浏览器使用全新临时 Context，不读取用户 Chrome Profile。所有页面调用都固定为
- * look/go/use/inputSql/query/judge/checkpoint，不接受模型 JavaScript、CSS 选择器或坐标；
- * inputSql 只接受文本并写入当前固定 textarea。
+ * look/act/query/judge/checkpoint，不接受模型 JavaScript、CSS 选择器或坐标。
  * headed Chromium 只打开维护器 Shell 页面；游戏本身作为 Shell 内的 iframe 加载，
  * 因此用户只看到一个可拖拽分栏的窗口。没有 Shell 地址时仅用于单元测试兼容直开游戏。
  */
@@ -140,7 +139,7 @@ export class GameBrowser {
   /**
    * 保存一次性页面检查点。
    *
-   * @throws 桥未安装或 sessionStorage 写入失败时拒绝，调用方不得继续 patch。
+   * @throws 桥未安装或 sessionStorage 写入失败时拒绝，调用方不得继续 edit。
    */
   async checkpoint(): Promise<void> {
     const saved = await this.needGameFrame().then((frame) => frame.evaluate(() => {
@@ -187,30 +186,21 @@ export class GameBrowser {
     return await this.call<PlayView>("look", []);
   }
 
-  /** 让桥内部执行有限 BFS 移动。 */
-  async go(
-    target: "objective" | "frontier",
+  /** 消费最新视图中的稳定动作。 */
+  async act(
+    revision: string,
+    actionId: string,
     maxSteps: number,
   ): Promise<PlayResult> {
     return await this.call<PlayResult>(
-      "go",
-      [target, Math.max(1, Math.min(64, maxSteps))],
+      "act",
+      [revision, actionId, Math.max(1, Math.min(64, maxSteps))],
     );
   }
 
-  /** 执行 look 返回的稳定动作 ID。 */
-  async use(actionId: string): Promise<PlayResult> {
-    return await this.call<PlayResult>("use", [actionId]);
-  }
-
-  /** 向当前已打开的固定玩家 textarea 写入 SQL，不执行查询或接受选择器。 */
-  async inputSql(sql: string): Promise<PlayResult> {
-    return await this.call<PlayResult>("inputSql", [sql]);
-  }
-
-  /** 点击当前玩家终端执行 textarea 现值，调用方不能传 SQL 参数。 */
-  async query(): Promise<PlayResult> {
-    return await this.call<PlayResult>("query", []);
+  /** 写入当前固定玩家 textarea 并点击真实执行控件。 */
+  async query(revision: string, sql: string): Promise<PlayResult> {
+    return await this.call<PlayResult>("query", [revision, sql]);
   }
 
   /** 读取隐藏验证摘要，不向模型工具暴露。 */
@@ -227,13 +217,13 @@ export class GameBrowser {
   }
 
   /** 返回已通过门禁的当前桥协议版本。 */
-  async protocolVersion(): Promise<3> {
+  async protocolVersion(): Promise<1> {
     const version = await this.needGameFrame().then((frame) => frame.evaluate(() => (
       (window as unknown as {
         __DUNGEON_PLAYTEST__?: { version?: number };
       }).__DUNGEON_PLAYTEST__?.version
     )));
-    if (version !== 3) throw new GameBrowserError("游戏桥协议版本不受支持");
+    if (version !== 1) throw new GameBrowserError("游戏桥协议版本不受支持");
     return version;
   }
 
@@ -243,7 +233,7 @@ export class GameBrowser {
       const version = (window as unknown as {
         __DUNGEON_PLAYTEST__?: { version?: number };
       }).__DUNGEON_PLAYTEST__?.version;
-      return version === 3;
+      return version === 1;
     });
     await currentFrame.waitForFunction(() => (
       document.querySelector("#app")?.getAttribute("data-runtime-state")
@@ -284,13 +274,13 @@ export class GameBrowser {
   }
 
   private async call<T>(
-    method: "look" | "go" | "use" | "inputSql" | "query" | "judge" | "events",
+    method: "look" | "act" | "query" | "judge" | "events",
     args: unknown[],
   ): Promise<T> {
     try {
       return await this.needGameFrame().then((frame) => frame.evaluate(
         async ({ name, values }) => {
-          if (name === "go" || name === "use") {
+          if (name === "act" || name === "query") {
             // 左侧输入框会让游戏 iframe 收到 blur，探索场景因此暂停外部移动和交互。
             // 在固定语义动作前重新聚焦游戏根节点，恢复真实页面输入状态；这里不接受
             // 模型选择器，也不伪造键盘或鼠标轨迹。

@@ -23,6 +23,7 @@ import { appendEvent } from "../../logging/events.js";
 import type { TaskStore } from "../../task/store.js";
 import type { TaskRecord } from "../../task/types.js";
 import { hashWorktree, readRepo, worktreeDiff } from "../../workspace/git.js";
+import { executeEvidenceQuery, type EvidenceInput } from "./evidence.js";
 
 /** `inspect` 的严格参数契约。 */
 export const InspectParameters = Type.Object({
@@ -34,6 +35,8 @@ export const InspectParameters = Type.Object({
     Type.Literal("read"),
     Type.Literal("read_many"),
     Type.Literal("diff"),
+    Type.Literal("evidence_list"),
+    Type.Literal("evidence_get"),
   ], {
     description: "定位源码默认选择 bundle；它会一次搜索并返回带 baseHash 的相关源码窗口。只有 bundle 上下文不足时才选择 search/read/read_many。",
   }),
@@ -50,6 +53,23 @@ export const InspectParameters = Type.Object({
     startLine: Type.Optional(Type.Integer({ minimum: 1, maximum: 1_000_000 })),
     lineCount: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_READ_LINES })),
   }, { additionalProperties: false }), { minItems: 1, maxItems: 4 })),
+  status: Type.Optional(Type.Union([
+    Type.Literal("active"),
+    Type.Literal("stale"),
+    Type.Literal("superseded"),
+    Type.Literal("all"),
+  ])),
+  kind: Type.Optional(Type.Union([
+    Type.Literal("source"),
+    Type.Literal("game"),
+    Type.Literal("check"),
+    Type.Literal("reproduction"),
+    Type.Literal("claim"),
+    Type.Literal("change"),
+    Type.Literal("verification"),
+  ])),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+  evidenceId: Type.Optional(Type.String({ pattern: "^[a-f0-9]{16}$" })),
 }, { additionalProperties: false });
 
 /** 注册工具所需的单任务依赖。 */
@@ -149,22 +169,42 @@ export function registerInspectTool(
   pi.registerTool({
     name: "inspect",
     label: "检查代码",
-    description: "查看 Git 状态、源码目录、一次性源码 bundle、文本搜索、分页文件或当前 Diff。",
+    description: "查看 Git 状态、源码、当前 Diff，或列出/回读当前任务证据。",
     promptSnippet: "用 inspect 获取代码与 Git 证据",
     promptGuidelines: [
       "定位源码时默认先用 inspect bundle；只有上下文不足时再补 read/read_many。",
-      "查看源码目录使用 inspect(action=files)；独立 tree 工具只管理 Git worktree。",
+      "查看源码目录使用 inspect(action=files)；workspace 只管理 Git worktree。",
       "多个已知代码符号可用空格分隔；整串零命中时会按字面符号回退。",
-      "修改前必须取得目标文件的 baseHash；bundle 窗口已包含可用于 patch 的 baseHash。",
+      "修改前必须取得目标文件的 baseHash；bundle 窗口已包含可用于 edit 的 baseHash。",
       "search/bundle 默认搜索仓库；已知目录时传 path 限定范围。",
       "bundle 最多返回 4 个 48 行窗口且总计不超过 192 行；ALREADY_SEEN 不需要再次读取。",
-      "bundle/read 已经显示能解释故障的实现时，立即使用 patch/write 做最小修改；首次写入会自动请求用户批准，不要为了扩大上下文继续泛搜。",
+      "bundle/read 已经显示能解释故障的实现时，立即使用 edit 做最小修改；首次写入会自动请求用户批准。",
+      "已有 evidence ID 时用 evidence_get；需要按状态或类型定位时用 evidence_list。",
     ],
     executionMode: "sequential",
     parameters: InspectParameters,
     async execute(_toolCallId, input, signal) {
       try {
-        const output = await inspectTask(context, input, signal);
+        if (input.action === "evidence_list" || input.action === "evidence_get") {
+          const evidenceInput: EvidenceInput = {
+            action: input.action === "evidence_list" ? "list" : "get",
+            ...(input.status === undefined ? {} : { status: input.status }),
+            ...(input.kind === undefined ? {} : { kind: input.kind }),
+            ...(input.limit === undefined ? {} : { limit: input.limit }),
+            ...(input.evidenceId === undefined ? {} : { evidenceId: input.evidenceId }),
+          };
+          const evidenceOutput = await executeEvidenceQuery(context, evidenceInput, signal);
+          await appendEvent(context.store, context.task.id, "tool.inspect", {
+            action: input.action,
+            outcome: "execution",
+            evidenceRevision: Number(evidenceOutput.details.revision),
+          });
+          return {
+            ...evidenceOutput,
+            details: { ...evidenceOutput.details },
+          };
+        }
+        const output = await inspectTask(context, input as InspectInput, signal);
         await appendEvent(context.store, context.task.id, "tool.inspect", {
           action: input.action,
           outcome: output.details.cacheKind === "exact" ? "receipt" : "execution",
@@ -175,7 +215,7 @@ export function registerInspectTool(
         });
         return {
           content: [{ type: "text", text: output.text }],
-          details: output.details,
+          details: { ...output.details },
         };
       } catch (error) {
         await appendEvent(context.store, context.task.id, "tool.inspect", {

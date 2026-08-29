@@ -21,13 +21,13 @@ export interface MaintainerInspectSummary {
   readonly receiptRatio: number;
 }
 
-/** 一整套 Eval 的 Agent、Judge、工具与时间汇总。 */
+/** 一整套 Eval 的 Agent、外部 Oracle、工具与时间汇总。 */
 export interface EvalUsageSummary {
   readonly agentTokens: number;
-  readonly judgeTokens: number;
   readonly totalTokens: number;
   readonly toolCalls: number;
   readonly sumAgentDurationMs: number;
+  readonly sumOracleDurationMs: number;
   readonly sumRunDurationMs: number;
   readonly suiteWallDurationMs: number;
 }
@@ -37,7 +37,7 @@ export interface EvalUsageSummary {
  *
  * @param results 已完成的低敏场景结果。
  * @param suiteWallDurationMs 从 Suite 开始到汇总的墙钟时间。
- * @returns Agent/Judge 分项 Token、工具次数和三种明确口径的毫秒耗时。
+ * @returns Agent Token、工具次数，以及 Agent、Oracle、Run、Suite 的明确耗时口径。
  */
 export function summarizeEvalUsage(
   results: readonly EvalRunResult[],
@@ -47,17 +47,16 @@ export function summarizeEvalUsage(
     (sum, result) => sum + result.agentResult.totalTokens,
     0,
   );
-  const judgeTokens = results.reduce(
-    (sum, result) => sum + result.judgeOutcome.totalTokens,
-    0,
-  );
   return {
     agentTokens,
-    judgeTokens,
-    totalTokens: agentTokens + judgeTokens,
+    totalTokens: agentTokens,
     toolCalls: results.reduce((sum, result) => sum + result.agentResult.toolCalls, 0),
     sumAgentDurationMs: results.reduce(
       (sum, result) => sum + result.agentResult.durationMs,
+      0,
+    ),
+    sumOracleDurationMs: results.reduce(
+      (sum, result) => sum + result.oracleOutcome.durationMs,
       0,
     ),
     sumRunDurationMs: results.reduce(

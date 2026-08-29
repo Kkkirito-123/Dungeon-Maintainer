@@ -54,7 +54,7 @@ src/
 ├─ app/                    # 启动、恢复和任务生命周期
 ├─ pi/                     # Pi 适配层
 │  ├─ extension.ts         # 薄装配入口
-│  ├─ native-write.ts      # 原生 write 批次、归因和刷新
+│  ├─ native-write.ts      # edit 授权、Hash 归因和刷新失败门禁
 │  ├─ request-lifecycle.ts # 输入、settled 和 shutdown
 │  ├─ tool-safety-gate.ts  # 授权、allowedPaths 和 realpath
 │  ├─ game-runtime.ts      # Vite/Chromium 生命周期
@@ -68,8 +68,8 @@ src/
 ├─ task/                   # TaskStore 和状态机
 ├─ logging/                # 脱敏事件和语义 Trace
 └─ eval/                   # 独立的内置评测
-   ├─ domain/              # Dataset、Scenario、预检 Oracle 和结果契约
-   ├─ execution/           # Workspace、LLM Judge、预检、Run、Worker Pool 和 Suite
+   ├─ domain/              # Dataset、Scenario、Browser Oracle 和结果契约
+   ├─ execution/           # Workspace、Browser Oracle、预检、Run、Worker Pool 和 Suite
    ├─ profiles/            # Maintainer 与 Pi Baseline
    ├─ reporting/           # Identity、checkpoint 和汇总
    └─ ui/                  # 本地进度页和 SSE
@@ -92,17 +92,17 @@ Oracle 结果。`tests/architecture.test.ts` 固定检查这些边界。
 
 ## 固定工具
 
-Pi 原生只加载完整文件写入工具 `write`。领域工具固定为：
+Pi 不加载任何原生工具或 Bash。模型工具固定且仅为：
 
 ```text
-inspect  evidence  patch  check  finish
-look     go        use    input_sql  query  tree
+inspect  edit  check  finish  workspace
+look     act   query
 ```
 
-- `inspect(files)` 查看源码目录；`tree` 专门查看或切换 Git worktree，两者不再同名。
-- `patch` 使用 `baseHash` 做唯一旧文本替换；`write` 写完整文件。
-- `look/go/use/input_sql/query` 只操作玩家可见游戏面。
-- `evidence` 只回读当前任务事实，不提供跨任务 Solution。
+- `inspect` 统一查看源码、Git 与当前任务 Evidence。
+- `edit` 使用当前 `baseHash` 做唯一替换、整文件写入或创建，并受精确路径授权和 3 文件/120 行预算约束。
+- `workspace` 只查看或切换合法 Git worktree，不能偷换当前会话 cwd。
+- `look/act/query` 只操作玩家可见游戏面；`act` 绑定最新 revision，`query` 合并 SQL 输入和真实提交。
 
 工具名是外部契约，不随内部文件拆分变化。
 
@@ -118,8 +118,7 @@ look     go        use    input_sql  query  tree
 | `EvalScenario` | 故障场景 | 公开任务、复现步骤和隐藏 Oracle 规格 |
 | `EvalRun` | 单次评测 | 一个 Scenario、Profile 和结果 |
 | `EvalSuite` | 评测集合 | 固定场景、重复次数和独立 Worker 的并行编排 |
-| `EvalJudge` | 功能判定 | Agent 结束后的单次 Flash LLM 宽松验收 |
-| `EvalOracle` | 浏览器规则 | 仅供显式预检匹配故障版与干净版 |
+| `EvalOracle` | 浏览器功能判定 | 正式 Run 的单次隐藏 after 验收，并供预检校准故障版与干净版 |
 | `EvalPreflight` | 浏览器诊断 | 可选地证明故障版失败且干净版通过，不阻塞 Suite |
 
 禁止使用不能表达领域含义的 `Manager`、`Helper`、`Utils`、`Common` 和泛化 `Service`。
@@ -165,19 +164,22 @@ created -> active -> verifying -> ready_to_apply -> applied
 EvalScenario
   -> 物化故障仓库
   -> 单个 Pi 修复
-  -> agent_settled
-  -> HEAD / 禁写路径 / 有效 Diff 门禁
-  -> 单次 Flash LLM Judge
-  -> schema v6 EvalRunResult / EvalSuiteReport
+  -> 首次 agent_settled
+  -> Profile 停止 Pi 并卸载本轮工具
+  -> 单次隐藏 after browser Oracle
+  -> schema v7 EvalRunResult / EvalSuiteReport
 ```
 
-Eval 内部为 Agent、Pi Baseline 和 Judge 复用当前 Key 与 Base URL，统一固定
-`deepseek-v4-flash` 并关闭 reasoning，不改变生产维护器默认模型。Judge 只读取公开任务、故障补丁
-和候选 Diff，不泄漏隐藏答案、不修改 Prompt、不控制工具选择；维护器工作流闭环只作为诊断字段。
+Eval 内部为 Agent 与 Pi Baseline 复用当前 Key 与 Base URL，统一固定 `deepseek-v4-flash` 并关闭
+reasoning，不改变生产维护器默认模型。首次 `agent_settled` 表示本次 Profile 正常结束；Profile 停止
+并卸载工具后，外层 Run 才启动隐藏 Browser Oracle，不再调用第二个模型，也不向 Agent 反馈结果。
 
-`EvalPreflight -> Browser Oracle` 是单独的显式诊断路径，默认 `run`、`suite` 和 `compare` 不运行、
-读取或要求预检证书。因此 Suite 通过只表示 Git 门禁和 LLM 功能验收通过，不表示浏览器端到端通过。
-详细命令、schema v6 和 Token/工具/时间统计口径见 [EVAL.md](EVAL.md)。
+故障成功物化是判分基础；PASS 只要求 `agentSettled && afterOracleMatched`。Eval 不比较候选代码、Diff
+或参考实现。每个 Run 拥有独立 Workspace、Pi Session、Vite 和 Chromium，Worker 之间不共享运行态。
+
+`EvalPreflight -> Browser Oracle` 是单独的显式校准路径，用于证明故障版失败且干净版通过；默认
+`run`、`suite` 和 `compare` 不读取或要求预检证书，而是各自只执行一次候选 after Oracle。
+详细命令、schema v7 和 Token/工具/时间统计口径见 [EVAL.md](EVAL.md)。
 
 ## 新手阅读顺序
 
@@ -202,5 +204,6 @@ pnpm test
 pnpm build
 ```
 
-游戏仍在开发时停在维护器自身门禁和 `pnpm eval -- check`；需要验证物化、浏览器和精确 Oracle 的
-真实集成时，再显式运行零模型 `preflight`。该诊断不阻塞默认 Suite。
+游戏仍在开发时停在维护器自身门禁和 `pnpm eval -- check`；需要校准故障版失败、干净版通过以及
+精确 Oracle 的真实集成时，再显式运行零模型 `preflight`。该校准不阻塞默认 Suite；正式 Run 仍会
+独立执行一次候选 after Oracle。

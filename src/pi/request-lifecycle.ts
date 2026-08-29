@@ -40,7 +40,7 @@ import { assertTaskSessionBinding } from "./session-policy.js";
 const REPAIR_ACTION_PATTERN = /(?:修复|修好|解决|排查|诊断|定位|调查|纠正|改掉|处理|实现|增加|支持|fix|debug|diagnos)/iu;
 const PROBLEM_PATTERN = /(?:问题|故障|错误|异常|bug|失败|不一致|不正确|不对|掉血|没法|无法|不能|看不见|卡住|崩溃|默认答案)/iu;
 const STRONG_REPAIR_PATTERN = /(?:修复|修好|解决|改掉|fix)|(?:(?:默认\s*(?:答案|SQL|查询)|题目).{0,24}(?:错|错误|不对|不一致))/iu;
-const GAME_FAILURE_EVIDENCE_TOOLS = new Set(["go", "use", "input_sql", "query"]);
+const GAME_FAILURE_EVIDENCE_TOOLS = new Set(["act", "query"]);
 
 interface RequestGameRuntime {
   ensure(): Promise<GameDriver>;
@@ -138,7 +138,7 @@ export function createRequestLifecycle(
     }
     if (task.state === "awaiting_approval") {
       // 进程中断时的确认框不能跨进程复用；恢复后清除摘要并回到 active，
-      // 下一次 patch 会基于新正文重新申请一次性审批。
+      // 下一次 edit 会基于新正文重新申请一次性审批。
       task.approval = null;
       await store.transition(task, "active");
     } else if (
@@ -267,7 +267,7 @@ export function createRequestLifecycle(
     // 不自动刷新、运行测试或验证；模型若未提交 finish(result)，用户可稍后显式 /verify。
     const inheritedWriteScope = hasActiveWriteScope(task);
     // 收权是安全状态变化，必须早于日志和遥测 I/O。即使后续持久化失败，当前
-    // Extension 也不能继续持有上一请求的原生 write/patch 执行授权。
+    // Extension 也不能继续持有上一请求的 edit 执行授权。
     if (isExecutionApproved() || inheritedWriteScope) setExecutionApproved(false);
     clearWriteAttributions();
     if (inheritedWriteScope) await store.closeWriteScope(task);

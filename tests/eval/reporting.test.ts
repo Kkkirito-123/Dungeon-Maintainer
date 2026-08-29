@@ -17,7 +17,7 @@ import type { EvalRunResult } from "../../src/eval/execution/run.js";
 
 function checkpointRun(scenarioId: string, runFingerprint: string): EvalRunResult {
   return {
-    schemaVersion: 6,
+    schemaVersion: 7,
     runId: "run-" + scenarioId,
     scenarioId,
     profile: "maintainer",
@@ -37,22 +37,16 @@ function checkpointRun(scenarioId: string, runFingerprint: string): EvalRunResul
     },
     externalCorrectness: {
       sourcePatchMaterialized: true,
-      judgePassed: true,
-      forbiddenPathsUntouched: true,
-      headUnchanged: true,
-      effectiveChange: true,
+      agentSettled: true,
+      afterOracleMatched: true,
     },
     workflowClosure: { paused: false },
-    judgeOutcome: {
+    oracleOutcome: {
       status: "passed",
       externalCorrectnessPassed: true,
       workflowClosurePassed: true,
-      verdict: "passed",
-      reasonCode: "function-restored",
-      modelId: "deepseek-v4-flash",
-      inputTokens: 4,
-      outputTokens: 2,
-      totalTokens: 6,
+      actionCount: 2,
+      browserErrorCount: 0,
       durationMs: 1,
     },
     identity: { runFingerprint },
@@ -60,7 +54,7 @@ function checkpointRun(scenarioId: string, runFingerprint: string): EvalRunResul
 }
 
 describe("Eval reporting", () => {
-  it("精确汇总 Agent、Judge、工具调用和时间", () => {
+  it("精确汇总 Agent、Oracle、工具调用和时间", () => {
     const results = [
       {
         agentResult: {
@@ -69,7 +63,7 @@ describe("Eval reporting", () => {
           durationMs: 1_200,
           totalDurationMs: 1_500,
         },
-        judgeOutcome: { totalTokens: 13 },
+        oracleOutcome: { durationMs: 13 },
       },
       {
         agentResult: {
@@ -78,16 +72,16 @@ describe("Eval reporting", () => {
           durationMs: 2_300,
           totalDurationMs: 2_900,
         },
-        judgeOutcome: { totalTokens: 17 },
+        oracleOutcome: { durationMs: 17 },
       },
     ] as EvalRunResult[];
 
     assert.deepEqual(summarizeEvalUsage(results, 3_456.7), {
       agentTokens: 303,
-      judgeTokens: 30,
-      totalTokens: 333,
+      totalTokens: 303,
       toolCalls: 16,
       sumAgentDurationMs: 3_500,
+      sumOracleDurationMs: 30,
       sumRunDurationMs: 4_400,
       suiteWallDurationMs: 3_457,
     });
@@ -145,11 +139,12 @@ describe("Eval reporting", () => {
         profile: "maintainer",
         repetitions: 1,
         expectedRuns: 2,
+        scenarioIds: ["first", "second"],
       }), true);
       assert.equal(evalSuiteCheckpointIsCompatible({
         ...checkpoint,
         results: [
-          { ...checkpoint.results[0], judgeOutcome: undefined },
+          { ...checkpoint.results[0], oracleOutcome: undefined },
           checkpoint.results[1],
         ],
       }, {
@@ -158,6 +153,7 @@ describe("Eval reporting", () => {
         profile: "maintainer",
         repetitions: 1,
         expectedRuns: 2,
+        scenarioIds: ["first", "second"],
       }), false);
       assert.deepEqual(read?.results.map((result) => result.scenarioId), ["first", "second"]);
       assert.equal((await readFile(join(root, "checkpoint.json"), "utf8")).endsWith("\n"), true);
@@ -167,7 +163,42 @@ describe("Eval reporting", () => {
         profile: "maintainer",
         repetitions: 1,
         expectedRuns: 2,
+        scenarioIds: ["first", "second"],
       }), false);
+
+      const expected = {
+        runFingerprint: checkpoint.runFingerprint,
+        datasetId: "eval-v1",
+        profile: "maintainer" as const,
+        repetitions: 1,
+        expectedRuns: 2,
+        scenarioIds: ["first", "second"],
+      };
+      assert.equal(evalSuiteCheckpointIsCompatible({
+        ...checkpoint,
+        results: [checkpoint.results[0], checkpoint.results[0]],
+      }, expected), false);
+      assert.equal(evalSuiteCheckpointIsCompatible({
+        ...checkpoint,
+        results: [checkpoint.results[0]],
+        runFailures: [{ scenarioId: "first", profile: "maintainer", repetition: 1, code: "infra" }],
+      }, expected), false);
+      assert.equal(evalSuiteCheckpointIsCompatible({
+        ...checkpoint,
+        results: [{ ...checkpoint.results[0], scenarioId: "outside" }, checkpoint.results[1]],
+      }, expected), false);
+      assert.equal(evalSuiteCheckpointIsCompatible({
+        ...checkpoint,
+        results: [{ ...checkpoint.results[0], repetition: 2 }, checkpoint.results[1]],
+      }, expected), false);
+      assert.equal(evalSuiteCheckpointIsCompatible({
+        ...checkpoint,
+        results: [{ ...checkpoint.results[0], identity: null }, checkpoint.results[1]],
+      }, expected), false);
+      assert.equal(evalSuiteCheckpointIsCompatible({
+        ...checkpoint,
+        results: [{ ...checkpoint.results[0], runId: "" }, checkpoint.results[1]],
+      }, expected), false);
     } finally {
       await rm(root, { recursive: true, force: true, maxRetries: 3 });
     }

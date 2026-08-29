@@ -23,7 +23,7 @@ export interface ShellTaskSwitchRequest {
 export type ShellPhase =
   | "diagnose"
   | "reproduce"
-  | "patch"
+  | "edit"
   | "verify"
   | "approval"
   | "compacting"

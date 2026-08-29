@@ -3,8 +3,9 @@
  *
  * 每次构建都直接加载当前分支编译出的 Maintainer Extension，因此 Prompt、领域工具、
  * 安全门禁和 Token 控制的后续修改会自动进入同一套游戏修复 Eval。运行器只负责建立
- * 隔离任务、自动确认 Eval 中唯一的完整方案审批并汇总低敏指标；案例、Oracle、
- * 检查和公开 Prompt 继续由 runner 统一提供。
+ * 隔离任务、自动确认 Eval 中唯一的完整方案审批并汇总低敏指标；第一次真实
+ * `agent_settled` 后停止 Pi、Shell 并卸载本轮工具。案例、隐藏 after Oracle、检查和公开
+ * Prompt 继续由外层 runner 统一提供，Profile 不参与功能判分。
  */
 
 import { mkdir } from "node:fs/promises";
@@ -15,7 +16,7 @@ import { loadEvalConfig } from "../config.js";
 import { PiRpcProcess } from "../../pi/rpc-process.js";
 import { startShellServer, type ShellHandle } from "../../shell/server.js";
 import { TaskStore } from "../../task/store.js";
-import { INITIAL_TASK_OBJECTIVE, type TaskState } from "../../task/types.js";
+import { INITIAL_TASK_OBJECTIVE } from "../../task/types.js";
 import { readRepo } from "../../workspace/git.js";
 import { createTaskWorktreeSnapshot } from "../../workspace/worktree.js";
 import type { ProfileRunMetrics, ProfileRunResult } from "../domain/result.js";
@@ -132,6 +133,33 @@ function requireEvalRpc(value: PiRpcProcess | null): PiRpcProcess {
   return value;
 }
 
+/** Maintainer 模型侧唯一会修改工作区的 1.0 工具。 */
+export function isMaintainerWriteTool(toolName: string): boolean {
+  return toolName === "edit";
+}
+
+/**
+ * 先停止 Pi，使 Extension 的 session_shutdown 卸载游戏 Browser/Vite 和模型工具，
+ * 再关闭只负责展示的 Shell。Profile 只有完成此边界后才会返回给外层 Oracle。
+ */
+export async function teardownMaintainerRuntime(input: {
+  readonly stopPi: () => Promise<void>;
+  readonly closeShell: () => Promise<void>;
+}): Promise<readonly ("pi-stop-failed" | "eval-shell-stop-failed")[]> {
+  const failures: ("pi-stop-failed" | "eval-shell-stop-failed")[] = [];
+  try {
+    await input.stopPi();
+  } catch {
+    failures.push("pi-stop-failed");
+  }
+  try {
+    await input.closeShell();
+  } catch {
+    failures.push("eval-shell-stop-failed");
+  }
+  return failures;
+}
+
 /**
  * 判断 Eval 是否需要自动回复一个 Extension UI 请求。
  *
@@ -174,24 +202,9 @@ export function evalShellEndpoint(shellUrl: string, path: string): string {
 }
 
 /**
- * 第一个真实 `agent_settled` 即表示本次自然请求的 Pi Agent Loop 已结束。
- * TaskState 只补充真实 blocked 分类；修复是否成功由随后独立运行的 LLM Judge 判断，
- * 不能再等待内部 Queue、paused 或 ready_to_apply 来替 Eval 判卷。
- */
-export function evalSettledDecision(input: {
-  readonly taskState: TaskState;
-}): { readonly failureCode: string | null } | null {
-  if (input.taskState === "blocked") return { failureCode: "maintainer-blocked" };
-  if (input.taskState === "paused") return { failureCode: "maintainer-paused" };
-  if (input.taskState === "ready_to_apply") return { failureCode: null };
-  return { failureCode: "maintainer-agent-incomplete" };
-}
-
-/**
  * 按真实 Agent Loop 是否结束区分语义失败与基础设施失败。
  *
- * incomplete、blocked 和 paused 都是已正常 settled 的 Agent 结果；只有未完成运行或
- * RPC/Shell/状态读取等错误才属于 infra_error。超时继续独立报告。
+ * Agent 一旦 settled 就交给外层功能 Oracle；只有未完成运行、超时或卸载失败会阻断。
  */
 export function classifyMaintainerRunStatus(input: {
   readonly completed: boolean;
@@ -201,15 +214,7 @@ export function classifyMaintainerRunStatus(input: {
   if (input.failureCode === "agent-timeout") return "timeout";
   if (input.infrastructureFailureCode) return "infra_error";
   if (!input.completed) return "infra_error";
-  if (
-    input.failureCode === null
-    || input.failureCode === "maintainer-agent-incomplete"
-    || input.failureCode === "maintainer-blocked"
-    || input.failureCode === "maintainer-paused"
-  ) {
-    return "settled";
-  }
-  return "infra_error";
+  return "settled";
 }
 
 /** 超时保持独立状态；其它情况下真实运行故障优先于 Agent 的正常收尾诊断。 */
@@ -234,6 +239,8 @@ export function buildPiMaintainerArguments(
  *
  * fixture 的故障补丁先暂存为任务基线，保证“修回正常 HEAD”仍会被工作区层识别为
  * Agent 增量。该暂存只发生在本轮临时仓库，外层 finally 会统一删除。
+ * 第一次真实 `agent_settled` 后本函数完成低敏统计并停止 Pi、Shell；只有 Profile 已返回、
+ * 本轮工具已卸载后，外层 Run 才会启动独立的隐藏 after browser Oracle。
  */
 export async function runPiMaintainer(
   options: PiMaintainerRunOptions,
@@ -297,18 +304,10 @@ export async function runPiMaintainer(
   });
   let rpc: PiRpcProcess | null = null;
   let shell: ShellHandle | null = null;
-  let settledClassification: Promise<void> = Promise.resolve();
-
   const markAgentSettled = (): void => {
     if (runState.completed) return;
     runState.completed = true;
     resolveCompleted();
-    settledClassification = store.read(task.id).then((currentTask) => {
-      const decision = evalSettledDecision({ taskState: currentTask.state });
-      if (decision) runState.failureCode ??= decision.failureCode;
-    }).catch(() => {
-      runState.infrastructureFailureCode ??= "maintainer-state-read-failed";
-    });
   };
 
   let stats: SessionStatsRecord = {};
@@ -418,7 +417,7 @@ export async function runPiMaintainer(
           if (signature === previousToolSignature) duplicateCalls += 1;
           previousToolSignature = signature;
           toolCalls += 1;
-          const isWrite = toolName === "write" || toolName === "patch";
+          const isWrite = isMaintainerWriteTool(toolName);
           if (runState.firstWriteAt === null && !isWrite) diagnosticToolCalls += 1;
           if (toolName === "read") readCalls += 1;
           if (toolName === "inspect") {
@@ -440,9 +439,6 @@ export async function runPiMaintainer(
         void store.read(task.id)
           .then((currentTask) => activeShell?.updateTask(currentTask))
           .catch(() => undefined);
-        if (eventRecord.type === "extension_error" || eventRecord.type === "pi_stderr") {
-          runState.infrastructureFailureCode ??= "pi-runtime-error";
-        }
       },
     );
     await rpc.start();
@@ -466,7 +462,6 @@ export async function runPiMaintainer(
       runState.failureCode = "agent-timeout";
       await rpc.send({ type: "abort" }).catch(() => undefined);
     }
-    await settledClassification;
     const statsRpc = requireEvalRpc(rpc);
     const statsResult = await requestWithDeadline(
       () => statsRpc.send({ type: "get_session_stats" }),
@@ -475,22 +470,14 @@ export async function runPiMaintainer(
     );
     const sessionStats = record(statsResult);
     if (sessionStats) stats = sessionStats;
-    else runState.infrastructureFailureCode ??= "pi-stats-rpc-failed";
-    shell.updateSessionStats(stats);
-    await store.read(task.id)
-      .then((currentTask) => shell?.updateTask(currentTask))
-      .catch(() => {
-        runState.infrastructureFailureCode ??= "maintainer-state-read-failed";
-      });
   } catch (error) {
     runState.infrastructureFailureCode ??= safeFailureCode(error);
   } finally {
-    await rpc?.stop().catch(() => {
-      runState.infrastructureFailureCode ??= "pi-stop-failed";
+    const teardownFailures = await teardownMaintainerRuntime({
+      stopPi: async () => await rpc?.stop(),
+      closeShell: async () => await shell?.close(),
     });
-    await shell?.close().catch(() => {
-      runState.infrastructureFailureCode ??= "eval-shell-stop-failed";
-    });
+    runState.infrastructureFailureCode ??= teardownFailures[0] ?? null;
   }
   const tokens = stats.tokens ?? {};
   const contextUsage = stats.contextUsage ?? {};
@@ -574,7 +561,7 @@ export async function runPiMaintainer(
       paused: finalTask.state === "paused",
     });
   } catch {
-    runState.infrastructureFailureCode ??= "maintainer-state-read-failed";
+    // 工作流闭环仅供诊断，功能成绩只由 settled 后的外层 Oracle 决定。
   }
   const evidenceGraph = await new EvidenceStore(dataDirectory, task)
     .list({ status: "all" }).then((records) => records.map((record) => ({

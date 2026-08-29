@@ -7,42 +7,33 @@
  * 放行写入门禁。这样既保留 Pi 原生 Coding 能力，又不会把“继续看看”之类普通
  * 回复误当成源码写入授权。
  *
- * 原生 write 使用 Pi 进程的本机权限，Pi 本身没有沙箱，因此 Extension 还必须
- * 对目标 realpath 做 detached worktree 边界校验。任意 bash 无法可靠限定路径，本版不加载。
+ * 源码写入统一由维护器自有 edit 执行；Pi 原生工具和任意 bash 均不加载。
  */
 
-/** 只加载可在方案批准后做路径门禁的原生写入工具。 */
-export const PI_BUILTIN_TOOLS = [
-  "write",
-] as const;
+/** 1.0 不加载任何 Pi 原生工具。 */
+export const PI_BUILTIN_TOOLS = [] as const;
 
 /** Dungeon Maintainer 额外注册的领域工具。 */
 export const MAINTAINER_TOOLS = [
   "inspect",
-  "evidence",
-  "patch",
+  "edit",
   "check",
   "finish",
+  "workspace",
   "look",
-  "go",
-  "use",
-  "input_sql",
+  "act",
   "query",
-  "tree",
 ] as const;
 
 /** 诊断阶段逻辑上允许的只读、固定检查和游戏复现工具。 */
 export const DIAGNOSIS_TOOLS = [
   "inspect",
-  "evidence",
   "check",
   "finish",
+  "workspace",
   "look",
-  "go",
-  "use",
-  "input_sql",
+  "act",
   "query",
-  "tree",
 ] as const;
 
 /** 用户批准完整方案后允许的全部原生与领域工具。 */

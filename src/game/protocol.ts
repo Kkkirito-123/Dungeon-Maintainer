@@ -2,7 +2,7 @@
  * 维护器与 SQL Dungeon 开发态桥的共享协议投影。
  *
  * 这些类型只包含可以进入 Pi 模型上下文的玩家可见状态和有限动作结果。当前已打开
- * textarea 中玩家可见的 SQL 可以进入 terminal；受控 inputSql 只写固定输入框，完整地图、隐藏答案、管理员答案字段、
+ * textarea 中玩家可见的 SQL 可以进入 terminal；受控 query 只写固定输入框，完整地图、隐藏答案、管理员答案字段、
  * 正式存档、背包和身份不在协议中。隐藏 judge 只供验证代码使用。
  */
 
@@ -10,6 +10,14 @@
 export interface PlayAction {
   id: string;
   label: string;
+  tool: "act" | "query";
+}
+
+export interface PlayTargetView {
+  kind: "reward" | "prerequisite-reward" | "shortcut-key" | "objective" | "frontier";
+  label: string;
+  prerequisites: readonly string[];
+  actionId: "objective" | "frontier";
 }
 
 export type PlayQueryStatusKind = "neutral" | "success" | "warning" | "error";
@@ -50,6 +58,7 @@ export interface PlayTerminalView {
 
 /** 经过游戏桥裁剪的玩家视图。 */
 export interface PlayView {
+  revision: string;
   floor: number;
   mode: string;
   hp: {
@@ -65,6 +74,7 @@ export interface PlayView {
     hintLevel: number;
   };
   actions: PlayAction[];
+  target: PlayTargetView | null;
   room: string;
   mission: {
     title: string;
@@ -113,20 +123,19 @@ export interface PlaytestEvent {
   summary: string;
 }
 
-/** 页面中 window.__DUNGEON_PLAYTEST__ 实现的当前协议 v3 投影。 */
+/** 页面中 window.__DUNGEON_PLAYTEST__ 实现的唯一协议 1.0 投影。 */
 export interface DungeonPlaytestBridge {
-  version: 3;
+  version: 1;
   readonly checkpointRestored: boolean;
   prepare(presetId: string): boolean;
   checkpoint(): boolean;
   look(): PlayView;
-  go(
-    target: "objective" | "frontier",
+  act(
+    revision: string,
+    actionId: string,
     maxSteps: number,
   ): Promise<PlayResult>;
-  use(actionId: string): Promise<PlayResult>;
-  inputSql(sql: string): Promise<PlayResult>;
-  query(): Promise<PlayResult>;
+  query(revision: string, sql: string): Promise<PlayResult>;
   judge(floor: number): PlayJudge;
   events(afterSequence: number): readonly PlaytestEvent[];
 }

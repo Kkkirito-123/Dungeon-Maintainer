@@ -13,7 +13,6 @@ import {
   readEvalDataset,
 } from "../domain/dataset.js";
 import { EVAL_ORACLE_VERSION } from "../domain/oracle.js";
-import { EVAL_JUDGE_VERSION } from "../config.js";
 import { runEvalPreflight, type EvalPreflightResult } from "./preflight.js";
 import { runEvalScenario, type EvalRunProfile, type EvalRunResult } from "./run.js";
 import type { EvalProgressEvent } from "./progress.js";
@@ -67,7 +66,7 @@ export interface EvalSuitePreflightResult {
 
 /** 完整 Suite 报告。 */
 export interface EvalSuiteResult {
-  readonly schemaVersion: 6;
+  readonly schemaVersion: 7;
   readonly status: "passed" | "failed";
   readonly datasetId: string;
   readonly datasetFingerprint: string;
@@ -102,6 +101,11 @@ interface EvalSuiteJob {
   readonly repetition: number;
   readonly order: number;
 }
+
+type EvalSuiteJobIdentity = Pick<
+  EvalSuiteJob,
+  "scenarioId" | "profile" | "repetition"
+>;
 
 /** 校验并限制 Worker 数。 */
 export function normalizeEvalWorkers(value: number | undefined, fallback: number): number {
@@ -159,6 +163,17 @@ function uniqueArchiveDirectory(root: string, label: string): string {
 
 function jobKey(input: Pick<EvalSuiteJob, "scenarioId" | "profile" | "repetition">): string {
   return input.scenarioId + ":" + input.profile + ":" + String(input.repetition);
+}
+
+/** 恢复时只有已产出功能结论的 job 可跳过；所有基础设施失败必须重跑。 */
+export function pendingEvalSuiteJobs<T extends EvalSuiteJobIdentity>(
+  jobs: readonly T[],
+  completedResults: readonly (EvalSuiteJobIdentity & Pick<EvalRunResult, "status">)[],
+): T[] {
+  const completedKeys = new Set(
+    completedResults.filter((result) => result.status !== "infra_error").map(jobKey),
+  );
+  return jobs.filter((job) => !completedKeys.has(jobKey(job)));
 }
 
 function runFailureCode(error: unknown): string {
@@ -286,7 +301,7 @@ export async function runEvalSuite(options: EvalSuiteOptions): Promise<EvalSuite
   );
   const runIdentity = await collectEvalRunIdentity({
     datasetFingerprint: dataset.fingerprint,
-    oracleVersion: EVAL_JUDGE_VERSION,
+    oracleVersion: EVAL_ORACLE_VERSION,
   });
   const selectedProfileCount = selectedProfile === "both" ? 2 : 1;
   const expectedRuns = dataset.scenarioIds.length * selectedProfileCount * options.repetitions;
@@ -303,9 +318,13 @@ export async function runEvalSuite(options: EvalSuiteOptions): Promise<EvalSuite
     profile: selectedProfile,
     repetitions: options.repetitions,
     expectedRuns,
+    scenarioIds: dataset.scenarioIds,
   });
-  const results: EvalRunResult[] = checkpointMatches ? [...priorCheckpoint.results] : [];
-  const runFailures: EvalRunFailure[] = checkpointMatches ? [...priorCheckpoint.runFailures] : [];
+  const results: EvalRunResult[] = checkpointMatches
+    ? priorCheckpoint.results.filter((result) => result.status !== "infra_error")
+    : [];
+  // 无论基础设施故障是否已包装成 RunResult，resume 都重新执行，而不是永久跳过。
+  const runFailures: EvalRunFailure[] = [];
   const jobs: EvalSuiteJob[] = [];
   for (let repetition = 1; repetition <= options.repetitions; repetition += 1) {
     for (let index = 0; index < dataset.scenarioIds.length; index += 1) {
@@ -336,18 +355,11 @@ export async function runEvalSuite(options: EvalSuiteOptions): Promise<EvalSuite
     }));
     return checkpointWrite;
   };
-  const completedKeys = new Set([
-      ...results.map(jobKey),
-      ...runFailures.map(jobKey),
-  ]);
-  const pendingJobs = jobs.filter((job) => !completedKeys.has(jobKey(job)));
+  const pendingJobs = pendingEvalSuiteJobs(jobs, results);
   await persistCheckpoint();
   const totals = () => ({
     completed: results.length + runFailures.length,
-    cumulativeTokens: results.reduce(
-      (sum, item) => sum + item.agentResult.totalTokens + item.judgeOutcome.totalTokens,
-      0,
-    ),
+    cumulativeTokens: results.reduce((sum, item) => sum + item.agentResult.totalTokens, 0),
     cumulativeToolCalls: results.reduce((sum, item) => sum + item.agentResult.toolCalls, 0),
   });
   await runEvalWorkerPool(pendingJobs, workers, async (job, workerId) => {
@@ -394,7 +406,7 @@ export async function runEvalSuite(options: EvalSuiteOptions): Promise<EvalSuite
   sortByOrder(runFailures);
   const summary = summarizeEvalSuiteRuns({ expectedRuns, results, runFailures });
   const output: EvalSuiteResult = {
-    schemaVersion: 6,
+    schemaVersion: 7,
     status: summary.status,
     datasetId: dataset.id,
     datasetFingerprint: dataset.fingerprint,
@@ -414,8 +426,8 @@ export async function runEvalSuite(options: EvalSuiteOptions): Promise<EvalSuite
     maintainerInspect: summarizeMaintainerInspect(results),
     usage: summarizeEvalUsage(results, performance.now() - suiteStartedAt),
     note: workers === 1
-      ? "功能结果由相同 Dataset 和一次 Flash LLM Judge 判定；单 Worker 的耗时可用于 Profile 对比。"
-      : "功能结果由一次 Flash LLM Judge 判定；多 Worker 会共享本机资源，因此耗时不用于 Profile 对比。",
+      ? "Agent 正常结束后由一次独立浏览器 Oracle 判定功能；单 Worker 的耗时可用于 Profile 对比。"
+      : "每个 Run 只执行一次独立浏览器 Oracle；多 Worker 会共享本机资源，因此耗时不用于 Profile 对比。",
   };
   await writeFile(join(archiveDirectory, "summary.json"), JSON.stringify({
     ...output,

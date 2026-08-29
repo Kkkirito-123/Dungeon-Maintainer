@@ -164,7 +164,7 @@ Agent 数据库或输出 Store。
 内容 ID、文案、SQL 契约与存档版本仍由原有
 权威模块负责。
 
-`src/devtools/dungeon-agent/` 只负责唯一的外部维护器协议 v3，维护器拒绝其它桥协议，并且始终只在开发态使用：`protocol.ts` 负责
+`src/devtools/dungeon-agent/` 只负责唯一的外部维护器协议 1.0，维护器拒绝其它桥协议，并且始终只在开发态使用：`protocol.ts` 负责
 协议类型与临时存储，`actions.ts` 负责固定 DOM 动作和可见覆盖层，`projection.ts` 负责玩家可见投影，
 `navigation.ts` 负责页面内部目标/frontier BFS 与停止原因，`query.ts` 负责浏览器内部固定查询执行，
 `trace.ts` 负责有限语义环形 Trace，`bridge.ts` 只负责协议生命周期装配。`src/application/main.ts` 只能
@@ -273,8 +273,8 @@ pnpm build
 
 - Dungeon Maintainer 桥只有在 `import.meta.env.DEV`、本机主机名和 `?playtest=agent` 同时匹配时安装。
   它使用页面内存 DataStore 和临时 Chromium `sessionStorage` 检查点，恢复后立即删除。桥只暴露
-  `checkpoint/look/go/use/inputSql/query/judge/events`；`inputSql` 只写当前固定玩家 textarea，
-  `query` 不接收 SQL 参数；Node 和模型不得收到隐藏答案、未揭示提示、完整地图、存档、背包、
+  `look/act/query/prepare/checkpoint/judge/events`；`query` 只把 SQL 写入当前固定玩家 textarea 并提交；
+  Node 和模型不得收到隐藏答案、未揭示提示、完整地图、存档、背包、
   身份或隐藏裁判详情。SQL 的唯一例外是当前玩家可见终端保持打开时，其 textarea 的当前值；
   已关闭终端与 `snapshot.adminAnswerSql` 始终在投影之外。生产构建不得暴露
   `window.__DUNGEON_PLAYTEST__`。

@@ -230,11 +230,11 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
 
   const toolActivity = (toolName: string): string => {
     if (toolName === "look") return "正在读取右侧游戏当前状态…";
-    if (["go", "use", "input_sql", "query"].includes(toolName)) return "正在右侧游戏中复现问题…";
-    if (["read", "grep", "find", "ls", "inspect", "tree"].includes(toolName)) {
+    if (["act", "query"].includes(toolName)) return "正在右侧游戏中复现问题…";
+    if (["inspect", "workspace"].includes(toolName)) {
       return "正在定位相关代码和证据…";
     }
-    if (["edit", "write", "patch"].includes(toolName)) {
+    if (toolName === "edit") {
       return "正在修改 detached worktree；右侧游戏会自动刷新…";
     }
     if (["bash", "check"].includes(toolName)) return "正在运行检查和验证…";
@@ -587,9 +587,9 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
     }
     if (event.type === "tool_execution_start") {
       const toolName = stringValue(event.toolName) ?? "tool";
-      const phase = toolName === "patch"
-        ? "patch"
-        : ["look", "go", "use", "input_sql", "query"].includes(toolName)
+      const phase = toolName === "edit"
+        ? "edit"
+        : ["look", "act", "query"].includes(toolName)
           ? "reproduce"
           : ["check", "finish"].includes(toolName)
             ? "verify"

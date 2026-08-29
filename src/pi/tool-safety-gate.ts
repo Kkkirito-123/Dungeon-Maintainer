@@ -7,7 +7,6 @@
  */
 
 import { createHash } from "node:crypto";
-import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { appendEvent } from "../logging/events.js";
 import { redactText } from "../logging/redact.js";
@@ -43,69 +42,25 @@ function safeFailure(error: unknown): string {
     || "未知安全错误";
 }
 
-function isWithinRoot(root: string, candidate: string): boolean {
-  const pathFromRoot = relative(resolve(root), resolve(candidate));
-  return pathFromRoot !== ""
-    && pathFromRoot !== ".."
-    && !pathFromRoot.startsWith(".." + sep)
-    && !isAbsolute(pathFromRoot);
-}
-
 async function requestedWritePaths(
   task: TaskRecord,
   toolName: string,
   input: Readonly<Record<string, unknown>>,
 ): Promise<string[]> {
-  if (toolName === "write") {
-    if (typeof input.path !== "string" || !input.path.trim()) {
-      throw new Error("原生写入缺少合法项目相对路径。");
-    }
-    return await validateWriteScopePaths(task.worktreeRoot, [input.path]);
-  }
-  if (toolName !== "patch" || !Array.isArray(input.edits) || input.edits.length === 0) {
-    throw new Error("patch 缺少合法 edits。");
+  if (toolName !== "edit" || !Array.isArray(input.edits) || input.edits.length === 0) {
+    throw new Error("edit 缺少合法 edits。");
   }
   const paths = input.edits.map((value) => {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error("patch 缺少合法 edits。");
+      throw new Error("edit 缺少合法 edits。");
     }
     const path = (value as Record<string, unknown>).path;
     if (typeof path !== "string" || !path.trim()) {
-      throw new Error("patch 缺少合法项目相对路径。");
+      throw new Error("edit 缺少合法项目相对路径。");
     }
     return path;
   });
   return await validateWriteScopePaths(task.worktreeRoot, paths);
-}
-
-async function nativeWritePathFailure(
-  task: TaskRecord,
-  input: Readonly<Record<string, unknown>>,
-): Promise<string | null> {
-  if (typeof input.path !== "string" || !input.path.trim()) {
-    return "原生写入缺少合法项目相对路径。";
-  }
-  const rawPath = input.path.trim();
-  if (rawPath.replace(/\\/gu, "/").split("/").includes("..")) {
-    return "原生写入路径不能包含 ..；只能修改当前 detached worktree。";
-  }
-  const candidate = resolve(task.worktreeRoot, rawPath);
-  if (
-    isAbsolute(rawPath)
-    && (candidate === resolve(task.repoRoot) || isWithinRoot(task.repoRoot, candidate))
-  ) {
-    return "原生写入不能使用正式仓库绝对路径；只能修改当前 detached worktree。";
-  }
-  if (!isWithinRoot(task.worktreeRoot, candidate)) {
-    return "原生写入路径已脱离当前 detached worktree。";
-  }
-  try {
-    assertWritePathAllowed(task, rawPath);
-    await resolveProjectPath(task.worktreeRoot, rawPath, "write");
-  } catch (error) {
-    return "原生写入路径未通过授权或 realpath 边界：" + safeFailure(error);
-  }
-  return null;
 }
 
 async function approvedPathFailure(
@@ -113,15 +68,14 @@ async function approvedPathFailure(
   toolName: string,
   input: Readonly<Record<string, unknown>>,
 ): Promise<string | null> {
-  if (toolName === "write") return await nativeWritePathFailure(task, input);
-  if (toolName !== "patch" || !Array.isArray(input.edits)) return "patch 缺少合法 edits。";
+  if (toolName !== "edit" || !Array.isArray(input.edits)) return "edit 缺少合法 edits。";
   for (const value of input.edits) {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
-      return "patch 缺少合法 edits。";
+      return "edit 缺少合法 edits。";
     }
     const path = (value as Record<string, unknown>).path;
     if (typeof path !== "string" || !path.trim()) {
-      return "patch 缺少合法项目相对路径。";
+      return "edit 缺少合法项目相对路径。";
     }
     try {
       const scoped = assertWritePathAllowed(task, path);
@@ -152,10 +106,10 @@ export class ToolSafetyGate {
   }
 
   /**
-   * 为当前 write/patch 取得授权并复核路径。任何拒绝都只影响当前工具调用。
+   * 为当前 edit 取得授权并复核路径。任何拒绝都只影响当前工具调用。
    */
   async authorize(
-    toolName: "write" | "patch",
+    toolName: "edit",
     input: Readonly<Record<string, unknown>>,
     context: ExtensionContext,
   ): Promise<ToolSafetyDecision> {

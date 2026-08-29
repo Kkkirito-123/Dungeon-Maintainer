@@ -11,7 +11,7 @@ function normalizedPath(value: string): string {
  *
  * 输入必须是 EvidenceStore.active() 的时间正序结果。优先链接目标文件源码窗口、包含
  * 这些窗口的 bundle、最近复现和最近 proposed；若目标文件没有精确窗口，则保留最近
- * 一条 source，避免直接 patch/write 产生没有任何诊断父节点的孤儿 change。
+ * 一条 source，避免直接 edit 产生没有任何诊断父节点的孤儿 change。
  */
 export function selectChangeUpstreamIds(
   active: readonly EvidenceRecord[],

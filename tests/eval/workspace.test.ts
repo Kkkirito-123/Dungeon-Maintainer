@@ -167,7 +167,7 @@ describe("Agent Eval fixture materializer", () => {
       ]);
       assert.equal(
         result.sourceFingerprint,
-        "7ee27a0d9d10ee2cb48b96d04d041d6eacc3898dcfbdf9fc12af65f9ea6095df",
+        "601281631fac050336a04c81a4cc450e36dabee9ab45655bc21e0030c8e45a57",
       );
       assert.match(
         await readFile(

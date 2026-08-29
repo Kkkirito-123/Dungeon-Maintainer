@@ -20,8 +20,23 @@ import type {
 import type { VisibleOverlayState } from "./actions";
 import { findDungeonAgentObjective } from "./navigation";
 
-function action(id: string, label: string): DungeonAgentAction {
-  return { id, label };
+function action(
+  id: string,
+  label: string,
+  tool: DungeonAgentAction["tool"] = "act",
+): DungeonAgentAction {
+  return { id, label, tool };
+}
+
+/** 由玩家可见投影生成短修订号，不包含坐标、地图或隐藏字段。 */
+function viewRevision(value: unknown): string {
+  const text = JSON.stringify(value);
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
 const EMPTY_OVERLAY: VisibleOverlayState = {
@@ -85,8 +100,9 @@ export function buildDungeonAgentView(
   overlay: VisibleOverlayState = EMPTY_OVERLAY,
 ): DungeonAgentView {
   const actions: DungeonAgentAction[] = [];
+  const objective = findDungeonAgentObjective(snapshot);
   const addMovementAction = (): void => {
-    if (findDungeonAgentObjective(snapshot)) {
+    if (objective) {
       actions.push(action(
         "objective",
         `沿真实路线前往${snapshot.navigationGuidance.objectiveTitle ?? "当前主线目标"}`,
@@ -110,9 +126,9 @@ export function buildDungeonAgentView(
     if (overlay.terminal?.kind !== "combat") {
       actions.push(action("terminal", "打开当前 SQL 战斗终端"));
     }
-    actions.push(action("query", "执行当前终端中的 SQL"));
+    actions.push(action("query", "执行当前终端中的 SQL", "query"));
   } else if (snapshot.mode === "challenge") {
-    actions.push(action("query", "执行当前终端中的 SQL 密文"));
+    actions.push(action("query", "执行当前终端中的 SQL 密文", "query"));
     actions.push(action("leave-challenge", "安全退出当前 SQL 密文终端"));
   } else if (snapshot.mode === "campfire") {
     actions.push(action("rest", "在此休息"), action("leave", "离开篝火"));
@@ -127,7 +143,22 @@ export function buildDungeonAgentView(
     actions.push(action("continue", "继续 MIGRATE 终章"));
   }
 
-  return {
+  const target = snapshot.mode === "explore"
+    ? objective
+      ? {
+          kind: "objective" as const,
+          label: snapshot.navigationGuidance.objectiveTitle ?? "当前主线目标",
+          prerequisites: [],
+          actionId: "objective" as const,
+        }
+      : {
+          kind: "frontier" as const,
+          label: "最近的未知可走区域",
+          prerequisites: [],
+          actionId: "frontier" as const,
+        }
+    : null;
+  const visible = {
     floor: snapshot.floor,
     mode: snapshot.mode,
     hp: {
@@ -143,6 +174,7 @@ export function buildDungeonAgentView(
       hintLevel: snapshot.hintLevel,
     },
     actions,
+    target,
     room: snapshot.currentRoomTitle,
     mission: {
       title: snapshot.missionTitle,
@@ -153,5 +185,9 @@ export function buildDungeonAgentView(
     terminal: terminalView(snapshot, overlay),
     prompt: snapshot.interactionPrompt,
     banner: snapshot.banner,
+  };
+  return {
+    revision: viewRevision(visible),
+    ...visible,
   };
 }

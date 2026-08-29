@@ -188,9 +188,6 @@ export async function runPiBaseline(
         runtimeState.settled = true;
         resolveSettled();
       }
-      if (value.type === "extension_error" || value.type === "pi_stderr") {
-        failureCode ??= "pi-runtime-error";
-      }
     },
   );
 
@@ -215,7 +212,6 @@ export async function runPiBaseline(
       null,
     ));
     if (statsResult) stats = statsResult;
-    else failureCode ??= "pi-stats-rpc-failed";
   } catch (error) {
     failureCode ??= safeFailureCode(error);
   } finally {

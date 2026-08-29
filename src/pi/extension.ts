@@ -2,8 +2,8 @@
  * Dungeon Maintainer 的唯一 Pi Extension 装配入口。
  *
  * 本文件只创建单任务依赖，注册 Provider、固定工具与命令，并按 Pi 事件流连接安全策略、
- * 请求生命周期和写入协调器。具体请求状态在 `request-lifecycle.ts`，原生 write/patch 的
- * 刷新与结果分类在 `native-write.ts`，游戏进程在 `game-runtime.ts`。
+ * 请求生命周期和写入协调器。具体请求状态在 `request-lifecycle.ts`，edit 的写后结果
+ * 分类在 `native-write.ts`，游戏进程在 `game-runtime.ts`。
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -108,8 +108,6 @@ export function installDungeonMaintainerExtension(
   const nativeWrite = createNativeWriteCoordinator({
     task,
     store,
-    evidence,
-    gameRuntime,
     safetyGate,
   });
   const requests = createRequestLifecycle({
