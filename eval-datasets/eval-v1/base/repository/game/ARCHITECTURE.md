@@ -258,7 +258,7 @@ encounter rates, navigation thresholds, and storage limits.
 It must never contain provider credentials. Content IDs, prose, SQL contracts,
 and save versions remain with their existing authorities.
 
-`src/devtools/dungeon-agent/` owns the sole external maintainer protocol v3 and remains
+`src/devtools/dungeon-agent/` owns the sole external maintainer protocol 1.0 and remains
 development-only. The maintainer rejects every other bridge protocol.
 `protocol.ts` owns types and temporary storage, `actions.ts` owns fixed DOM actions and visible
 overlays, `projection.ts` owns the player-visible view, `navigation.ts` owns internal target/frontier
@@ -419,8 +419,8 @@ static output is `dist/`; serve it through HTTP rather than opening files throug
 - The Dungeon Maintainer bridge is installed only when `import.meta.env.DEV`, a localhost
   hostname, and `?playtest=agent` all match. It uses a page-memory DataStore and a temporary
   Chromium `sessionStorage` checkpoint that is deleted immediately after restore. The bridge
-  exposes only `checkpoint/look/go/use/inputSql/query/judge/events`; `inputSql` writes only the
-  current fixed player textarea, while `query` has no SQL parameter. Node and the model never receive
+  exposes only `look/act/query/prepare/checkpoint/judge/events`; `query` writes SQL only to the
+  current fixed player textarea and submits through the real control. Node and the model never receive
   hidden answers, unrevealed hints, complete maps, saves, inventory, identity, or hidden judge
   details. The only SQL exception is the current value of a player-visible textarea while its
   terminal is open; closed terminals and `snapshot.adminAnswerSql` remain outside the projection.

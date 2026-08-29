@@ -15,8 +15,8 @@ describe("GameContractCheck", () => {
         scripts: { test: "test", build: "build", "architecture:check": "architecture" },
       }), "utf8");
       await writeFile(join(protocolDirectory, "protocol.ts"), [
-        "interface Bridge { readonly version: 3;",
-        "look(): void; go(): void; use(): void; inputSql(): void; query(): void;",
+        "interface Bridge { readonly version: 1;",
+        "look(): void; act(): void; query(): void;",
         "prepare(): void; checkpoint(): void; judge(): void; events(): void; }",
       ].join("\n"), "utf8");
       const result = await runGameContractCheck(root);

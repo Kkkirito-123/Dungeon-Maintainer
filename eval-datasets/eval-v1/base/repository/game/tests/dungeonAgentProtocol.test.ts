@@ -81,14 +81,14 @@ describe("Dungeon Agent 开发态协议", () => {
     const trace = new DungeonAgentTrace(2);
     trace.record("look", "floor=1 mode=explore");
     trace.record("query", "SELECT * FROM monsters");
-    trace.record("go", "target=objective steps=4 result=mode");
+    trace.record("act", "action=objective steps=4 result=mode");
 
     expect(trace.eventsAfter(0)).toEqual([
       { sequence: 2, type: "query", summary: "[查询正文未记录]" },
-      { sequence: 3, type: "go", summary: "target=objective steps=4 result=mode" },
+      { sequence: 3, type: "act", summary: "action=objective steps=4 result=mode" },
     ]);
     expect(trace.eventsAfter(2)).toEqual([
-      { sequence: 3, type: "go", summary: "target=objective steps=4 result=mode" },
+      { sequence: 3, type: "act", summary: "action=objective steps=4 result=mode" },
     ]);
   });
 });

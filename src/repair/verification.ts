@@ -55,7 +55,7 @@ export async function verifyTask(
   driver: GameDriver | null,
   signal?: AbortSignal,
 ): Promise<VerificationResult> {
-  // Pi 原生 write 不经过 patch 工具；验证前以 Git 事实同步变化，确保固定
+  // edit 的写后元数据可能在进程中断前尚未持久化；验证前以 Git 事实同步变化，确保固定
   // 检查、补丁封装和 apply 看到同一组文件，而不是依赖模型是否主动登记路径。
   await syncWorktreeChanges(store, task, "verify", evidence);
   if (task.changedPaths.length === 0) {

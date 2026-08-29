@@ -7,7 +7,8 @@ import {
 import { buildPiBaselineArguments } from "../../src/eval/profiles/pi-baseline.js";
 import {
   classifyMaintainerRunStatus,
-  evalSettledDecision,
+  isMaintainerWriteTool,
+  teardownMaintainerRuntime,
 } from "../../src/eval/profiles/maintainer.js";
 import { requestWithDeadline } from "../../src/eval/profiles/rpc-deadline.js";
 import { buildMaintainerWorkflowClosure } from "../../src/eval/domain/result.js";
@@ -40,10 +41,37 @@ describe("Pi Eval baseline 来源", () => {
     assert.equal(args.includes("--no-extensions"), true);
   });
 
-  it("Maintainer settled 分类不再依赖无效 queueActive 或固定延迟", () => {
-    assert.deepEqual(evalSettledDecision({ taskState: "ready_to_apply" }), { failureCode: null });
-    assert.deepEqual(evalSettledDecision({ taskState: "paused" }), { failureCode: "maintainer-paused" });
-    assert.equal(classifyMaintainerRunStatus({ completed: true, failureCode: "maintainer-paused" }), "settled");
+  it("Maintainer 只按真实 settled、超时和卸载结果分类", () => {
+    assert.equal(classifyMaintainerRunStatus({ completed: true, failureCode: null }), "settled");
+    assert.equal(classifyMaintainerRunStatus({ completed: false, failureCode: null }), "infra_error");
+    assert.equal(classifyMaintainerRunStatus({ completed: false, failureCode: "agent-timeout" }), "timeout");
+  });
+
+  it("1.0 只把 edit 计为写调用", () => {
+    assert.equal(isMaintainerWriteTool("edit"), true);
+    for (const legacyTool of ["write", "patch", "evidence", "tree", "go", "use", "input_sql"]) {
+      assert.equal(isMaintainerWriteTool(legacyTool), false);
+    }
+  });
+
+  it("settled 后先停止 Pi 和游戏工具，再关闭 Shell", async () => {
+    const lifecycle: string[] = [];
+    const failures = await teardownMaintainerRuntime({
+      stopPi: async () => { lifecycle.push("pi-and-game-tools-stopped"); },
+      closeShell: async () => { lifecycle.push("shell-closed"); },
+    });
+    assert.deepEqual(failures, []);
+    assert.deepEqual(lifecycle, ["pi-and-game-tools-stopped", "shell-closed"]);
+
+    const failedLifecycle: string[] = [];
+    assert.deepEqual(await teardownMaintainerRuntime({
+      stopPi: async () => {
+        failedLifecycle.push("pi-stop-attempted");
+        throw new Error("expected");
+      },
+      closeShell: async () => { failedLifecycle.push("shell-still-closed"); },
+    }), ["pi-stop-failed"]);
+    assert.deepEqual(failedLifecycle, ["pi-stop-attempted", "shell-still-closed"]);
   });
 
   it("区分写入尝试、真实 mutation 和最终保留变更", () => {

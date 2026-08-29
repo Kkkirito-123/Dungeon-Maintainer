@@ -6,7 +6,7 @@
  * 当前 Agent 运行开放 Pi 原生 Coding 工具。它不相信模型声称测试通过；`result` 会自动
  * 调用 repair verification，只有固定检查、刷新重放和隐藏断言全部通过才进入 ready_to_apply。
  * `/verify` 仅作为用户显式重试入口，正式仓库仍只能由 `/apply` 修改。
- * SQL、答案、完整地图、存档和凭据会在持久化前脱敏。复现缺少真实 go/use/input_sql/query
+ * SQL、答案、完整地图、存档和凭据会在持久化前脱敏。复现缺少真实 act/query
  * 动作时明确拒绝，避免把单次 look 当成运行证据。
  */
 
@@ -220,8 +220,8 @@ export function registerFinishTool(
     promptSnippet: "可用 proposed 预先说明多文件方案；完成后用 result 保存结果",
     promptGuidelines: [
       "运行时问题复现成功后，以 reproduced 保存语义动作及至少一项修复后应满足的结构化结果断言；不要把当前故障值当成断言。",
-      "首次 query-accepted 已经证明 stageIndex 未按期望推进时立即 reproduced，不要再追加 input_sql/query 确认；阶段目标使用 minStageIndex。",
-      "用户要求修复时，定位病因后可直接 patch/write；首次写入会自动申请精确文件权限。只有需要提前说明多文件方案时才用 proposed。",
+      "首次 query-accepted 已经证明 stageIndex 未按期望推进时立即 reproduced，不要再追加 query 确认；阶段目标使用 minStageIndex。",
+      "用户要求修复时，定位病因后可直接 edit；首次写入会自动申请精确文件权限。只有需要提前说明多文件方案时才用 proposed。",
       "代码修改后用 result；工具会自动运行当前代码的固定检查、刷新重放和隐藏断言，失败时继续修复。",
       "确认无法继续且原因客观时才用 blocked。",
     ],
@@ -348,7 +348,7 @@ export function registerFinishTool(
           "",
           "风险：" + risk,
           "",
-          "确认后将为当前 Agent 运行开放 Pi 原生 write 与精确 patch，并在 detached worktree 一次执行完整方案。",
+          "确认后将为当前 Agent 运行开放受限 edit，并在 detached worktree 一次执行完整方案。",
         ].join("\n");
         const factLinks = (await context.evidence.active())
           .filter((record) => (
@@ -469,7 +469,7 @@ export function registerFinishTool(
               ? "证据提示：" + evidenceWarnings.join(" ")
               : "",
             executionApproved === true
-              ? "用户已批准方案，调查阶段结束；立即在 allowedPaths 内使用 patch/write 完整执行，不要再次询问或遍历 evidence。只有缺少精确 oldText/baseHash 时才定向回读对应文件一次。"
+              ? "用户已批准方案，调查阶段结束；立即在 allowedPaths 内使用 edit 完整执行，不要再次询问或遍历 Evidence。只有缺少精确 oldText/baseHash 时才定向回读对应文件一次。"
               : "",
             executionApproved === false ? "用户未批准执行；worktree 保持不变。" : "",
             reproductionId ? "复现：" + reproductionId : "",

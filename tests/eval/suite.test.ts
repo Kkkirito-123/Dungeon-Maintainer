@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
   evalSuiteProfiles,
   normalizeEvalWorkers,
+  pendingEvalSuiteJobs,
   runEvalWorkerPool,
 } from "../../src/eval/execution/suite.js";
 
@@ -38,5 +39,17 @@ describe("EvalSuite Worker", () => {
     });
     assert.deepEqual([...visited].sort(), [1, 2, 3]);
     assert.deepEqual(results.map((entry) => entry.status), ["fulfilled", "rejected", "fulfilled"]);
+  });
+
+  it("resume 只跳过功能结论，所有基础设施失败对应 Job 都会重跑", () => {
+    const jobs = [
+      { scenarioId: "complete", profile: "maintainer" as const, repetition: 1 },
+      { scenarioId: "infra-failed", profile: "maintainer" as const, repetition: 1 },
+    ];
+    const completedResults = [
+      { scenarioId: "complete", profile: "maintainer" as const, repetition: 1, status: "passed" as const },
+      { scenarioId: "infra-failed", profile: "maintainer" as const, repetition: 1, status: "infra_error" as const },
+    ];
+    assert.deepEqual(pendingEvalSuiteJobs(jobs, completedResults), jobs.slice(1));
   });
 });

@@ -65,7 +65,17 @@ describe("1.0 启动与 Extension 职责分区", () => {
     assert.doesNotMatch(extension, /on\("context"/u);
     assert.doesNotMatch(extension, /triggerTurn\s*:\s*true/u);
     assert.doesNotMatch(extension, /transition\(task,\s*"paused"/u);
-    assert.match(toolIndex, /registerEvidenceTool/u);
+    for (const registration of [
+      "registerInspectTool",
+      "registerEditTool",
+      "registerCheckTool",
+      "registerFinishTool",
+      "registerGameTools",
+      "registerWorkspaceTool",
+    ]) {
+      assert.match(toolIndex, new RegExp(registration, "u"));
+    }
+    assert.doesNotMatch(toolIndex, /registerEvidenceTool/u);
     assert.match(sessionPolicy, /session_before_switch/u);
     assert.match(gameRuntime, /startGameServer\(/u);
   });

@@ -2,7 +2,7 @@
  * 当前游戏仓库的独立静态合同检查。
  *
  * GameContractCheck 不读取 EvalDataset，也不运行场景。它只确认维护器可见的游戏目录、
- * 固定脚本和开发桥 v3 仍存在，让游戏开发与冻结 Eval 数据互不修改。
+ * 固定脚本和协议 1.0 开发桥仍存在，让游戏开发与冻结 Eval 数据互不修改。
  */
 
 import { lstat, readFile, realpath } from "node:fs/promises";
@@ -58,8 +58,8 @@ export async function runGameContractCheck(
     );
     const protocol = await readFile(protocolPath, "utf8");
     checks.push(
-      { id: "playtest-protocol-v3", passed: /readonly version:\s*3;/u.test(protocol) },
-      { id: "playtest-player-actions", passed: ["look", "go", "use", "inputSql", "query"]
+      { id: "playtest-protocol", passed: /readonly version:\s*1;/u.test(protocol) },
+      { id: "playtest-player-actions", passed: ["look", "act", "query"]
         .every((name) => protocol.includes(name + "(")) },
       { id: "playtest-oracle-actions", passed: ["prepare", "checkpoint", "judge", "events"]
         .every((name) => protocol.includes(name + "(")) },

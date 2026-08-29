@@ -1,8 +1,8 @@
 /**
  * Pi 的 SQL Dungeon 语义游戏工具。
  *
- * 本文件只暴露 `look/go/use/input_sql/query` 五种高层动作。模型不能提交 JavaScript、选择器、
- * 鼠标坐标或按键轨迹；input_sql 只向当前固定 textarea 写入文本，query 不接受 SQL 参数。
+ * 本文件只暴露 `look/act/query` 三种高层动作。模型不能提交 JavaScript、选择器、
+ * 鼠标坐标或按键轨迹；query 只向当前固定 textarea 写入文本并点击真实提交控件。
  * GameDriver 负责建立复现起点和 500 条环形 Trace，本层再把动作类型与有限状态写入
  * events.jsonl。浏览器不可用、桥版本不符或动作失败都会作为明确工具结果返回，
  * 不会改动正式仓库或用户浏览器 Profile。
@@ -17,21 +17,17 @@ import type { TaskStore } from "../../task/store.js";
 import type { TaskRecord } from "../../task/types.js";
 
 const EmptyParameters = Type.Object({}, { additionalProperties: false });
-const GoParameters = Type.Object({
-  target: Type.Union([
-    Type.Literal("objective"),
-    Type.Literal("frontier"),
-  ]),
-  maxSteps: Type.Integer({ minimum: 1, maximum: 64 }),
-}, { additionalProperties: false });
-const UseParameters = Type.Object({
+const ActParameters = Type.Object({
+  revision: Type.String({ pattern: "^[a-f0-9]{8}$" }),
   actionId: Type.String({
     minLength: 1,
     maxLength: 64,
     pattern: "^[a-zA-Z0-9:_-]+$",
   }),
+  maxSteps: Type.Integer({ minimum: 1, maximum: 64 }),
 }, { additionalProperties: false });
-const InputSqlParameters = Type.Object({
+const QueryParameters = Type.Object({
+  revision: Type.String({ pattern: "^[a-f0-9]{8}$" }),
   sql: Type.String({ minLength: 1, maxLength: 16 * 1024 }),
 }, { additionalProperties: false });
 const MODEL_TEXT_LIMIT = 1_200;
@@ -85,6 +81,7 @@ function terminalForModel(terminal: PlayTerminalView | null): unknown {
 
 function viewForModel(view: PlayView): unknown {
   return {
+    revision: view.revision,
     floor: view.floor,
     mode: view.mode,
     terminal: terminalForModel(view.terminal),
@@ -94,6 +91,7 @@ function viewForModel(view: PlayView): unknown {
     hp: view.hp,
     progress: view.progress,
     actions: view.actions,
+    target: view.target,
     room: view.room,
     record: view.record,
   };
@@ -120,7 +118,7 @@ export function serializeGameToolResult(value: PlayView | PlayResult): string {
 }
 
 /**
- * 向单个 Pi 会话注册五个语义游戏工具。
+ * 向单个 Pi 会话注册三个语义游戏工具。
  *
  * @param pi 当前 Extension API。
  * @param context 与当前 headed Chromium 绑定的依赖。
@@ -147,20 +145,21 @@ export function registerGameTools(
   });
 
   pi.registerTool({
-    name: "go",
-    label: "移动探索",
-    description: "让开发桥按真实地图规则前往当前主线目标或最近 frontier，最多执行 64 个真实移动步；objective 会在同一次工具调用内跨过无需决策的中途 action/task 边界。",
-    promptSnippet: "用 go 执行可重放的语义移动",
+    name: "act",
+    label: "执行游戏动作",
+    description: "执行最新 look 返回的 actionId；移动最多 64 个真实步并在 E 交互处停止，其它动作只点击固定可见控件。",
+    promptSnippet: "用 act 消费最新 look 的修订和动作",
     executionMode: "sequential",
-    parameters: GoParameters,
+    parameters: ActParameters,
     async execute(_toolCallId, input, signal) {
       signal?.throwIfAborted();
-      const result = await context.requireDriver().go(
-        input.target,
+      const result = await context.requireDriver().act(
+        input.revision,
+        input.actionId,
         input.maxSteps,
       );
-      await appendEvent(context.store, context.task.id, "game.go", {
-        target: input.target,
+      await appendEvent(context.store, context.task.id, "game.act", {
+        actionId: input.actionId,
         maxSteps: input.maxSteps,
         steps: result.steps,
         ok: result.ok,
@@ -171,54 +170,17 @@ export function registerGameTools(
   });
 
   pi.registerTool({
-    name: "use",
-    label: "执行交互",
-    description: "执行 look 返回的稳定 actionId，例如调查、关闭记录、休息或领取战利品。",
-    promptSnippet: "用 use 执行玩家可见的稳定交互",
-    executionMode: "sequential",
-    parameters: UseParameters,
-    async execute(_toolCallId, input, signal) {
-      signal?.throwIfAborted();
-      const result = await context.requireDriver().use(input.actionId);
-      await appendEvent(context.store, context.task.id, "game.use", {
-        actionId: input.actionId,
-        ok: result.ok,
-        event: result.event,
-      });
-      return { content: [{ type: "text", text: serializeGameToolResult(result) }], details: result };
-    },
-  });
-
-  pi.registerTool({
-    name: "input_sql",
-    label: "填写 SQL",
-    description: "把 SQL 文本写入当前已打开的固定玩家 textarea；不执行查询，不接受选择器、脚本或坐标，也不读取隐藏答案。",
-    promptSnippet: "用 input_sql 把你的 SQL 写入当前终端，再用 query 提交",
-    executionMode: "sequential",
-    parameters: InputSqlParameters,
-    async execute(_toolCallId, input, signal) {
-      signal?.throwIfAborted();
-      const result = await context.requireDriver().inputSql(input.sql);
-      await appendEvent(context.store, context.task.id, "game.input-sql", {
-        inputLength: input.sql.length,
-        ok: result.ok,
-        event: result.event,
-      });
-      return { content: [{ type: "text", text: serializeGameToolResult(result) }], details: result };
-    },
-  });
-
-  pi.registerTool({
     name: "query",
     label: "提交游戏查询",
-    description: "点击当前玩家终端的真实执行按钮，提交 textarea 现值并经过 AppShell、SQL 引擎和游戏规则；SQL 必须先由 input_sql 写入。",
-    promptSnippet: "用 query 提交 input_sql 写入的当前终端 SQL",
+    description: "把 SQL 写入当前玩家可见的固定 textarea，再点击真实执行按钮并经过 AppShell、SQL 引擎和游戏规则。",
+    promptSnippet: "用 query 一次完成可见 SQL 输入和真实提交",
     executionMode: "sequential",
-    parameters: EmptyParameters,
-    async execute(_toolCallId, _input, signal) {
+    parameters: QueryParameters,
+    async execute(_toolCallId, input, signal) {
       signal?.throwIfAborted();
-      const result = await context.requireDriver().query();
+      const result = await context.requireDriver().query(input.sql, input.revision);
       await appendEvent(context.store, context.task.id, "game.query", {
+        inputLength: input.sql.length,
         ok: result.ok,
         event: result.event,
       });

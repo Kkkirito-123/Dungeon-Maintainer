@@ -14,8 +14,8 @@ worktree 中的真实游戏。正式游戏仓库只有在用户显式执行 `/ap
 └─ 底部：上下文、Token、任务和运行状态
         ↓
 Pi RPC + Dungeon Maintainer Extension
-  ├─ inspect / evidence / patch / check / finish
-  ├─ look / go / use / input_sql / query / tree
+  ├─ inspect / edit / check / finish / workspace
+  ├─ look / act / query
   ├─ detached worktree + 固定检查
   └─ Vite + Playwright iframe + 检查点重放
         ↓
@@ -27,13 +27,13 @@ Pi RPC + Dungeon Maintainer Extension
 维护器与游戏保持两个独立仓库。1.0 固定为单 Agent、单 Pi、单活动 worktree、单 Vite 和单浏览器会话；
 历史任务和其他合法 worktree 可持久化并在 Shell 中切换，切换时旧 Pi 会先停止，不会后台继续调用模型。
 不提供公网 Dashboard、Electron、面向用户的任意终端、多 Agent、自动提交、推送、PR、部署或长期记忆。
-任意 Bash 不加载；方案确认后只开放隔离 worktree 内的原生 `write` 和受限 `patch`。
+任意 Pi 原生工具和 Bash 均不加载；方案确认后只开放维护器自有的受限 `edit`。
 
 核心代码按单一职责分区：`src/app.ts` 是公开入口，`src/app/` 分别拥有仓库事实、Pi 进程、
 任务生命周期与 start/resume；`src/pi/extension.ts` 只做 Pi 装配，会话安全策略和游戏运行时分别
 位于 `session-policy.ts` 与 `game-runtime.ts`。游戏开发桥也将投影、导航、固定动作和查询执行拆开，
 `bridge.ts` 只组合协议生命周期。外部命令和 Pi 工具/命令不因内部拆分改变；浏览器驱动优先消费
-当前协议 v3，不接受旧桥协议。
+当前桥协议统一为 1.0，不接受其它桥协议。
 
 ## 环境要求
 
@@ -110,30 +110,28 @@ Shell 左侧是聊天输入，右侧 iframe 显示同一个 worktree 的游戏�
 `resume` 不会静默创建新 worktree 或新会话；
 任务记录、正式仓库 HEAD、worktree HEAD、Pi session-id、session-dir 或首行 cwd 任一漂移都会阻断。
 
-Pi 启动时固定使用 `--mode rpc`，显式加载 Pi 原生 Coding 工具和维护器领域工具，同时禁用外部 Extension、
+Pi 启动时固定使用 `--mode rpc`，不加载 Pi 原生工具，只显式加载维护器的 8 个领域工具，同时禁用外部 Extension、
 Skill、Prompt Template 和上下文文件。Extension 默认只激活只读诊断工具；用户在 Shell 确认“病因 +
-完整方案 + 验证方式”后，才为当前 Agent 运行临时开放 `write/patch`。Pi 内会在运行时真正替换会话前取消
+完整方案 + 验证方式”后，才为当前 Agent 运行临时开放 `edit`。Pi 内会在运行时真正替换会话前取消
 `/new`、`/resume`、`/import`、`/fork`、`/clone` 和 `/tree`。模型固定来自进程启动时的
 `MAINTAINER_MODEL`；Thinking 和压缩仍通过 Pi 原生 RPC 调整，Shell 以 Pi 返回状态为事实源。
 Shell 与后端仅通过本机 HTTP/SSE 通信，API Key 不进入浏览器。
 
 ## Pi 内工具与命令
 
-维护器提供 11 个领域工具，并只复用 1 个 Pi 原生 `write`（合计 12 个工具）。原生 `read/grep/find/ls/edit` 不加载；源码读取、
-搜索、目录和 Diff 统一通过安全 `inspect`：
+维护器只向模型注册以下 8 个领域工具。Pi 原生工具和 Bash 均不加载；源码读取、证据、编辑、
+游戏操作和工作树切换都经过维护器自己的边界：
 
 | 工具 | 作用 | 硬边界 |
 |---|---|---|
-| `inspect` | 查看状态、浅目录、搜索、分页文件和 Diff | 项目相对路径；read 默认 80 行、最多 160 行，单次最多 4 KiB |
-| `patch` | 唯一文本替换或创建文本文件 | `baseHash`、唯一匹配、最多 3 文件/120 行、核心审批 |
+| `inspect` | 查看状态、浅目录、搜索、分页文件、Diff，以及列出/回读当前任务 Evidence | 项目相对路径；read 默认 80 行、最多 160 行，单次最多 4 KiB |
+| `edit` | 唯一文本替换、创建文本文件或整文件写入 | 当前 `baseHash`、realpath、精确授权路径、最多 3 文件/120 行、写前检查点与写后刷新重放 |
 | `check` | 运行固定白名单检查 | 模型不能传命令、参数、cwd 或环境变量 |
 | `finish` | 保存诊断、复现、总方案审批、修复结果或阻断结论 | `result` 自动执行固定检查、刷新重放和断言 |
-| `look` | 读取玩家可见游戏投影 | 终端打开时包含题面、schema、当前 textarea SQL、状态、结果与计划；不返回隐藏答案或完整地图 |
-| `go` | 前往主线目标或最近 frontier | 桥内 BFS；每次最多 64 个真实移动步 |
-| `use` | 执行视图提供的稳定动作 ID | 不接受选择器、坐标或脚本 |
-| `input_sql` | 填写当前终端 textarea | 只写固定玩家输入框，不执行查询、不接受选择器或脚本 |
-| `query` | 提交当前终端 textarea | 不接受 SQL 参数；点击真实执行按钮并经过 AppShell、SQLite 与游戏判定 |
-| `tree` | 列出或切换同一仓库的本地工作树 | 只接受枚举 ID；切换需确认并创建绑定目标树的新任务 |
+| `workspace` | 列出或切换同一仓库的本地 Git worktree | 只接受枚举 ID；切换需确认并创建绑定目标树的新任务 |
+| `look` | 读取带 revision、目标、前置说明和稳定 action ID 的玩家可见投影 | 不返回坐标、完整地图、背包、存档、隐藏答案或 Judge |
+| `act` | 消费最新 revision 中的稳定动作，完成导航或固定可见交互 | 最多 64 个真实移动步；遇到 `E` 交互停止；旧修订、不可用动作和连续无进展明确失败 |
+| `query` | 写入 SQL 并提交当前可见终端 | 先写固定 textarea，再点击真实执行按钮；SQL 仅在进程内用于重放 |
 
 用户可使用五个命令：
 
@@ -148,13 +146,13 @@ Shell 与后端仅通过本机 HTTP/SSE 通信，API Key 不进入浏览器。
 ## 标准修复闭环
 
 1. 用户在 Shell 左侧描述问题。
-2. Agent 在只读阶段使用 `inspect` 和 `look/go/use/input_sql/query` 定位并复现。
+2. Agent 在只读阶段使用 `inspect` 和 `look/act/query` 定位并复现。
 3. 运行时问题通过 `finish(status=reproduced)` 保存检查点后的语义动作、期望、实际、证据和结构化结果断言；
    构建、类型或测试问题以失败的固定检查作为复现证据。
-4. Agent 形成唯一病因后直接使用精确 `patch` 或 Pi 原生 `write`；第一次写入时 Shell 按目标文件询问一次是否允许修改。
+4. Agent 形成唯一病因后直接使用 `edit` 做精确替换、创建或整文件写入；第一次写入时 Shell 按目标文件询问一次是否允许修改。
    需要提前说明多文件方案时仍可用 `finish(status=proposed)`；拒绝时不开放写入能力。
 5. 用户确认后，原始写入调用继续执行，本轮在批准范围内自然完成修改，不重复询问同一文件。
-   原生编辑后的实际 Git 增量会同步到任务记录，旧验证立即失效。
+   编辑后的实际 Git 增量会同步到任务记录，旧验证立即失效。
 6. 第一字节写入前保存临时浏览器检查点。写入 worktree 后等待 Vite 更新，刷新页面、消费检查点，
    重新建立同一起点检查点并重放相同语义动作。
 7. Agent 调用 `finish(status=result)` 自动运行固定检查、恢复重放和 hidden judge 断言；全部通过才进入 `ready_to_apply`。`/verify` 只用于人工重试。
@@ -167,8 +165,8 @@ Shell 与后端仅通过本机 HTTP/SSE 通信，API Key 不进入浏览器。
 - 来源工作树允许已有修改；快照期间若继续变化会阻断启动，任务期间漂移会阻断 `/apply`。
 - 总方案授权绑定当前 `taskId + baseHead + 病因 + 完整步骤 + 验证方式`，只覆盖当前 Agent 运行；
   运行结束自动恢复只读诊断工具。
-- 维护器 `patch` 仍执行路径、`realpath`、`baseHash`、唯一匹配和预算校验；Pi 原生工具没有操作系统
-  沙箱，因此 Prompt 明确要求它只能修改当前 detached worktree。正式仓库仍只有 `/apply` 能写入。
+- 维护器 `edit` 执行路径、`realpath`、`baseHash`、唯一匹配、精确授权和预算校验；写入只发生在
+  当前 detached worktree，正式仓库仍只有 `/apply` 能写入。
 - `.git`、`.env*`、凭据、法律文件、`node_modules`、`dist`、缓存和二进制不属于修复方案允许范围。
 - 日志不保存 API Key、模型正文、SQL、答案、完整地图、正式存档、背包、身份或浏览器帧。
 
@@ -191,7 +189,7 @@ worktrees/<task-id>/
 
 ## 游戏开发桥
 
-目标游戏仓库必须实现当前协议 v3 的开发桥。桥只有在以下条件同时成立时安装：
+目标游戏仓库必须实现协议 1.0 开发桥。桥只有在以下条件同时成立时安装：
 
 - `import.meta.env.DEV`
 - 页面主机为 `127.0.0.1`、`localhost` 或 `[::1]`
@@ -268,9 +266,11 @@ Shell 只展示低敏摘要，不传输 API Key、完整 Prompt、thinking、SQL
 
 ## 内置 Eval
 
-`pnpm eval` 把真实故障场景物化到独立仓库，启动正常 Maintainer 修复，通过 `HEAD`、禁写路径和
-有效 Diff 三个 Git 门禁后，只调用一次 Flash LLM Judge 做宽松功能验收。现场演示和 CI 共用一个
-Runner；结果 schema v6 分开统计 Agent/Judge Token、Agent 工具调用和 Agent/Run/Suite 三种耗时。
+`pnpm eval` 把真实故障场景物化到独立仓库，启动正常 Maintainer 修复，并在第一次真实
+`agent_settled` 时结束 Agent 回合。Profile 停止 Pi、Shell 并卸载本轮工具后，正式 Run 只在
+候选工作区执行一次隐藏的 after browser Oracle。它不比较代码、Diff 或参考实现，也不调用第二个模型。
+故障已成功物化是运行前提；PASS 只要求 Agent 正常 settled 且 after Oracle 命中。现场演示和 CI
+共用一个 Runner；结果 schema v7 分开统计 Agent Token、Agent 工具调用和 Agent/Oracle/Run/Suite 耗时。
 
 ```powershell
 pnpm eval -- suite `
@@ -283,9 +283,10 @@ pnpm eval -- suite `
 
 Eval Dataset 固定在 `eval-datasets/`，不读取当前游戏源码。正式运行只从 `--dependencies` 指定的
 游戏仓库复用已安装的 `game/node_modules`；游戏开发和评测基线互不修改。单 Profile 默认并行
-2 个独立 Worker，公平对比默认 1 个。Eval 复用当前 Key 与 Base URL，并为 Agent、Pi Baseline 和
-Judge 固定 `deepseek-v4-flash`、关闭 reasoning，不改变生产默认模型。`preflight` 保留为显式的
-零模型浏览器诊断，但不阻塞 `run`、`suite` 或 `compare`；Suite 通过不等于浏览器端到端通过。
+2 个独立 Worker，公平对比默认 1 个；每个 Run 拥有独立的 Workspace、Pi Session、Vite 和 Chromium。
+Eval 复用当前 Key 与 Base URL，并为被测 Agent 和 Pi Baseline 固定 `deepseek-v4-flash`、关闭
+reasoning，不改变生产默认模型。`preflight` 是显式的零模型校准：确认故障版命中失败 Oracle、
+干净版命中通过 Oracle；它不阻塞 `run`、`suite` 或 `compare`，正式 Run 仍只执行一次候选 after Oracle。
 目录分层、判定边界、统计口径、版本指纹和断点恢复见 [docs/EVAL.md](docs/EVAL.md)。
 
 模型上下文保留 Pi 原生 Session 历史和 compact。维护器不设置请求级工具次数或 Token 强制上限；

@@ -12,8 +12,8 @@ TypeScript 标识符使用清晰英文领域词。
 ```text
 Chromium Shell -> Pi RPC -> src/pi/extension.ts
   -> session-policy + game-runtime
-  -> inspect / patch / check / finish
-  -> look / go / use / query
+  -> inspect / edit / check / finish / workspace
+  -> look / act / query
   -> task + workspace + repair + game + logging
 ```
 
@@ -34,7 +34,7 @@ src/pi/extension.ts      Pi Provider、工具、命令和生命周期装配
 src/pi/session-policy.ts Pi 会话绑定、模型/会话切换阻断
 src/pi/game-runtime.ts   单 Vite、临时 Chromium 和 GameDriver 生命周期
 src/pi/tool-policy.ts    只读诊断与本轮完整执行的活动工具集合
-src/pi/tools/            十一个固定领域工具（含总方案审批与工作树切换；另加载 Pi 原生 write）
+src/pi/tools/            八个固定模型工具（含总方案审批与工作树切换；不加载 Pi 原生工具）
 src/pi/commands/         五个固定用户命令
 src/shell/               Chromium Shell 页面、HTTP/SSE 协议和状态栏
 src/task/                当前 schema v4 任务事实与状态机
@@ -52,22 +52,22 @@ tests/                   Node 测试；安全边界优先使用真实临时 Git 
 ```
 
 不要在相邻模块复制权威：任务状态只由 `TaskStore` 持久化；正式仓库写入只由
-`workspace/apply.ts` 执行；浏览器只能调用当前协议 v3 固定方法；Pi prompt 不能替代执行层权限。
+`workspace/apply.ts` 执行；浏览器只能调用协议 1.0 固定方法；Pi prompt 不能替代执行层权限。
 
 ## 开发规则
 
 - 修改前读取 Git 状态、拥有行为的模块、对应测试和设计文档；保留无关用户工作。
 - 只实现当前明确目标，优先最小完整切片；不要为单次调用建立泛化抽象或兼容层。
-- 诊断阶段可以提出精确 write/patch；第一次调用由执行层按目标文件申请用户批准，批准后才真正写入；
+- 诊断阶段可以提出精确 edit；第一次调用由执行层按目标文件申请用户批准，批准后才真正写入；
   本轮结束必须自动收权。
-- 任意 Bash 不加载；原生 write 也必须经过 detached worktree 的项目相对路径和 realpath 边界。
+- 任意 Pi 原生工具和 Bash 均不加载；所有源码写入统一经过维护器自有 edit。
 - 所有文件访问必须先规范项目相对路径，再通过 `realpath`/最近存在父目录检查符号链接逃逸。
-- `patch` 必须绑定最新 `baseHash`、唯一旧文本和 3 文件/120 行预算；模型调用时复用当前已批准的
-  精确写入范围，不得为同一文件重复打断用户。
+- `edit` 必须绑定最新 `baseHash` 和 3 文件/120 行预算；replace 要求唯一旧文本，write/create
+  要求完整正文，create 固定使用 `missing` Hash。模型调用时复用当前已批准的精确写入范围。
 - 第一字节源码写入前必须存在浏览器复现检查点；写入后按刷新、恢复、重建检查点、重放的顺序执行。
 - 所有 Agent 修改只进入 detached worktree。正式仓库仅由用户 `/apply` 修改，且不自动提交。
 - 来源工作树允许脏状态；启动时复制为隔离 index 基线，后续 Diff 只包含 Agent 增量。
-- `tree` 只能枚举同一 Git common-dir 的合法游戏 worktree；切换必须确认并创建新任务，不能原地偷换 cwd。
+- `workspace` 只能枚举同一 Git common-dir 的合法游戏 worktree；切换必须确认并创建新任务，不能原地偷换 cwd。
 - 不输出、记录或持久化 API Key、模型正文、SQL、答案、完整地图、正式存档、背包、身份或帧画面。
 - 删除终态 worktree 前必须验证解析后的精确目标是配置 `worktrees/` 下的单个任务子目录。
 
@@ -107,9 +107,10 @@ dungeon-maintain start --repo <游戏仓库>
 dungeon-maintain resume <task-id>
 ```
 
-Pi 原生工具只加载 `write`；源码读取、搜索、目录和 Diff 统一走安全 `inspect`。维护器共加载
-11 个领域工具和 1 个 Pi 原生工具，领域工具固定为
-`inspect/patch/check/finish/look/go/use/input_sql/query/tree`；用户命令固定为 `/play /diff /verify /apply /discard`。
+Pi 不加载原生工具。维护器向模型固定注册且仅注册 8 个工具：
+`inspect/edit/check/finish/workspace/look/act/query`；用户命令固定为 `/play /diff /verify /apply /discard`。
+`inspect` 统一负责源码、Diff、Git 状态和 Evidence list/get；内部重放仍使用
+`look/go/use/input-sql/query` 语义 Trace，但这些内部动作不是模型工具。
 新增能力前必须先修改已批准设计，不能通过配置动态扩展。
 
 维护器内部评测统一称为 `Eval`（入口为 `pnpm eval`，代码位于 `src/eval/`）。生产 Eval 不读取
@@ -137,7 +138,7 @@ pnpm test
 pnpm build
 ```
 
-测试必须覆盖 CLI/Pi 参数、诊断阶段禁写、总方案确认、单轮收权、原生编辑同步、会话绑定、
+测试必须覆盖 CLI/Pi 参数、诊断阶段禁写、总方案确认、单轮收权、edit 写后同步、会话绑定、
 状态迁移、绝对路径与 `..`、符号链接、审批拒绝与消费、
 Hash 冲突、worktree 隔离、刷新重放顺序、日志脱敏、apply 漂移和 discard 清理。Git 安全测试使用
 真实临时仓库，不能只用 mock。

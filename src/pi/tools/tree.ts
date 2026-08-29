@@ -67,15 +67,15 @@ async function requestControllerSwitch(tree: RepositoryWorktreeSummary): Promise
  * @param pi 当前固定 Pi Extension API。
  * @param context 当前任务和任务存储；候选只能来自同一 Git common-dir 的注册 worktree。
  */
-export function registerTreeTool(pi: ExtensionAPI, context: TreeToolContext): void {
+export function registerWorkspaceTool(pi: ExtensionAPI, context: TreeToolContext): void {
   pi.registerTool({
-    name: "tree",
+    name: "workspace",
     label: "工作树",
     description: "列出当前游戏仓库的本地工作树，或经用户确认后用目标树启动一个新任务。",
-    promptSnippet: "用 tree 查看或切换本地 Git 工作树",
+    promptSnippet: "用 workspace 查看或切换本地 Git 工作树",
     promptGuidelines: [
-      "切换前必须先 tree(action=list)，并只使用返回的 12 位 treeId。",
-      "tree(action=switch) 会创建新任务并结束当前运行时，不能用它规避 /apply。",
+      "切换前必须先 workspace(action=list)，并只使用返回的 12 位 treeId。",
+      "workspace(action=switch) 会创建新任务并结束当前运行时，不能用它规避 /apply。",
     ],
     executionMode: "sequential",
     parameters: TreeParameters,

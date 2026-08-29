@@ -76,6 +76,58 @@ function nodeText(node: EvidenceNode): string {
     + "\n" + node.summary;
 }
 
+/** 供统一 inspect 工具复用的当前任务证据查询。 */
+export async function executeEvidenceQuery(
+  context: EvidenceToolContext,
+  input: EvidenceInput,
+  signal?: AbortSignal,
+) {
+  signal?.throwIfAborted();
+  if (input.action === "list") {
+    if (input.evidenceId !== undefined) {
+      throw new Error("evidence(list) 不接受 evidenceId");
+    }
+    const output = await listEvidenceNodes(context.evidence, {
+      ...(input.status === undefined ? {} : { status: input.status }),
+      ...(input.kind === undefined ? {} : { kind: input.kind }),
+      ...(input.limit === undefined ? {} : { limit: input.limit }),
+    });
+    return {
+      content: [{
+        type: "text" as const,
+        text: [
+          "[EVIDENCE_LIST revision=" + String(output.revision)
+            + " count=" + String(output.records.length) + "]",
+          ...output.records.map(nodeText),
+        ].join("\n"),
+      }],
+      details: { action: "list", ...output } as Record<string, unknown>,
+    };
+  }
+  if (input.status !== undefined || input.kind !== undefined || input.limit !== undefined) {
+    throw new Error("evidence(get) 只接受 evidenceId");
+  }
+  if (input.evidenceId === undefined) {
+    throw new Error("evidence(get) 缺少 evidenceId");
+  }
+  const detail = await getEvidenceDetail(context.evidence, input.evidenceId);
+  if (!detail) throw new Error("evidenceId 不属于当前任务");
+  const artifact = detail.artifact.available
+    ? [
+        "[ARTIFACT kind=" + detail.artifact.kind
+          + " truncated=" + String(detail.artifact.truncated) + "]",
+        detail.artifact.text,
+      ].join("\n")
+    : "[ARTIFACT unavailable reason=" + detail.artifact.reason + "]";
+  return {
+    content: [{
+      type: "text" as const,
+      text: nodeText(detail.record) + "\n" + artifact,
+    }],
+    details: { action: "get", ...detail, records: [] } as Record<string, unknown>,
+  };
+}
+
 /** 向单个 Pi 会话注册受限证据回读工具。 */
 export function registerEvidenceTool(
   pi: ExtensionAPI,
@@ -95,60 +147,13 @@ export function registerEvidenceTool(
     executionMode: "sequential",
     parameters: EvidenceParameters,
     async execute(_toolCallId, input: EvidenceInput, signal) {
-      signal?.throwIfAborted();
-      if (input.action === "list") {
-        if (input.evidenceId !== undefined) {
-          throw new Error("evidence(list) 不接受 evidenceId");
-        }
-        const output = await listEvidenceNodes(context.evidence, {
-          ...(input.status === undefined ? {} : { status: input.status }),
-          ...(input.kind === undefined ? {} : { kind: input.kind }),
-          ...(input.limit === undefined ? {} : { limit: input.limit }),
-        });
-        await appendEvent(context.store, context.task.id, "tool.evidence", {
-          action: "list",
-          count: output.records.length,
-          revision: output.revision,
-        });
-        return {
-          content: [{
-            type: "text",
-            text: [
-              "[EVIDENCE_LIST revision=" + String(output.revision)
-                + " count=" + String(output.records.length) + "]",
-              ...output.records.map(nodeText),
-            ].join("\n"),
-          }],
-          details: { action: "list", ...output },
-        };
-      }
-      if (input.status !== undefined || input.kind !== undefined || input.limit !== undefined) {
-        throw new Error("evidence(get) 只接受 evidenceId");
-      }
-      if (input.evidenceId === undefined) {
-        throw new Error("evidence(get) 缺少 evidenceId");
-      }
-      const detail = await getEvidenceDetail(context.evidence, input.evidenceId);
-      if (!detail) throw new Error("evidenceId 不属于当前任务");
+      const output = await executeEvidenceQuery(context, input, signal);
       await appendEvent(context.store, context.task.id, "tool.evidence", {
-        action: "get",
-        artifactAvailable: detail.artifact.available,
-        revision: detail.revision,
+        action: input.action,
+        count: Array.isArray(output.details.records) ? output.details.records.length : 0,
+        revision: Number(output.details.revision),
       });
-      const artifact = detail.artifact.available
-        ? [
-            "[ARTIFACT kind=" + detail.artifact.kind
-              + " truncated=" + String(detail.artifact.truncated) + "]",
-            detail.artifact.text,
-          ].join("\n")
-        : "[ARTIFACT unavailable reason=" + detail.artifact.reason + "]";
-      return {
-        content: [{
-          type: "text",
-          text: nodeText(detail.record) + "\n" + artifact,
-        }],
-        details: { action: "get", ...detail, records: [] },
-      };
+      return output;
     },
   });
 }

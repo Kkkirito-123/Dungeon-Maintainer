@@ -2,8 +2,9 @@
  * 单浏览器语义动作、检查点和重放编排。
  *
  * GameDriver 是 Pi 游戏工具与底层 Playwright 客户端之间的唯一入口。第一次 look 或
- * /play 会先在页面 sessionStorage 建立复现起点并清空环形 Trace；后续 go/use/inputSql/query
- * 只记录有限语义。源码修改后先 reload 消费检查点，再立刻重建同一起点检查点，最后
+ * /play 会先在页面 sessionStorage 建立复现起点并清空环形 Trace；模型通过 look/act/query
+ * 操作游戏，驱动仍用 go/use/input-sql/query 记录有限重放语义。源码修改后先 reload
+ * 消费检查点，再立刻重建同一起点检查点，最后
  * 按原顺序重放动作，因此后续 /verify 仍能从相同起点再次验证。
  */
 
@@ -17,8 +18,6 @@ import type { GameBrowser } from "./browser.js";
 
 const TRANSITION_POLL_INTERVAL_MS = 50;
 const TRANSITION_POLL_ATTEMPTS = 40;
-const MAX_GO_SEGMENTS = 8;
-const CONTINUABLE_GO_EVENTS = new Set(["action", "task"]);
 
 /** 一次重放的公开验证结果。 */
 export interface ReplayResult {
@@ -54,8 +53,9 @@ export class GameDriver {
   private lastView: PlayView | null = null;
   /** SQL 只在当前进程内按 Trace 序号保留，永不写入复现文件或事件日志。 */
   private readonly replayInputSql = new Map<number, string>();
+  private pendingSql: string | null = null;
 
-  /** @param browser 已打开协议 v3 页面。 */
+  /** @param browser 已打开协议 1.0 页面。 */
   constructor(private readonly browser: GameBrowser) {}
 
   /**
@@ -68,6 +68,7 @@ export class GameDriver {
     await this.browser.checkpoint();
     this.trace.clear();
     this.replayInputSql.clear();
+    this.pendingSql = null;
     this.checkpointReady = true;
     this.lastView = view;
     return view;
@@ -98,7 +99,7 @@ export class GameDriver {
    * 读取当前玩家投影，但不建立检查点也不写入复现 Trace。
    *
    * 该入口只供每轮 Agent 开始前注入一份小型实时状态，避免为了回答当前位置而额外
-   * 消耗一次模型工具往返；真正的复现仍必须通过 `look/go/use/inputSql/query` 留下语义证据。
+   * 消耗一次模型工具往返；真正的复现仍必须通过 `look/act/query` 留下语义证据。
    */
   async peek(): Promise<PlayView> {
     const view = await this.browser.look();
@@ -120,37 +121,31 @@ export class GameDriver {
     return view;
   }
 
+  /** 消费模型最近一次 look 返回的修订和动作。 */
+  async act(revision: string, actionId: string, maxSteps: number): Promise<PlayResult> {
+    await this.ensureCheckpoint();
+    const result = await this.browser.act(revision, actionId, maxSteps);
+    this.lastView = result.view;
+    const movement = actionId === "objective" || actionId === "frontier";
+    this.trace.push({
+      action: movement ? "go" : "use",
+      arguments: movement
+        ? { target: actionId, maxSteps }
+        : { actionId },
+      ok: result.ok,
+      summary: result.event + " · " + result.view.banner,
+    });
+    return result;
+  }
+
   /** 执行有限 BFS 移动并记录语义结果。 */
   async go(
     target: "objective" | "frontier",
     maxSteps: number,
   ): Promise<PlayResult> {
     await this.ensureCheckpoint();
-    let remainingSteps = maxSteps;
-    let result = await this.browser.go(target, remainingSteps);
-    let totalSteps = result.steps;
-    for (let segment = 1; segment < MAX_GO_SEGMENTS; segment += 1) {
-      if (
-        !result.ok
-        || result.view.mode !== "explore"
-        || !CONTINUABLE_GO_EVENTS.has(result.event)
-        || totalSteps >= maxSteps
-      ) break;
-      remainingSteps = maxSteps - totalSteps;
-      const previous = result;
-      const next = await this.browser.go(target, remainingSteps);
-      if (
-        !next.ok
-        && next.steps === 0
-        && (next.event === "no-discovered-path" || next.event === "target-not-visible")
-      ) {
-        result = previous;
-        break;
-      }
-      result = next;
-      totalSteps += next.steps;
-    }
-    result = { ...result, steps: totalSteps };
+    const view = this.lastView ?? await this.browser.look();
+    const result = await this.browser.act(view.revision, target, maxSteps);
     this.lastView = result.view;
     this.trace.push({
       action: "go",
@@ -164,7 +159,8 @@ export class GameDriver {
   /** 执行玩家视图提供的稳定动作。 */
   async use(actionId: string): Promise<PlayResult> {
     await this.ensureCheckpoint();
-    const result = await this.browser.use(actionId);
+    const view = this.lastView ?? await this.browser.look();
+    const result = await this.browser.act(view.revision, actionId, 1);
     this.lastView = result.view;
     this.trace.push({
       action: "use",
@@ -186,8 +182,16 @@ export class GameDriver {
       throw new Error("SQL 输入无效或超过 16 KiB");
     }
     await this.ensureCheckpoint();
-    const result = await this.browser.inputSql(sql);
-    this.lastView = result.view;
+    const view = this.lastView ?? await this.browser.look();
+    const terminalOpen = (view.mode === "combat" || view.mode === "challenge")
+      && view.terminal !== null;
+    const result: PlayResult = {
+      ok: terminalOpen,
+      event: terminalOpen ? "input-buffered" : "terminal-not-open",
+      steps: 0,
+      view,
+    };
+    this.pendingSql = sql;
     const entry = this.trace.push({
       action: "input-sql",
       arguments: { inputLength: sql.length },
@@ -198,10 +202,17 @@ export class GameDriver {
     return result;
   }
 
-  /** 提交当前 textarea 现值；SQL 参数必须先通过 inputSql 写入。 */
-  async query(): Promise<PlayResult> {
+  /** 把进程内 SQL 写入当前 textarea 并提交真实查询。 */
+  async query(sql?: string, revision?: string): Promise<PlayResult> {
+    if (sql !== undefined) {
+      const input = await this.inputSql(sql);
+      if (!input.ok) return input;
+    }
     await this.ensureCheckpoint();
-    const result = await this.browser.query();
+    if (this.pendingSql === null) throw new Error("当前没有可提交的 SQL 输入");
+    const view = this.lastView ?? await this.browser.look();
+    const result = await this.browser.query(revision ?? view.revision, this.pendingSql);
+    this.pendingSql = null;
     this.lastView = result.view;
     this.trace.push({
       action: "query",
@@ -254,6 +265,7 @@ export class GameDriver {
     this.trace.clear();
     this.checkpointReady = true;
     this.lastView = restored;
+    this.pendingSql = null;
     let failure: string | null = null;
     let actionCount = 0;
     let queryAccepted: boolean | null = null;

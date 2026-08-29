@@ -3079,7 +3079,7 @@ export class GameSession {
 
     const progressedRoomIds = new Set<string>([
       this.graph.entryId,
-      focusLandmark.anchor.roomNodeId,
+      ...(preset.keepFocusRoomIncomplete ? [] : [focusLandmark.anchor.roomNodeId]),
       ...this.graph.nodes
         .filter((room) => room.lessonId && completedLessons.has(room.lessonId))
         .map((room) => room.id),

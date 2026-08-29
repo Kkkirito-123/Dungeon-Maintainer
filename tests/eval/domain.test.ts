@@ -12,11 +12,13 @@ import type { PlayJudge, PlayView } from "../../src/game/protocol.js";
 
 function view(overrides: Partial<PlayView> = {}): PlayView {
   return {
+    revision: "00000001",
     floor: 1,
     mode: "explore",
     hp: { current: 2, max: 2, armor: 0 },
     progress: { lessons: 0, rooms: 0, moves: 0, queries: 0, hintLevel: 0 },
     actions: [],
+    target: null,
     room: "start",
     mission: { title: "任务", body: "", lesson: "SELECT" },
     record: null,
@@ -115,7 +117,12 @@ describe("Agent Eval 精确 Oracle", () => {
       observation({ op: "query", planClass: "scan", view: scanView }),
     ]), true);
     assert.equal(matchesAfterOracle("query-plan-current", [
-      observation({ op: "query", planClass: "search", view: searchView }),
+      observation({
+        op: "query",
+        event: "query-accepted",
+        planClass: "search",
+        view: searchView,
+      }),
     ]), true);
     assert.equal(matchesAfterOracle("query-plan-current", [
       observation({ op: "wait", planClass: "search", view: searchView }),
@@ -125,6 +132,26 @@ describe("Agent Eval 精确 Oracle", () => {
     ]), true);
     assert.equal(matchesAfterOracle("query-plan-current", [
       observation({ op: "query", event: "query-accepted", planClass: "none" }),
+    ]), false);
+    assert.equal(matchesAfterOracle("query-plan-current", [
+      observation({ op: "query", event: "query-accepted", planClass: "scan", view: scanView }),
+    ]), false);
+  });
+
+  it("最终胜场 Oracle 不接受中间态曾经等于一", () => {
+    const transient = observation({
+      isFinal: false,
+      view: view({ mode: "victory" }),
+      judge: judge({ victories: 1 }),
+    });
+    const duplicated = observation({
+      stepIndex: 1,
+      view: view({ mode: "victory" }),
+      judge: judge({ victories: 2 }),
+    });
+    assert.equal(matchesAfterOracle("victory-count-once", [transient, duplicated]), false);
+    assert.equal(matchesAfterOracle("victory-count-once", [
+      { ...duplicated, judge: judge({ victories: 1 }) },
     ]), true);
   });
 });

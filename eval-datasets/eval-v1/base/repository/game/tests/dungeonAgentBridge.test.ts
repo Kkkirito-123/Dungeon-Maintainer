@@ -52,6 +52,22 @@ describe("Dungeon Agent 玩家投影", () => {
         checkpointStorage: null,
         checkpointRestored: false,
       });
+      const bridge = window.__DUNGEON_PLAYTEST__;
+      expect(bridge?.version).toBe(1);
+      expect(Object.keys(bridge ?? {}).sort()).toEqual([
+        "act",
+        "checkpoint",
+        "checkpointRestored",
+        "events",
+        "judge",
+        "look",
+        "prepare",
+        "query",
+        "version",
+      ]);
+      expect("go" in (bridge ?? {})).toBe(false);
+      expect("use" in (bridge ?? {})).toBe(false);
+      expect("inputSql" in (bridge ?? {})).toBe(false);
       expect(window.__DUNGEON_PLAYTEST__?.prepare("../escape")).toBe(false);
       expect(window.__DUNGEON_PLAYTEST__?.prepare("f1-admin-boss")).toBe(true);
       expect(window.__DUNGEON_PLAYTEST__?.judge(1)).toMatchObject({
@@ -124,6 +140,7 @@ describe("Dungeon Agent 玩家投影", () => {
     const encoded = JSON.stringify(view);
 
     expect(view.floor).toBe(1);
+    expect(view.revision).toMatch(/^[a-f0-9]{8}$/u);
     expect(encoded).not.toContain("mazeFloor");
     expect(encoded).not.toContain("adminAnswerSql");
     expect(encoded).not.toContain("runInstanceId");
@@ -132,7 +149,14 @@ describe("Dungeon Agent 玩家投影", () => {
     expect(encoded).not.toContain(snapshot.runSeed);
     expect(view.terminal).toBeNull();
     if (snapshot.adminAnswerSql) expect(encoded).not.toContain(snapshot.adminAnswerSql);
-    expect(view.actions.some((entry) => entry.id === "objective")).toBe(true);
+    expect(view.actions).toContainEqual(expect.objectContaining({
+      id: "objective",
+      tool: "act",
+    }));
+    expect(view.target).toMatchObject({
+      kind: "objective",
+      actionId: "objective",
+    });
   });
 
   it("只投影当前打开终端的题面、可见 SQL、状态、证据和已解锁提示", () => {
@@ -334,7 +358,7 @@ describe("Dungeon Agent 玩家投影", () => {
     })).toBe("action");
   });
 
-  it("inputSql 写入当前 textarea 后，query 走真实终端按钮且规则拒绝时返回 ok=false", async () => {
+  it("query 一次写入 textarea 并走真实终端按钮，规则拒绝时返回 ok=false", async () => {
     const session = new GameSession(null, createEmptyProfile(), "agent-query-result");
     session.enableAgentPlaytestMode();
     expect(session.adminApplyPreset("f1-admin-dormitory")).toMatchObject({ ok: true });
@@ -403,26 +427,34 @@ describe("Dungeon Agent 玩家投影", () => {
       });
 
       const sql = "SELECT id FROM monsters WHERE id = -1";
-      await expect(window.__DUNGEON_PLAYTEST__?.inputSql(sql)).resolves.toMatchObject({
-        ok: true,
-        event: "input-accepted",
-        view: { terminal: { inputSql: sql } },
+      const view = window.__DUNGEON_PLAYTEST__!.look();
+      const staleRevision = view.revision === "00000000" ? "ffffffff" : "00000000";
+      await expect(window.__DUNGEON_PLAYTEST__!.query(
+        staleRevision,
+        sql,
+      )).resolves.toMatchObject({
+        ok: false,
+        event: "stale-view",
       });
-      await expect(window.__DUNGEON_PLAYTEST__?.query()).resolves.toMatchObject({
+      expect(editor.value).toBe("");
+      await expect(window.__DUNGEON_PLAYTEST__!.query(view.revision, sql)).resolves.toMatchObject({
         ok: false,
         event: "query-rejected",
         view: {
           terminal: {
-            inputSql: editor.value,
+            inputSql: sql,
             status: { kind: "warning" },
           },
         },
       });
-      const inputEvent = window.__DUNGEON_PLAYTEST__?.events(0).find(
-        (entry) => entry.type === "input-sql",
+      const queryEvent = window.__DUNGEON_PLAYTEST__?.events(0)
+        .filter((entry) => entry.type === "query")
+        .at(-1);
+      expect(queryEvent?.summary).toContain("length=");
+      expect(queryEvent?.summary).not.toContain(sql);
+      expect(window.__DUNGEON_PLAYTEST__?.events(0)).not.toContainEqual(
+        expect.objectContaining({ type: "input-sql" }),
       );
-      expect(inputEvent?.summary).toContain("length=");
-      expect(inputEvent?.summary).not.toContain(sql);
     } finally {
       removeBridge?.();
       if (previousWindow) {
@@ -504,7 +536,12 @@ describe("Dungeon Agent 玩家投影", () => {
         checkpointStorage: null,
         checkpointRestored: false,
       });
-      await expect(window.__DUNGEON_PLAYTEST__?.use("interact")).resolves.toMatchObject({
+      const firstView = window.__DUNGEON_PLAYTEST__!.look();
+      await expect(window.__DUNGEON_PLAYTEST__!.act(
+        firstView.revision,
+        "interact",
+        1,
+      )).resolves.toMatchObject({
         ok: false,
         event: "action-not-applied",
       });
@@ -513,7 +550,12 @@ describe("Dungeon Agent 玩家投影", () => {
       );
 
       interactionDelay = 72;
-      await expect(window.__DUNGEON_PLAYTEST__?.use("interact")).resolves.toMatchObject({
+      const retryView = window.__DUNGEON_PLAYTEST__!.look();
+      await expect(window.__DUNGEON_PLAYTEST__!.act(
+        retryView.revision,
+        "interact",
+        1,
+      )).resolves.toMatchObject({
         ok: true,
         event: "action:interact",
       });
@@ -530,7 +572,7 @@ describe("Dungeon Agent 玩家投影", () => {
 });
 
 describe("Dungeon Agent 桥接边界", () => {
-  it("协议不接收 SQL 参数、选择器或脚本，只读取已打开 textarea", async () => {
+  it("协议只暴露 1.0 语义入口，不接收选择器、坐标或脚本", async () => {
     const protocolSource = await readFile(
       new URL("../src/devtools/dungeon-agent/protocol.ts", import.meta.url),
       "utf8",
@@ -556,11 +598,13 @@ describe("Dungeon Agent 桥接边界", () => {
       "utf8",
     );
 
-    expect(protocolSource).toContain("readonly version: 3");
-    expect(protocolSource).toContain("inputSql(sql: string): Promise<DungeonAgentResult>");
-    expect(protocolSource).toContain("query(): Promise<DungeonAgentResult>");
+    expect(protocolSource).toContain("readonly version: 1");
+    expect(protocolSource).toContain("act(");
+    expect(protocolSource).toContain("query(revision: string, sql: string)");
     expect(protocolSource).toContain("events(afterSequence: number)");
-    expect(protocolSource).not.toContain("query(sql");
+    expect(protocolSource).not.toContain("go(");
+    expect(protocolSource).not.toContain("use(actionId");
+    expect(protocolSource).not.toContain("inputSql(sql");
     expect(protocolSource).not.toContain("evaluate(script");
     expect(protocolSource).toContain("inputSql: string");
     expect(actionsSource).toContain('"#sql-editor"');
@@ -573,6 +617,7 @@ describe("Dungeon Agent 桥接边界", () => {
     expect(querySource).not.toContain("answerSql");
     expect(querySource).not.toContain("SqlEngine");
     expect(bridgeSource).toContain("writeDungeonAgentSql");
+    expect(bridgeSource).not.toContain("legacyBridge");
     expect(navigationSource).toContain("findGridPath");
     expect(projectionSource).toContain("export function buildDungeonAgentView");
     expect(projectionSource).not.toContain("adminAnswerSql");

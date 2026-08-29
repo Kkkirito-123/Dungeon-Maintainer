@@ -121,23 +121,24 @@ export function matchesAfterOracle(
   oracle: EvalOracleAfter,
   observations: readonly EvalOracleObservation[],
 ): boolean {
+  const final = finalObservation(observations);
+  if (!final) return false;
   if (oracle === "terminal-action-available") {
-    return observations.some((entry) => entry.ok && entry.event === "action:terminal");
+    return final.ok && final.event === "action:terminal";
   }
-  if (oracle === "combat-progressed") return observations.some((entry) => (
-    entry.event === "query-accepted" && (entry.judge.stageIndex ?? 0) > 0
-  ));
-  if (oracle === "boss-defeated") return observations.some((entry) => entry.judge.bossDefeated);
+  if (oracle === "combat-progressed") return (
+    final.event === "query-accepted" && (final.judge.stageIndex ?? 0) > 0
+  );
+  if (oracle === "boss-defeated") return final.judge.bossDefeated;
   if (oracle === "floor-advanced") {
-    const final = finalObservation(observations);
-    return Boolean(final && (final.judge.advanced || final.view.floor > final.judge.floor));
+    return final.judge.advanced || final.view.floor > final.judge.floor;
   }
   if (oracle === "query-plan-current") {
     const queries = observations.filter((entry) => entry.op === "query");
     return queries.length === 1
-      && (queries[0]?.planClass === "search" || queries[0]?.event === "query-accepted");
+      && queries[0] === final
+      && queries[0].planClass === "search"
+      && queries[0].event === "query-accepted";
   }
-  return observations.some((entry) => (
-    entry.view.mode === "victory" && (entry.judge.victories ?? 0) === 1
-  ));
+  return final.view.mode === "victory" && (final.judge.victories ?? 0) === 1;
 }
