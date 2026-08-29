@@ -78,7 +78,6 @@ describe("1.0 启动与 Extension 职责分区", () => {
       "inspection",
       "logging",
       "repair",
-      "settings",
       "shell",
       "task",
       "workspace",
