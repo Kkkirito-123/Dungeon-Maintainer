@@ -204,7 +204,11 @@ export async function runPiBaseline(
     ]);
     if (!completed) {
       failureCode = "agent-timeout";
-      await rpc.send({ type: "abort" }).catch(() => undefined);
+      await requestWithDeadline(
+        () => rpc.send({ type: "abort" }),
+        SESSION_STATS_TIMEOUT_MS,
+        null,
+      );
     }
     const statsResult = record(await requestWithDeadline(
       () => rpc.send({ type: "get_session_stats" }),

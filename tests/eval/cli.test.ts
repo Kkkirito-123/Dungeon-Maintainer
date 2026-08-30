@@ -7,13 +7,13 @@ import {
 } from "../../src/eval/cli.js";
 
 describe("Eval CLI", () => {
-  it("使用 Dataset / Scenario / Profile / Worker 统一命名", () => {
+  it("使用当前游戏 / Scenario / Profile / Worker 统一命名", () => {
     const preflight = parseEvalPreflightArgs([
       "--scenario", "terminal-action-bug",
       "--dependencies", "game-repo",
     ]);
     assert.equal(preflight?.scenarioId, "terminal-action-bug");
-    assert.equal(preflight.datasetId, "eval-v1");
+    assert.equal(preflight.dependencyRepoRoot.endsWith("game-repo"), true);
 
     const run = parseEvalRunArgs([
       "--scenario", "terminal-action-bug",
@@ -50,5 +50,9 @@ describe("Eval CLI", () => {
       "--workers", "5",
       "--dependencies", "game-repo",
     ]), /1 至 4/u);
+    assert.throws(() => parseEvalSuiteArgs([
+      "--dataset", "eval-v1",
+      "--dependencies", "game-repo",
+    ]), /未知 suite 参数/u);
   });
 });

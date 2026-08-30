@@ -42,12 +42,12 @@ src/workspace/           Git、realpath、补丁、检查、apply 与 worktree
 src/game/                Vite、临时 Chromium、协议客户端与语义驱动
 src/repair/              复现、刷新重放与验证
 src/logging/             低敏事件、脱敏与 500 条语义 Trace
-src/eval/domain/         Dataset、Scenario、Oracle 和 Profile 共用结果契约
+src/eval/domain/         当前游戏 Adapter 清单、Scenario、Oracle 和 Profile 共用结果契约
 src/eval/execution/      Workspace、预检、单次运行、并行 Suite 和进度事件
 src/eval/profiles/       互不依赖的 Maintainer 与 Pi Baseline
 src/eval/reporting/      运行身份、checkpoint 和结果汇总
 src/eval/ui/             Eval 静态进度页和本地 SSE 服务
-eval-datasets/           冻结评测输入；不读取当前游戏工作树
+（Benchmark 场景由当前游戏仓库的 `scripts/benchmark-adapter.mjs` 暴露）
 tests/                   Node 测试；安全边界优先使用真实临时 Git 仓库
 ```
 
@@ -113,9 +113,11 @@ Pi 不加载原生工具。维护器向模型固定注册且仅注册 8 个工�
 `look/go/use/input-sql/query` 语义 Trace，但这些内部动作不是模型工具。
 新增能力前必须先修改已批准设计，不能通过配置动态扩展。
 
-维护器内部评测统一称为 `Eval`（入口为 `pnpm eval`，代码位于 `src/eval/`）。生产 Eval 不读取
-当前游戏的场景或适配器：场景只来自 `eval-datasets/`；`--dependencies` 只复用游戏的
-`game/node_modules`。游戏合同由独立 `game-contract` 静态检查维护。
+维护器内部评测统一称为 `Eval`（入口为 `pnpm eval`，代码位于 `src/eval/`）。Eval 通过
+`--dependencies` 调用当前游戏仓库的 `scripts/benchmark-adapter.mjs` 读取场景，并在每次
+物化时复制当下工作树、注入故障、建立临时单提交 Git 仓库；真实游戏分支不会被切换或写入。
+Adapter 的隐藏复现和期望只留在游戏仓库，物化目标不包含 `benchmark/`、Adapter 或凭据。
+游戏合同由独立 `game-contract` 静态检查维护。
 
 任务记录只接受当前 schema v4，不迁移旧格式。状态机为：
 

@@ -68,7 +68,7 @@ src/
 ├─ task/                   # TaskStore 和状态机
 ├─ logging/                # 脱敏事件和语义 Trace
 └─ eval/                   # 独立的内置评测
-   ├─ domain/              # Dataset、Scenario、Browser Oracle 和结果契约
+   ├─ domain/              # 当前游戏 Adapter 清单、Scenario、Browser Oracle 和结果契约
    ├─ execution/           # Workspace、Browser Oracle、预检、Run、Worker Pool 和 Suite
    ├─ profiles/            # Maintainer 与 Pi Baseline
    ├─ reporting/           # Identity、checkpoint 和汇总
@@ -170,8 +170,8 @@ EvalScenario
   -> schema v7 EvalRunResult / EvalSuiteReport
 ```
 
-Eval 内部为 Agent 与 Pi Baseline 复用当前 Key 与 Base URL，统一固定 `deepseek-v4-flash` 并关闭
-reasoning，不改变生产维护器默认模型。首次 `agent_settled` 表示本次 Profile 正常结束；Profile 停止
+Eval 内部为 Agent 与 Pi Baseline 复用当前 Key 与 Base URL，默认使用 `deepseek-v4-flash`，并允许
+`DUNGEON_EVAL_MODEL` 为跨模型实测显式选择统一模型；reasoning 始终关闭，不改变生产维护器默认模型。首次 `agent_settled` 表示本次 Profile 正常结束；Profile 停止
 并卸载工具后，外层 Run 才启动隐藏 Browser Oracle，不再调用第二个模型，也不向 Agent 反馈结果。
 
 故障成功物化是判分基础；PASS 只要求 `agentSettled && afterOracleMatched`。Eval 不比较候选代码、Diff

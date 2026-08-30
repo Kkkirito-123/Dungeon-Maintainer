@@ -6,7 +6,7 @@
  */
 
 import { resolve } from "node:path";
-import { DEFAULT_EVAL_DATASET_ID, readEvalDataset } from "./domain/dataset.js";
+import { readEvalDataset } from "./domain/dataset.js";
 import { EVAL_TIMEOUT_MAX_MS } from "./domain/scenario.js";
 import { runEvalPreflight } from "./execution/preflight.js";
 import { runEvalScenario, type EvalRunProfile } from "./execution/run.js";
@@ -22,16 +22,15 @@ const HELP = [
   "Dungeon Maintainer Eval",
   "",
   "用法：",
-  "  pnpm eval -- check [--dataset eval-v1]",
+  "  pnpm eval -- check --repo <当前游戏仓库>",
   "  pnpm eval -- preflight --scenario <id> --dependencies <游戏仓库>",
   "  pnpm eval -- run --scenario <id> --profile maintainer|pi-baseline --dependencies <游戏仓库>",
-  "  pnpm eval -- suite --dataset eval-v1 --profile maintainer --workers 2 --dependencies <游戏仓库>",
-  "  pnpm eval -- compare --dataset eval-v1 --workers 1 --dependencies <游戏仓库>",
+  "  pnpm eval -- suite --profile maintainer --workers 2 --dependencies <游戏仓库>",
+  "  pnpm eval -- compare --workers 1 --dependencies <游戏仓库>",
   "  pnpm eval -- game-contract --repo <当前游戏仓库>",
 ].join("\n");
 
 interface EvalCommonRunCliOptions {
-  readonly datasetId: string;
   readonly dependencyRepoRoot: string;
   readonly archiveRoot: string;
   readonly timeoutMs: number | null;
@@ -96,12 +95,10 @@ function commonOptions(
   command: string,
   defaultArchive: string,
 ): EvalCommonRunCliOptions {
-  const datasetId = safeId(take(values, "--dataset") ?? DEFAULT_EVAL_DATASET_ID, "--dataset");
   const dependencies = take(values, "--dependencies");
   if (!dependencies) throw new Error(command + " 缺少 --dependencies");
   const timeoutValue = take(values, "--timeout-ms");
   return {
-    datasetId,
     dependencyRepoRoot: resolve(dependencies),
     archiveRoot: resolve(take(values, "--archive-root") ?? defaultArchive),
     timeoutMs: timeoutValue === null
@@ -192,7 +189,9 @@ export async function runEvalCli(args: readonly string[]): Promise<number> {
   if (command === "check") {
     const values = pairs(args.slice(1), "check");
     if (!values) { console.log(HELP); return 0; }
-    const dataset = await readEvalDataset(safeId(take(values, "--dataset") ?? DEFAULT_EVAL_DATASET_ID, "--dataset"));
+    const repo = take(values, "--repo");
+    if (!repo) throw new Error("check 缺少 --repo");
+    const dataset = await readEvalDataset(resolve(repo));
     rejectUnknown(values, "check");
     process.stdout.write(JSON.stringify({
       status: "passed",
@@ -215,10 +214,9 @@ export async function runEvalCli(args: readonly string[]): Promise<number> {
   if (command === "preflight") {
     const options = parseEvalPreflightArgs(args.slice(1));
     if (!options) { console.log(HELP); return 0; }
-    const dataset = await readEvalDataset(options.datasetId);
+    const dataset = await readEvalDataset(options.dependencyRepoRoot);
     const result = await runEvalPreflight({
       scenarioId: options.scenarioId,
-      datasetRoot: dataset.root,
       datasetFingerprint: dataset.fingerprint,
       dependencyRepoRoot: options.dependencyRepoRoot,
       archiveRoot: options.archiveRoot,
@@ -230,10 +228,9 @@ export async function runEvalCli(args: readonly string[]): Promise<number> {
   if (command === "run") {
     const options = parseEvalRunArgs(args.slice(1));
     if (!options) { console.log(HELP); return 0; }
-    const dataset = await readEvalDataset(options.datasetId);
+    const dataset = await readEvalDataset(options.dependencyRepoRoot);
     const result = await runEvalScenario({
       scenarioId: options.scenarioId,
-      datasetRoot: dataset.root,
       datasetFingerprint: dataset.fingerprint,
       dependencyRepoRoot: options.dependencyRepoRoot,
       profile: options.profile,
@@ -250,7 +247,6 @@ export async function runEvalCli(args: readonly string[]): Promise<number> {
     const progress = options.ui === "progress" ? await startEvalProgressPage(true) : null;
     try {
       const result = await runEvalSuite({
-        datasetId: options.datasetId,
         dependencyRepoRoot: options.dependencyRepoRoot,
         archiveRoot: options.archiveRoot,
         repetitions: options.repetitions,

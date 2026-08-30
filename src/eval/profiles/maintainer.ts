@@ -460,7 +460,11 @@ export async function runPiMaintainer(
     ]);
     if (!finished) {
       runState.failureCode = "agent-timeout";
-      await rpc.send({ type: "abort" }).catch(() => undefined);
+      await requestWithDeadline(
+        () => requireEvalRpc(rpc).send({ type: "abort" }),
+        SESSION_STATS_TIMEOUT_MS,
+        null,
+      );
     }
     const statsRpc = requireEvalRpc(rpc);
     const statsResult = await requestWithDeadline(

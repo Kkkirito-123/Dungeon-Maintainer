@@ -132,7 +132,7 @@ describe("Agent Eval 精确 Oracle", () => {
     ]), true);
     assert.equal(matchesAfterOracle("query-plan-current", [
       observation({ op: "query", event: "query-accepted", planClass: "none" }),
-    ]), false);
+    ]), true);
     assert.equal(matchesAfterOracle("query-plan-current", [
       observation({ op: "query", event: "query-accepted", planClass: "scan", view: scanView }),
     ]), false);

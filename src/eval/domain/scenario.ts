@@ -10,9 +10,8 @@
  * 事件、公开报告或模型工具结果。
  */
 
-import { lstat, readFile, realpath } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve } from "node:path";
-import { DEFAULT_EVAL_DATASET_ID, defaultEvalDatasetsRoot } from "./dataset.js";
+import { isAbsolute, resolve } from "node:path";
+import { invokeGameBenchmarkAdapter } from "../game-adapter.js";
 import {
   parseEvalOracleAfter,
   parseEvalOracleBefore,
@@ -82,8 +81,8 @@ export interface EvalScenario {
 export interface EvalScenarioReadOptions {
   /** 不含路径分隔符的 Scenario ID。 */
   readonly scenarioId: string;
-  /** 完整 Dataset 根；省略时定位内置 `eval-v1`。 */
-  readonly datasetRoot?: string;
+  /** 拥有 Benchmark Adapter v2 的当前游戏仓库。 */
+  readonly gameRepoRoot: string;
 }
 
 const CATEGORIES = new Set<EvalScenarioCategory>([
@@ -101,10 +100,6 @@ const CHECK_IDS = new Set([
   "game-architecture",
   "game-build",
 ]);
-
-function defaultDatasetRoot(): string {
-  return join(defaultEvalDatasetsRoot(), DEFAULT_EVAL_DATASET_ID);
-}
 
 function record(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -311,20 +306,8 @@ function parseExpected(value: unknown, requestedId: string): EvalScenarioExpecte
   };
 }
 
-async function readJson(path: string, label: string): Promise<unknown> {
-  const information = await lstat(path);
-  if (information.isSymbolicLink() || !information.isFile()) {
-    throw new Error(label + " 必须是普通文件");
-  }
-  try {
-    return JSON.parse(await readFile(path, "utf8")) as unknown;
-  } catch (error) {
-    throw new Error(label + " 不是有效 UTF-8 JSON", { cause: error });
-  }
-}
-
 /**
- * 严格读取一个内置 EvalScenario。
+ * 通过当前游戏 Adapter 严格读取一个 EvalScenario。
  *
  * @param options fixture ID 和可选测试根目录。
  * @returns 公开任务、确定性复现和隐藏判卷条件；调用方必须保持三者边界。
@@ -334,33 +317,22 @@ export async function readEvalScenario(
   options: EvalScenarioReadOptions,
 ): Promise<EvalScenario> {
   const id = scenarioId(options.scenarioId);
-  const datasetRoot = resolve(options.datasetRoot ?? defaultDatasetRoot());
-  const root = resolve(datasetRoot, "scenarios");
-  const rootInformation = await lstat(root);
-  if (rootInformation.isSymbolicLink() || !rootInformation.isDirectory()) {
-    throw new Error("Agent Eval fixture 根必须是真实目录");
-  }
-  const realRoot = await realpath(root);
-  const requestedDirectory = resolve(realRoot, id);
-  const directoryInformation = await lstat(requestedDirectory);
-  if (directoryInformation.isSymbolicLink() || !directoryInformation.isDirectory()) {
-    throw new Error("Agent Eval 案例必须是真实目录");
-  }
-  const directory = await realpath(requestedDirectory);
-  const escaped = relative(realRoot, directory);
-  if (!escaped || escaped.startsWith("..") || escaped.includes("/") || escaped.includes("\\")) {
-    throw new Error("Agent Eval 案例逃逸 fixture 根目录");
-  }
-  const [publicCase, reproduction, expected] = await Promise.all([
-    readJson(join(directory, "case.json"), "case.json").then((value) => parsePublicCase(value, id)),
-    readJson(join(directory, "reproduction.json"), "reproduction.json")
-      .then((value) => parseReproduction(value, id)),
-    readJson(join(directory, "expected.json"), "expected.json").then((value) => parseExpected(value, id)),
+  const gameRepoRoot = resolve(options.gameRepoRoot);
+  const described = await invokeGameBenchmarkAdapter(gameRepoRoot, [
+    "describe", "--fixture", id, "--audience", "runner",
   ]);
+  if (
+    described.suite !== "full"
+    || typeof described.sourceFingerprint !== "string"
+    || !/^[0-9a-f]{64}$/u.test(described.sourceFingerprint)
+  ) throw new Error("benchmark-adapter-scenario-invalid");
+  const publicCase = parsePublicCase(described.case, id);
+  const reproduction = parseReproduction(described.reproduction, id);
+  const expected = parseExpected(described.expected, id);
   for (const step of reproduction.steps) {
     if (step.op === "input-sql" && !(step.inputRef in expected.secretInputs)) {
       throw new Error("reproduction.json 引用了不存在的隐藏输入");
     }
   }
-  return { directory, publicCase, reproduction, expected };
+  return { directory: gameRepoRoot, publicCase, reproduction, expected };
 }

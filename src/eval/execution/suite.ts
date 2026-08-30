@@ -1,5 +1,5 @@
 /**
- * 固定 Dataset 的 EvalSuite 编排。
+ * 当前游戏 Adapter 套件的 EvalSuite 编排。
  *
  * Suite 只决定场景顺序、Profile、并发和断点恢复。每个 Run 自己创建 Workspace、Pi
  * session、端口与浏览器上下文；Worker 之间唯一共享的是只读 Dataset 和串行 checkpoint。
@@ -8,10 +8,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import {
-  DEFAULT_EVAL_DATASET_ID,
-  readEvalDataset,
-} from "../domain/dataset.js";
+import { readEvalDataset } from "../domain/dataset.js";
 import { EVAL_ORACLE_VERSION } from "../domain/oracle.js";
 import { runEvalPreflight, type EvalPreflightResult } from "./preflight.js";
 import { runEvalScenario, type EvalRunProfile, type EvalRunResult } from "./run.js";
@@ -41,9 +38,6 @@ export type EvalSuiteProfile = EvalRunProfile | "both";
 export interface EvalSuiteOptions {
   readonly dependencyRepoRoot: string;
   readonly archiveRoot: string;
-  readonly datasetId?: string;
-  /** Dataset 父目录，仅供仓库测试注入。 */
-  readonly datasetsRoot?: string;
   readonly repetitions: number;
   readonly timeoutMs?: number;
   readonly profile?: EvalSuiteProfile;
@@ -209,7 +203,6 @@ function failedPreflight(
 
 async function runEvalPreflights(input: {
   readonly options: Omit<EvalSuiteOptions, "repetitions" | "profile">;
-  readonly datasetRoot: string;
   readonly scenarioIds: readonly string[];
   readonly archiveRoot: string;
   readonly runIdentity: EvalRunIdentity;
@@ -224,7 +217,6 @@ async function runEvalPreflights(input: {
     try {
       let result = await runEvalPreflight({
         scenarioId,
-        datasetRoot: input.datasetRoot,
         datasetFingerprint: input.runIdentity.datasetFingerprint,
         dependencyRepoRoot: input.options.dependencyRepoRoot,
         archiveRoot: input.archiveRoot,
@@ -234,7 +226,6 @@ async function runEvalPreflights(input: {
       if (result.status === "infra_error") {
         result = await runEvalPreflight({
           scenarioId,
-          datasetRoot: input.datasetRoot,
           datasetFingerprint: input.runIdentity.datasetFingerprint,
           dependencyRepoRoot: input.options.dependencyRepoRoot,
           archiveRoot: input.archiveRoot,
@@ -256,10 +247,7 @@ async function runEvalPreflights(input: {
 export async function runEvalSuitePreflight(
   options: Omit<EvalSuiteOptions, "repetitions" | "profile">,
 ): Promise<EvalSuitePreflightResult> {
-  const dataset = await readEvalDataset(
-    options.datasetId ?? DEFAULT_EVAL_DATASET_ID,
-    options.datasetsRoot,
-  );
+  const dataset = await readEvalDataset(options.dependencyRepoRoot);
   const archiveDirectory = uniqueArchiveDirectory(options.archiveRoot, "preflight");
   await mkdir(archiveDirectory, { recursive: true });
   const runIdentity = await collectEvalRunIdentity({
@@ -268,7 +256,6 @@ export async function runEvalSuitePreflight(
   });
   const results = await runEvalPreflights({
     options,
-    datasetRoot: dataset.root,
     scenarioIds: dataset.scenarioIds,
     archiveRoot: archiveDirectory,
     runIdentity,
@@ -295,10 +282,7 @@ export async function runEvalSuite(options: EvalSuiteOptions): Promise<EvalSuite
   const suiteStartedAt = performance.now();
   const selectedProfile = options.profile ?? "maintainer";
   const workers = normalizeEvalWorkers(options.workers, selectedProfile === "both" ? 1 : 2);
-  const dataset = await readEvalDataset(
-    options.datasetId ?? DEFAULT_EVAL_DATASET_ID,
-    options.datasetsRoot,
-  );
+  const dataset = await readEvalDataset(options.dependencyRepoRoot);
   const runIdentity = await collectEvalRunIdentity({
     datasetFingerprint: dataset.fingerprint,
     oracleVersion: EVAL_ORACLE_VERSION,
@@ -374,7 +358,6 @@ export async function runEvalSuite(options: EvalSuiteOptions): Promise<EvalSuite
     try {
       const run = await runEvalScenario({
         scenarioId: job.scenarioId,
-        datasetRoot: dataset.root,
         datasetFingerprint: dataset.fingerprint,
         dependencyRepoRoot: options.dependencyRepoRoot,
         profile: job.profile,

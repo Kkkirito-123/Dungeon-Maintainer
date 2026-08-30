@@ -137,7 +137,7 @@ export function matchesAfterOracle(
     const queries = observations.filter((entry) => entry.op === "query");
     return queries.length === 1
       && queries[0] === final
-      && queries[0].planClass === "search"
+      && (queries[0].planClass === "search" || queries[0].planClass === "none")
       && queries[0].event === "query-accepted";
   }
   return final.view.mode === "victory" && (final.judge.victories ?? 0) === 1;

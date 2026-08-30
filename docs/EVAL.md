@@ -1,24 +1,24 @@
 # 内置 Eval
 
 Eval 把故障复现、现场演示和版本比较放进维护器，但不并入游戏业务代码。它复用正式
-Maintainer、Pi 和游戏驱动，不创建第二套 Agent Loop。
+Maintainer、Pi 和游戏驱动，不创建第二套 Agent Loop；场景由当前游戏仓库的 Adapter 实时提供。
 
 ## 三个独立边界
 
 ```text
-eval-datasets/          冻结输入：共享基线、七个场景、复现步骤、隐藏期望
+当前游戏仓库             benchmark/agent-evals + scripts/benchmark-adapter.mjs
        |
        v
-src/eval/               评测程序：读取、物化、执行、判卷、报告、进度页
+src/eval/               评测程序：读取 Adapter、物化、执行、判卷、报告、进度页
        |
        v
 当前游戏仓库             独立开发；静态合同检查与依赖复用
 ```
 
-- Dataset 是维护器版本的一部分，不读取当前游戏源码；修改游戏不会自动改变历史评测。
-- Eval 只从 `--dependencies` 指定的游戏仓库复用 `game/node_modules`，不会把其中源码当作场景定义。
-- `game-contract` 单独检查当前游戏的目录、脚本和协议 1.0 开发桥，不读取 Dataset，也不运行场景。
-- 新游戏版本要进入评测时，显式生成新的 Dataset 版本；不要原地修改 `eval-v1`。
+- Adapter 每次从 `--dependencies` 指定的当前游戏工作树读取场景和源码；修改游戏后下一次运行即使用新内容。
+- 物化目标是临时单提交 Git 仓库，并在其中保持本次测试的故障状态；真实游戏分支不切换、不写入。
+- Eval 只复用游戏仓库的 `game/node_modules`，不会把隐藏复现、期望或 benchmark 定义复制到目标仓库。
+- `game-contract` 单独检查当前游戏的目录、脚本和协议 1.0 开发桥，不读取隐藏数据，也不运行场景。
 
 这样，游戏开发、场景基线和评测执行可以分别变化，彼此通过窄合同连接。
 
@@ -31,7 +31,7 @@ src/eval/
 ├─ game-contract.ts       # 当前游戏的独立静态合同检查
 ├─ main.ts                # CLI 进程入口
 ├─ domain/                # 无进程副作用的领域数据与判定
-│  ├─ dataset.ts          # Dataset 清单与内容指纹
+│  ├─ dataset.ts          # 当前游戏 Adapter 清单与内容指纹
 │  ├─ scenario.ts         # Scenario 读取和严格校验
 │  ├─ oracle.ts           # 正式 after 验收与显式预检共用的纯 Oracle 规则
 │  └─ result.ts           # Profile 共用结果类型
@@ -66,12 +66,12 @@ ui 仅接收 progress 事件
 游戏尚未稳定时，只运行下列命令。它们不会启动 Vite、Chromium、模型或七个正式场景：
 
 ```powershell
-pnpm eval -- check
+pnpm eval -- check --repo "C:\path\to\select-from-dungeon"
 pnpm eval -- game-contract --repo "C:\path\to\select-from-dungeon"
 ```
 
-`check` 校验内置 Dataset 的目录、schema、场景顺序和内容指纹。`game-contract` 只做静态合同检查；
-游戏还在修改时它可以失败，但不会改变 Dataset。
+`check` 校验当前游戏 Adapter 的目录、schema、场景顺序和内容指纹。`game-contract` 只做静态合同检查；
+游戏还在修改时它可以失败，但不会写入游戏仓库。
 
 维护器自身的开发门禁同样不执行正式场景：
 
@@ -107,11 +107,10 @@ pnpm eval -- run `
   --dependencies "C:\path\to\select-from-dungeon"
 ```
 
-运行完整 Dataset：
+运行 Adapter catalog 中的完整套件：
 
 ```powershell
 pnpm eval -- suite `
-  --dataset eval-v1 `
   --profile maintainer `
   --workers 2 `
   --dependencies "C:\path\to\select-from-dungeon" `
@@ -122,7 +121,6 @@ pnpm eval -- suite `
 
 ```powershell
 pnpm eval -- compare `
-  --dataset eval-v1 `
   --workers 1 `
   --dependencies "C:\path\to\select-from-dungeon" `
   --ui progress
@@ -138,30 +136,30 @@ pnpm eval -- compare `
   -> schema v7 结果
 ```
 
-Eval Agent 与 Pi Baseline 复用当前维护器的 API Key 与 Base URL，并在 Eval 内固定使用
-`deepseek-v4-flash`、关闭 reasoning；这不会改变生产维护器的默认模型。Agent settled 后不再调用
+Eval Agent 与 Pi Baseline 复用当前维护器的 API Key 与 Base URL，默认使用 `deepseek-v4-flash`；
+需要跨模型实测时可用 `DUNGEON_EVAL_MODEL` 显式选择同一模型。Eval 始终关闭 reasoning，且不会改变生产维护器的默认模型。Agent settled 后不再调用
 第二个模型，功能结果只来自隐藏浏览器 Oracle。
 
 单 Profile 默认 2 个 Worker，对比默认 1 个 Worker，可显式设置为 1 至 4。每个 Worker 拥有独立
 Workspace 和 Pi Session；每个 Run 的 Vite、Chromium 与工具生命周期也彼此独立。隐藏 Oracle 只在
 该 Profile 已停止并卸载工具后启动，不向 Agent 反馈结果。单个 Job 失败不会中止其它 Job，最终结果
-仍按 Dataset 顺序输出。多 Worker 的耗时不与单 Worker 历史结果直接比较，报告会写出
+仍按 Adapter catalog 顺序输出。多 Worker 的耗时不与单 Worker 历史结果直接比较，报告会写出
 `timingComparable`。
 
-`--resume <归档目录>` 只恢复运行身份一致的 checkpoint。Dataset、维护器工作树、模型配置或
+`--resume <归档目录>` 只恢复运行身份一致的 checkpoint。当前游戏工作树、维护器工作树、模型配置或
 Oracle 版本任一变化，旧 checkpoint 都不会复用。
 
-## Dataset
+## 当前游戏 Adapter
 
 ```text
-eval-datasets/eval-v1/
-├─ dataset.json           # 固定场景顺序
-├─ base/                  # 一份共享干净仓库
-└─ scenarios/<id>/        # 公开任务、复现、隐藏期望和故障补丁
+select-from-dungeon/
+├─ scripts/benchmark-adapter.mjs  # catalog/describe/materialize 协议
+└─ benchmark/agent-evals/<id>/    # 公开任务、复现、隐藏期望和故障补丁
 ```
 
-生产代码对外统一使用 `scenarioId`。冻结 JSON 仍保留历史字段 `fixtureId`，只作为 `eval-v1` 的
-只读兼容格式，不扩散到 CLI、报告或新代码命名。
+生产代码对外统一使用 `scenarioId`。Adapter JSON 使用 `fixtureId` 作为协议字段；维护器内部不会
+保留第二份场景快照。`sourceFingerprint` 绑定当前游戏 HEAD、工作树和 Adapter，工作树变化会使
+旧的预检证书和 checkpoint 失效。
 
 ## 判分与隐私
 
@@ -173,7 +171,7 @@ PASS 的功能公式固定为 `agentSettled && afterOracleMatched`，故障成�
 评测不比较代码、Diff、测试数量或参考实现，也不要求候选修复与原实现一致；维护器工作流闭环只作为
 诊断字段。after Oracle 失败即功能未恢复，浏览器或评测基础设施失败则单独记为基础设施错误。
 
-显式 `preflight` 只校准 Dataset：故障版应失败、干净版应通过。Suite 不消费其证书，也不会把这两次
+显式 `preflight` 只校准当前 Adapter：故障版应失败、干净版应通过。Suite 不消费其证书，也不会把这两次
 校准重复到每个正式 Run；正式 Run 始终只有一次候选 after Oracle。
 
 Suite 报告使用 schema v7，并在 `usage` 中汇总 `agentTokens`、`totalTokens`、`toolCalls`、

@@ -69,9 +69,7 @@ export interface EvalPreflightResult {
 /** 预检参数；依赖仓库必须由调用方显式提供，避免评测期间联网安装。 */
 export interface EvalPreflightOptions {
   readonly scenarioId: string;
-  /** 完整 Dataset 根；省略时读取内置 eval-v1。 */
-  readonly datasetRoot?: string;
-  /** 已由 EvalDataset 读取器验证的完整内容指纹。 */
+  /** 已由当前游戏 Adapter catalog 返回的完整内容指纹。 */
   readonly datasetFingerprint: string;
   readonly dependencyRepoRoot: string;
   readonly archiveRoot?: string;
@@ -84,14 +82,14 @@ function evalDependencyKey(path: string): string {
   return createHash("sha256").update(resolve(path)).digest("hex").slice(0, 16);
 }
 
-/** 从固定 Dataset 读取一个 EvalScenario。 */
+/** 从当前游戏 Adapter 读取一个 EvalScenario。 */
 export async function loadEvalScenario(options: {
   readonly scenarioId: string;
-  readonly datasetRoot?: string;
+  readonly gameRepoRoot: string;
 }): Promise<EvalScenario> {
   return await readEvalScenario({
     scenarioId: options.scenarioId,
-    ...(options.datasetRoot ? { datasetRoot: options.datasetRoot } : {}),
+    gameRepoRoot: options.gameRepoRoot,
   });
 }
 
@@ -181,14 +179,17 @@ export async function runEvalPreflight(
   let failureCode: string | null = null;
   let browserErrorCount = 0;
   try {
-    scenario = await loadEvalScenario(options);
+    scenario = await loadEvalScenario({
+      scenarioId: options.scenarioId,
+      gameRepoRoot: options.dependencyRepoRoot,
+    });
     runIdentity = await resolveEvalRunIdentity(options.datasetFingerprint, options.runIdentity);
     const timeoutMs = options.timeoutMs ?? scenario.publicCase.timeoutMs;
     temporaryRoot = await mkdtemp(join(tmpdir(), "dungeon-agent-eval-"));
     workspaceRoot = join(temporaryRoot, "repository");
     await createEvalWorkspace({
       scenarioId: scenario.publicCase.scenarioId,
-      ...(options.datasetRoot ? { datasetRoot: options.datasetRoot } : {}),
+      gameRepoRoot: options.dependencyRepoRoot,
       destination: workspaceRoot,
     });
     dependencyLease = await provisionEvalDependencies({
@@ -210,7 +211,7 @@ export async function runEvalPreflight(
       const cleanRoot = join(temporaryRoot, "clean-repository");
       await createEvalWorkspace({
         scenarioId: scenario.publicCase.scenarioId,
-        ...(options.datasetRoot ? { datasetRoot: options.datasetRoot } : {}),
+        gameRepoRoot: options.dependencyRepoRoot,
         destination: cleanRoot,
         variant: "clean",
       });

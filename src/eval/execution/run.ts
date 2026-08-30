@@ -3,7 +3,7 @@
  *
  * 本模块只物化故障仓库、运行一个 Profile 到自然 settled，并在 Profile 已停止后执行一次
  * 隐藏浏览器 Oracle。它不读取候选 Diff、HEAD 或路径，不比较参考实现，也不调用第二个模型。
- * 输入来自冻结 Dataset 与公开任务，隐藏复现和断言只交给进程外 Oracle；输出是低敏结果与
+ * 输入来自当前游戏 Adapter 与公开任务，隐藏复现和断言只交给进程外 Oracle；输出是低敏结果与
  * 时间/Token 指标。Agent 只获临时工作区权限，不能读取隐藏判定输入。副作用限于临时仓库、
  * Agent/游戏子进程和可选结果归档，均在本轮回收；启动、卸载或 Oracle 失败会分类为
  * `infra_error`，修正环境后可重跑完整 Scenario。
@@ -87,9 +87,7 @@ export interface EvalRunResult {
 /** 一次真实模型游戏修复 Eval 的参数。 */
 export interface EvalRunOptions {
   readonly scenarioId: string;
-  /** 完整 Dataset 根；省略时读取内置 eval-v1。 */
-  readonly datasetRoot?: string;
-  /** 已由 EvalDataset 读取器验证的完整内容指纹。 */
+  /** 已由当前游戏 Adapter catalog 返回的完整内容指纹。 */
   readonly datasetFingerprint: string;
   readonly dependencyRepoRoot: string;
   readonly profile: EvalRunProfile;
@@ -265,7 +263,10 @@ export async function runEvalScenario(
   let agentStartedAt: number | null = null;
 
   try {
-    const scenario = await loadEvalScenario(options);
+    const scenario = await loadEvalScenario({
+      scenarioId: options.scenarioId,
+      gameRepoRoot: options.dependencyRepoRoot,
+    });
     const runIdentity = await resolveEvalRunIdentity(
       options.datasetFingerprint,
       options.runIdentity,
@@ -278,7 +279,7 @@ export async function runEvalScenario(
     const workspaceRoot = join(temporaryRoot, "repository");
     await createEvalWorkspace({
       scenarioId: scenario.publicCase.scenarioId,
-      ...(options.datasetRoot ? { datasetRoot: options.datasetRoot } : {}),
+      gameRepoRoot: options.dependencyRepoRoot,
       destination: workspaceRoot,
     });
     sourcePatchMaterialized = true;

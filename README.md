@@ -155,7 +155,7 @@ Shell 与后端仅通过本机 HTTP/SSE 通信，API Key 不进入浏览器。
    编辑后的实际 Git 增量会同步到任务记录，旧验证立即失效。
 6. 第一字节写入前保存临时浏览器检查点。写入 worktree 后等待 Vite 更新，刷新页面、消费检查点，
    重新建立同一起点检查点并重放相同语义动作。
-7. Agent 调用 `finish(status=result)` 自动运行固定检查、恢复重放和 hidden judge 断言；全部通过才进入 `ready_to_apply`。`/verify` 只用于人工重试。
+7. Agent 修改完成后默认自然结束，用户稍后用 `/verify` 运行固定检查、恢复重放和 hidden judge 断言；用户明确要求立即验证时，Agent 才调用 `finish(status=result)` 完成同一流程。
 8. 用户执行 `/apply`。维护器重新检查来源工作树仍与启动快照完全一致、HEAD、目标文件 Hash、
    worktree Hash 和 `git apply --check`，成功后只写入 Agent 增量。
 
@@ -274,20 +274,49 @@ Shell 只展示低敏摘要，不传输 API Key、完整 Prompt、thinking、SQL
 
 ```powershell
 pnpm eval -- suite `
-  --dataset eval-v1 `
   --profile maintainer `
   --workers 2 `
   --dependencies "C:\path\to\select-from-dungeon" `
   --ui progress
 ```
 
-Eval Dataset 固定在 `eval-datasets/`，不读取当前游戏源码。正式运行只从 `--dependencies` 指定的
-游戏仓库复用已安装的 `game/node_modules`；游戏开发和评测基线互不修改。单 Profile 默认并行
-2 个独立 Worker，公平对比默认 1 个；每个 Run 拥有独立的 Workspace、Pi Session、Vite 和 Chromium。
-Eval 复用当前 Key 与 Base URL，并为被测 Agent 和 Pi Baseline 固定 `deepseek-v4-flash`、关闭
-reasoning，不改变生产默认模型。`preflight` 是显式的零模型校准：确认故障版命中失败 Oracle、
+Benchmark 场景由 `--dependencies` 指定的当前游戏仓库中的 `scripts/benchmark-adapter.mjs`
+实时列出；每次 Run 都从当下工作树生成独立临时仓库并注入故障，不修改真实游戏分支。物化目标只
+复用已安装的 `game/node_modules`，不会复制隐藏 benchmark 数据。单 Profile 默认并行 2 个独立
+Worker，公平对比默认 1 个；每个 Run 拥有独立的 Workspace、Pi Session、Vite 和 Chromium。
+Eval 复用当前 Key 与 Base URL，被测 Agent 和 Pi Baseline 默认使用 `deepseek-v4-flash`，可用
+`DUNGEON_EVAL_MODEL` 显式选择同一模型，并始终关闭 reasoning；这不改变生产默认模型。`preflight` 是显式的零模型校准：确认故障版命中失败 Oracle、
 干净版命中通过 Oracle；它不阻塞 `run`、`suite` 或 `compare`，正式 Run 仍只执行一次候选 after Oracle。
 目录分层、判定边界、统计口径、版本指纹和断点恢复见 [docs/EVAL.md](docs/EVAL.md)。
+
+### 7 场真实 Benchmark
+
+当前游戏 Adapter `full` 套件的实测结果如下。四组都关闭 reasoning；公平的 Pro 对比和 Pi Flash
+基线使用单 Worker。Maintainer Flash 使用 2 个 Worker，并在中断后通过 `--resume` 继续，因而它的
+通过率、Token 和工具调用可比较，但累计耗时不能与三个单 Worker 结果严格横向比较。
+
+| 方案 | 模型 | Workers | 通过 | Timeout | 总 Token | 缓存命中率 | 工具调用 | 累计 Run 耗时 | 平均 Run |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Dungeon Maintainer | Flash | 2 | **7/7** | 0 | **3,667,555** | 95.14% | **226** | 1,550.786s | **221.541s** |
+| Dungeon Maintainer | Pro | 1 | **7/7** | 0 | 4,662,858 | 95.67% | 254 | 1,890.915s | 270.131s |
+| Pi 原版 Baseline | Pro | 1 | **7/7** | 0 | 9,975,944 | 94.26% | 317 | 2,680.705s | 382.958s |
+| Pi 原版 Baseline | Flash | 1 | **2/7** | **5** | 9,796,788 | 96.17% | 355 | 3,929.883s | 561.412s |
+
+每个明细单元格依次为 `结果 / Token / 缓存命中率 / 工具调用 / Run 耗时`：
+
+| 场景 | Maintainer Flash | Maintainer Pro | Pi 原版 Pro | Pi 原版 Flash |
+|---|---|---|---|---|
+| `terminal-action-bug` | 通过 / 367,095 / 92.94% / 26 / 139.541s | 通过 / 597,521 / 94.71% / 31 / 216.319s | 通过 / 2,050,118 / 92.02% / 57 / 518.079s | 通过 / 678,913 / 95.35% / 35 / 505.403s |
+| `accepted-query-without-progress` | 通过 / 431,384 / 94.20% / 31 / 252.097s | 通过 / 718,144 / 96.14% / 39 / 203.730s | 通过 / 636,671 / 95.66% / 33 / 230.444s | 通过 / 987,840 / 95.71% / 37 / 315.838s |
+| `final-stage-boss-stuck-at-one-hp` | 通过 / 292,238 / 93.75% / 25 / 264.581s | 通过 / 460,351 / 95.22% / 26 / 276.167s | 通过 / 887,680 / 96.03% / 33 / 225.708s | **timeout** / 1,112,392 / 97.23% / 48 / 621.412s |
+| `admin-floor-transition-deadlock` | 通过 / 798,980 / 96.16% / 42 / 307.311s | 通过 / 679,837 / 95.33% / 38 / 340.768s | 通过 / 1,343,521 / 91.88% / 43 / 392.968s | **timeout** / 3,353,168 / 96.89% / 94 / 620.410s |
+| `transition-lost-after-reload` | 通过 / 778,869 / 96.37% / 35 / 184.844s | 通过 / 936,003 / 96.41% / 43 / 283.846s | 通过 / 2,043,908 / 95.55% / 58 / 567.158s | **timeout** / 1,618,725 / 94.27% / 59 / 620.285s |
+| `stale-query-plan-evidence` | 通过 / 624,037 / 95.32% / 36 / 193.503s | 通过 / 818,892 / 95.95% / 45 / 279.379s | 通过 / 1,872,357 / 94.13% / 54 / 466.116s | **timeout** / 1,451,540 / 97.15% / 44 / 626.066s |
+| `duplicate-final-victory-commit` | 通过 / 374,952 / 94.37% / 31 / 208.909s | 通过 / 452,110 / 95.12% / 32 / 290.706s | 通过 / 1,141,689 / 96.78% / 39 / 280.232s | **timeout** / 594,210 / 94.54% / 38 / 620.469s |
+
+在同为单 Worker 且 7/7 通过的 Pro 对比中，Maintainer 相比 Pi 原版减少 53.26% Token、
+19.87% 工具调用和 29.46% 累计 Run 耗时。缓存命中率只表示输入复用比例；Pi Flash 在 5 个
+超时循环中也会持续命中缓存，因此不能单独作为效率或成功率指标。
 
 模型上下文保留 Pi 原生 Session 历史和 compact。维护器不设置请求级工具次数或 Token 强制上限；
 自动重试、compact、steer、abort 和自然结束保持 Pi 原生语义。每条自然语言输入发送前仍执行

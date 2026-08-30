@@ -1,8 +1,0 @@
-{
-  "schemaVersion": 2,
-  "id": "accepted-query-without-progress",
-  "base": "game-repair",
-  "sourcePatch": "source.patch",
-  "patchSha256": "5a44fd15fe035041e9dc2a295bbcfb9233c0b4e39b2d29c86a120d5f8d8f0b89",
-  "dirtyPaths": ["game/src/domain/session/GameSession.ts"]
-}
