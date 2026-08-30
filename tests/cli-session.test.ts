@@ -18,7 +18,7 @@ import { FULL_CODING_TOOLS } from "../src/pi/tool-policy.js";
 import { createTaskRecordFixture, createTemporaryGitRepository } from "./testSupport.js";
 
 describe("外部 CLI 与固定 Pi 启动参数", () => {
-  it("只接受 start、resume 和 help 三种入口", () => {
+  it("只接受 start、resume、eval 和 help 四种入口", () => {
     assert.deepEqual(parseMaintainerCli([]), { action: "help" });
     assert.deepEqual(
       parseMaintainerCli(["start", "--repo", "C:/game"]),
@@ -27,6 +27,10 @@ describe("外部 CLI 与固定 Pi 启动参数", () => {
     assert.deepEqual(
       parseMaintainerCli(["resume", "task-1"]),
       { action: "resume", taskId: "task-1" },
+    );
+    assert.deepEqual(
+      parseMaintainerCli(["eval", "suite", "--help"]),
+      { action: "eval", args: ["suite", "--help"] },
     );
     assert.throws(
       () => parseMaintainerCli(["start", "C:/game"]),

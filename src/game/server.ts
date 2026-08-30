@@ -74,6 +74,10 @@ export async function startGameServer(
     ],
     {
       cwd: gameRoot,
+      env: {
+        ...process.env,
+        DUNGEON_MAINTAINER_VITE_CACHE_DIR: join(repoRoot, ".vite-cache"),
+      },
       stdio: "ignore",
       windowsHide: true,
       shell: false,

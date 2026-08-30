@@ -12,8 +12,8 @@ TypeScript 标识符使用清晰英文领域词。
 ```text
 Chromium Shell -> Pi RPC -> src/pi/extension.ts
   -> session-policy + game-runtime
-  -> inspect / patch / check / finish
-  -> look / go / use / query
+  -> inspect / edit / check / finish / workspace
+  -> look / act / query
   -> task + workspace + repair + game + logging
 ```
 
@@ -34,7 +34,7 @@ src/pi/extension.ts      Pi Provider、工具、命令和生命周期装配
 src/pi/session-policy.ts Pi 会话绑定、模型/会话切换阻断
 src/pi/game-runtime.ts   单 Vite、临时 Chromium 和 GameDriver 生命周期
 src/pi/tool-policy.ts    只读诊断与本轮完整执行的活动工具集合
-src/pi/tools/            十个固定领域工具（含总方案审批与工作树切换）
+src/pi/tools/            八个固定模型工具（含总方案审批与工作树切换；不加载 Pi 原生工具）
 src/pi/commands/         五个固定用户命令
 src/shell/               Chromium Shell 页面、HTTP/SSE 协议和状态栏
 src/task/                当前 schema v4 任务事实与状态机
@@ -42,26 +42,32 @@ src/workspace/           Git、realpath、补丁、检查、apply 与 worktree
 src/game/                Vite、临时 Chromium、协议客户端与语义驱动
 src/repair/              复现、刷新重放与验证
 src/logging/             低敏事件、脱敏与 500 条语义 Trace
+src/eval/domain/         当前游戏 Adapter 清单、Scenario、Oracle 和 Profile 共用结果契约
+src/eval/execution/      Workspace、预检、单次运行、并行 Suite 和进度事件
+src/eval/profiles/       互不依赖的 Maintainer 与 Pi Baseline
+src/eval/reporting/      运行身份、checkpoint 和结果汇总
+src/eval/ui/             Eval 静态进度页和本地 SSE 服务
+（Benchmark 场景由当前游戏仓库的 `scripts/benchmark-adapter.mjs` 暴露）
 tests/                   Node 测试；安全边界优先使用真实临时 Git 仓库
 ```
 
 不要在相邻模块复制权威：任务状态只由 `TaskStore` 持久化；正式仓库写入只由
-`workspace/apply.ts` 执行；浏览器只能调用当前协议 v3 固定方法；Pi prompt 不能替代执行层权限。
+`workspace/apply.ts` 执行；浏览器只能调用协议 1.0 固定方法；Pi prompt 不能替代执行层权限。
 
 ## 开发规则
 
 - 修改前读取 Git 状态、拥有行为的模块、对应测试和设计文档；保留无关用户工作。
 - 只实现当前明确目标，优先最小完整切片；不要为单次调用建立泛化抽象或兼容层。
-- 诊断阶段可以提出精确 write/patch；第一次调用由执行层按目标文件申请用户批准，批准后才真正写入；
+- 诊断阶段可以提出精确 edit；第一次调用由执行层按目标文件申请用户批准，批准后才真正写入；
   本轮结束必须自动收权。
-- 任意 Bash 不加载；原生 edit/write 也必须经过 detached worktree 的项目相对路径和 realpath 边界。
+- 任意 Pi 原生工具和 Bash 均不加载；所有源码写入统一经过维护器自有 edit。
 - 所有文件访问必须先规范项目相对路径，再通过 `realpath`/最近存在父目录检查符号链接逃逸。
-- `patch` 必须绑定最新 `baseHash`、唯一旧文本和 3 文件/120 行预算；模型调用时复用当前已批准的
-  精确写入范围，不得为同一文件重复打断用户。
+- `edit` 必须绑定最新 `baseHash` 和 3 文件/120 行预算；replace 要求唯一旧文本，write/create
+  要求完整正文，create 固定使用 `missing` Hash。模型调用时复用当前已批准的精确写入范围。
 - 第一字节源码写入前必须存在浏览器复现检查点；写入后按刷新、恢复、重建检查点、重放的顺序执行。
 - 所有 Agent 修改只进入 detached worktree。正式仓库仅由用户 `/apply` 修改，且不自动提交。
 - 来源工作树允许脏状态；启动时复制为隔离 index 基线，后续 Diff 只包含 Agent 增量。
-- `tree` 只能枚举同一 Git common-dir 的合法游戏 worktree；切换必须确认并创建新任务，不能原地偷换 cwd。
+- `workspace` 只能枚举同一 Git common-dir 的合法游戏 worktree；切换必须确认并创建新任务，不能原地偷换 cwd。
 - 不输出、记录或持久化 API Key、模型正文、SQL、答案、完整地图、正式存档、背包、身份或帧画面。
 - 删除终态 worktree 前必须验证解析后的精确目标是配置 `worktrees/` 下的单个任务子目录。
 
@@ -101,9 +107,17 @@ dungeon-maintain start --repo <游戏仓库>
 dungeon-maintain resume <task-id>
 ```
 
-Pi 原生工具只加载 `edit/write`；源码读取、搜索、目录和 Diff 统一走安全 `inspect`。领域工具固定为
-`inspect/patch/check/finish/look/go/use/input_sql/query/tree`；用户命令固定为 `/play /diff /verify /apply /discard`。
+Pi 不加载原生工具。维护器向模型固定注册且仅注册 8 个工具：
+`inspect/edit/check/finish/workspace/look/act/query`；用户命令固定为 `/play /diff /verify /apply /discard`。
+`inspect` 统一负责源码、Diff、Git 状态和 Evidence list/get；内部重放仍使用
+`look/go/use/input-sql/query` 语义 Trace，但这些内部动作不是模型工具。
 新增能力前必须先修改已批准设计，不能通过配置动态扩展。
+
+维护器内部评测统一称为 `Eval`（入口为 `pnpm eval`，代码位于 `src/eval/`）。Eval 通过
+`--dependencies` 调用当前游戏仓库的 `scripts/benchmark-adapter.mjs` 读取场景，并在每次
+物化时复制当下工作树、注入故障、建立临时单提交 Git 仓库；真实游戏分支不会被切换或写入。
+Adapter 的隐藏复现和期望只留在游戏仓库，物化目标不包含 `benchmark/`、Adapter 或凭据。
+游戏合同由独立 `game-contract` 静态检查维护。
 
 任务记录只接受当前 schema v4，不迁移旧格式。状态机为：
 
@@ -126,7 +140,7 @@ pnpm test
 pnpm build
 ```
 
-测试必须覆盖 CLI/Pi 参数、诊断阶段禁写、总方案确认、单轮收权、原生编辑同步、会话绑定、
+测试必须覆盖 CLI/Pi 参数、诊断阶段禁写、总方案确认、单轮收权、edit 写后同步、会话绑定、
 状态迁移、绝对路径与 `..`、符号链接、审批拒绝与消费、
 Hash 冲突、worktree 隔离、刷新重放顺序、日志脱敏、apply 漂移和 discard 清理。Git 安全测试使用
 真实临时仓库，不能只用 mock。
@@ -145,8 +159,9 @@ Pi 子进程继续使用 RPC/JSONL；游戏由 Playwright 在同一个 Chromium 
 管理员答案、隐藏裁判或浏览器帧。允许本地 HTTP/SSE 仅用于当前任务的 Shell，不得扩展成公网服务。
 
 长模型请求必须通过 `activity` SSE 事件在固定 `role=status` 区域给出即时阶段反馈；反馈只使用
-确定性运行时事件和计时，不得额外请求模型或向聊天记录周期性追加消息。同一任务一次只接受一个
-自然语言输入，完成、拒绝或错误后必须恢复输入控件。
+确定性运行时事件和计时，不得额外请求模型或向聊天记录周期性追加消息。同一任务同一时刻只运行一个
+自然语言回合；回合运行中允许通过 Pi 原生 `steer` 追加文字要求，固定命令仍需等待回合结束。
+用户可通过 Pi 原生 `abort` 停止当前回合；收到 `agent_settled` 或请求明确完成后必须恢复输入控件。
 
 涉及游戏桥时，还要在目标游戏仓库运行聚焦测试、完整游戏测试、架构检查和生产构建，并确认
 `game/dist` 不含 `__DUNGEON_PLAYTEST__`。只报告实际执行的检查，不把静态或 mock 证据称为端到端。

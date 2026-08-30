@@ -1,5 +1,5 @@
 /**
- * 任务级 Evidence Ledger 与项目级解决方案索引。
+ * 任务级 Evidence Ledger。
  *
  * EvidenceStore 是证据身份、缓存命中、失效和恢复的唯一事实源。TaskStore 只保存任务
  * 状态与写入权限；events.jsonl 只保存低敏审计事件。证据采用 JSONL 追加写入，进程
@@ -16,9 +16,6 @@ import type {
   CheckRecord,
   EvidenceRecord,
   EvidenceStatus,
-  SolutionIndexRecord,
-  SolutionRecord,
-  SolutionSearchResult,
 } from "./types.js";
 
 function digest(value: string): string {
@@ -49,13 +46,6 @@ function safeArtifactText(value: string): { text: string; reusable: boolean } {
     return [line];
   }).join("\n").slice(0, 8 * 1024);
   return { text, reusable };
-}
-
-function safeProjectKey(repoRoot: string): string {
-  const normalized = process.platform === "win32"
-    ? resolve(repoRoot).toLowerCase()
-    : resolve(repoRoot);
-  return digest(normalized).slice(0, 16);
 }
 
 const EVIDENCE_RECORD_KEYS = [
@@ -94,11 +84,6 @@ function isNullableString(value: unknown): value is string | null {
 
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
-}
-
-function isStringRecord(value: unknown): value is Record<string, string> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  return Object.values(value).every((item) => typeof item === "string");
 }
 
 function isMetadata(value: unknown): boolean {
@@ -173,74 +158,6 @@ function recordActionKeys(record: EvidenceRecord): string[] {
   ].filter((value): value is string => Boolean(value)))];
 }
 
-function validSolutionIndex(value: unknown): value is SolutionIndexRecord {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const record = value as Record<string, unknown>;
-  return hasExactKeys(record, [
-    "schemaVersion",
-    "id",
-    "projectKey",
-    "title",
-    "description",
-    "category",
-    "searchText",
-    "relatedPaths",
-    "detailRef",
-    "createdAt",
-  ])
-    && record.schemaVersion === 1
-    && typeof record.id === "string"
-    && typeof record.projectKey === "string"
-    && typeof record.title === "string"
-    && typeof record.description === "string"
-    && typeof record.category === "string"
-    && typeof record.searchText === "string"
-    && isStringArray(record.relatedPaths)
-    && typeof record.detailRef === "string"
-    && typeof record.createdAt === "string";
-}
-
-function validSolutionRecord(
-  value: unknown,
-  id: string,
-  projectKey: string,
-): value is SolutionRecord {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const record = value as Record<string, unknown>;
-  return hasExactKeys(record, [
-    "schemaVersion",
-    "id",
-    "projectKey",
-    "taskId",
-    "title",
-    "symptom",
-    "rootCause",
-    "planTitle",
-    "steps",
-    "verification",
-    "relatedPaths",
-    "evidenceRefs",
-    "buggyHashes",
-    "fixedHashes",
-    "createdAt",
-  ])
-    && record.schemaVersion === 1
-    && record.id === id
-    && record.projectKey === projectKey
-    && typeof record.taskId === "string"
-    && typeof record.title === "string"
-    && typeof record.symptom === "string"
-    && typeof record.rootCause === "string"
-    && typeof record.planTitle === "string"
-    && isStringArray(record.steps)
-    && typeof record.verification === "string"
-    && isStringArray(record.relatedPaths)
-    && isStringArray(record.evidenceRefs)
-    && isStringRecord(record.buggyHashes)
-    && isStringRecord(record.fixedHashes)
-    && typeof record.createdAt === "string";
-}
-
 async function readJsonLines<T>(
   path: string,
   validate: (value: unknown) => value is T,
@@ -275,61 +192,16 @@ async function readJsonLines<T>(
   return output;
 }
 
-function normalizedTokens(value: string): Set<string> {
-  const normalized = value
-    .toLowerCase()
-    .replaceAll("首领", " boss ")
-    .replaceAll("下一关", " floor-advance ")
-    .replaceAll("下一层", " floor-advance ")
-    .replaceAll("卡死", " stuck ")
-    .replaceAll("卡住", " stuck ")
-    .replaceAll("卡在", " stuck ")
-    .replaceAll("传送门", " portal ")
-    .replace(/[^\p{L}\p{N}_./-]+/gu, " ")
-    .trim();
-  const tokens = normalized.split(/\s+/u).filter(Boolean);
-  for (const token of [...tokens]) {
-    if (/^[\p{Script=Han}]+$/u.test(token) && token.length > 1) {
-      for (let index = 0; index < token.length - 1; index += 1) {
-        tokens.push(token.slice(index, index + 2));
-      }
-    }
-  }
-  return new Set(tokens);
-}
-
-function searchScore(query: string, entry: SolutionIndexRecord): number {
-  const queryTokens = normalizedTokens(query);
-  const targetTokens = normalizedTokens([
-    entry.title,
-    entry.description,
-    entry.category,
-    entry.searchText,
-    ...entry.relatedPaths,
-  ].join(" "));
-  let score = 0;
-  for (const token of queryTokens) {
-    if (targetTokens.has(token)) score += token.length > 2 ? 12 : 6;
-  }
-  const normalizedQuery = [...queryTokens].join(" ");
-  if (entry.searchText.toLowerCase().includes(normalizedQuery) && normalizedQuery) {
-    score += 30;
-  }
-  return score;
-}
-
 /** 与一个任务和正式仓库绑定的证据存储。 */
 export class EvidenceStore {
   readonly dataDir: string;
   readonly task: TaskRecord;
-  readonly projectKey: string;
   private records = new Map<string, EvidenceRecord>();
   /** 同一 ID 最后一条 JSONL 快照对应的单调账本序号。 */
   private recordRevisions = new Map<string, number>();
   private actionIndex = new Map<string, string>();
   /** 同一 kind、fingerprint 和有效版本下的 active 事实索引。 */
   private fingerprintIndex = new Map<string, string>();
-  private solutions = new Map<string, SolutionIndexRecord>();
   private loaded = false;
   private loadPromise: Promise<void> | null = null;
   private currentRevision = 0;
@@ -339,7 +211,6 @@ export class EvidenceStore {
   constructor(dataDir: string, task: TaskRecord) {
     this.dataDir = resolve(dataDir);
     this.task = task;
-    this.projectKey = safeProjectKey(task.repoRoot);
   }
 
   get revision(): number {
@@ -356,14 +227,6 @@ export class EvidenceStore {
 
   private evidencePath(): string {
     return join(this.taskDirectory(), "evidence.jsonl");
-  }
-
-  private projectDirectory(): string {
-    return join(this.dataDir, "projects", this.projectKey);
-  }
-
-  private solutionIndexPath(): string {
-    return join(this.projectDirectory(), "solution-index.jsonl");
   }
 
   private rebuildIndexes(): void {
@@ -387,7 +250,7 @@ export class EvidenceStore {
     return await pending;
   }
 
-  /** 从磁盘重建任务证据和项目解决方案索引。 */
+  /** 从磁盘重建任务证据。 */
   async load(): Promise<void> {
     if (this.loaded) return;
     this.loadPromise ??= (async () => {
@@ -400,15 +263,6 @@ export class EvidenceStore {
         }
         this.records.set(record.id, record);
         this.recordRevisions.set(record.id, index + 1);
-      }
-      for (const solution of await readJsonLines(
-        this.solutionIndexPath(),
-        validSolutionIndex,
-      )) {
-        if (solution.projectKey !== this.projectKey) {
-          throw new Error("解决方案索引 projectKey 与项目目录不匹配");
-        }
-        this.solutions.set(solution.id, solution);
       }
       // revision 表示追加事件数，不是唯一证据 ID 数；状态失效也必须占一个序号。
       this.currentRevision = records.length;
@@ -487,7 +341,9 @@ export class EvidenceStore {
       taskId: this.task.id,
       actionAliases: [],
       summary: safeSummary(candidate.summary),
-      links: [...new Set(candidate.links)].slice(0, 32),
+      // 上游过多时保留最近取得的事实。长调查中最新病因、变更和验证比最早的
+      // 探测更能支撑当前结论；输入顺序由调用方保持为时间正序。
+      links: [...new Set(candidate.links)].slice(-32),
       metadata: Object.fromEntries(Object.entries(candidate.metadata).map(([key, value]) => [
         key,
         typeof value === "string" ? safeSummary(value).slice(0, 300) : value,
@@ -634,7 +490,7 @@ export class EvidenceStore {
     await this.appendRecord({ ...record, status, createdAt: new Date().toISOString() });
   }
 
-  /** 文件修改后让相关源码证据、旧整树快照和全部旧检查/验证失效。 */
+  /** 文件修改后让旧版本源码、变更、终态结论、检查和验证失效。 */
   async invalidatePaths(
     paths: readonly string[],
     currentWorktreeHash?: string,
@@ -653,6 +509,11 @@ export class EvidenceStore {
           ))
           || record.kind === "check"
           || record.kind === "verification"
+          || (record.kind === "change" && (
+            currentWorktreeHash === undefined
+            || record.worktreeHash !== currentWorktreeHash
+          ))
+          || (record.kind === "claim" && record.metadata.finishStatus !== "proposed")
         ) {
           await this.updateStatus(record, "stale");
         }
@@ -677,8 +538,8 @@ export class EvidenceStore {
   /**
    * 新修复目标开始时隔离上一目标的任务级事实。
    *
-   * 项目级 Solution 索引不受影响；同一目标的“继续”也不会调用本方法。全部任务证据
-   * 退出 active 后，新目标必须重新复现、读取当前源码、提出方案并按当前 Hash 验证，
+   * 同一目标的“继续”不会调用本方法。全部任务证据退出 active 后，新目标必须重新
+   * 复现、读取当前源码、提出方案并按当前 Hash 验证，
    * 从而避免旧 verification 或旧 claim 直接关闭新 Bug Goal。
    */
   async supersedeGoalEvidence(): Promise<void> {
@@ -721,84 +582,6 @@ export class EvidenceStore {
     });
   }
 
-  /** 写入验证成功后的跨任务解决方案和搜索索引。 */
-  async saveSolution(solution: Omit<SolutionRecord, "schemaVersion" | "projectKey">): Promise<SolutionRecord> {
-    await this.load();
-    if (this.solutions.has(solution.id)) {
-      const existing = await this.getSolution(solution.id);
-      if (existing) return existing;
-    }
-    const record: SolutionRecord = {
-      ...solution,
-      schemaVersion: 1,
-      projectKey: this.projectKey,
-    };
-    const directory = join(this.projectDirectory(), "solutions");
-    await mkdir(directory, { recursive: true });
-    const detailPath = join(directory, record.id + ".json");
-    const temporary = detailPath + "." + String(process.pid) + ".tmp";
-    await writeFile(temporary, JSON.stringify(record, null, 2) + "\n", "utf8");
-    const { rename } = await import("node:fs/promises");
-    await rename(temporary, detailPath);
-    const index: SolutionIndexRecord = {
-      schemaVersion: 1,
-      id: record.id,
-      projectKey: this.projectKey,
-      title: safeSummary(record.title).slice(0, 160),
-      description: safeSummary(record.rootCause).slice(0, 300),
-      category: "game-repair",
-      searchText: safeSummary([
-        record.symptom,
-        record.rootCause,
-        record.planTitle,
-        ...record.steps,
-        ...record.relatedPaths,
-      ].join(" ")),
-      relatedPaths: [...new Set(record.relatedPaths)].slice(0, 20),
-      detailRef: relative(this.projectDirectory(), detailPath).replaceAll("\\", "/"),
-      createdAt: record.createdAt,
-    };
-    await mkdir(dirname(this.solutionIndexPath()), { recursive: true });
-    await writeFile(this.solutionIndexPath(), JSON.stringify(index) + "\n", {
-      encoding: "utf8",
-      flag: "a",
-    });
-    this.solutions.set(index.id, index);
-    return record;
-  }
-
-  async searchSolutions(query: string, limit = 3): Promise<SolutionSearchResult[]> {
-    await this.load();
-    return [...this.solutions.values()]
-      .map((entry) => ({ entry, score: searchScore(query, entry) }))
-      .filter(({ score }) => score > 0)
-      .sort((left, right) => right.score - left.score || left.entry.id.localeCompare(right.entry.id))
-      .slice(0, Math.max(1, Math.min(limit, 5)))
-      .map(({ entry, score }) => ({
-        id: entry.id,
-        title: entry.title,
-        description: entry.description,
-        category: entry.category,
-        relatedPaths: entry.relatedPaths,
-        score,
-      }));
-  }
-
-  async getSolution(id: string): Promise<SolutionRecord | null> {
-    await this.load();
-    const index = this.solutions.get(id);
-    if (!index) return null;
-    const path = resolve(this.projectDirectory(), index.detailRef);
-    const fromRoot = relative(this.projectDirectory(), path);
-    if (fromRoot.startsWith("..") || fromRoot === "..") {
-      throw new Error("解决方案路径脱离项目数据目录");
-    }
-    const value: unknown = JSON.parse(await readFile(path, "utf8"));
-    if (!validSolutionRecord(value, id, this.projectKey)) {
-      throw new Error("解决方案文件格式、版本、ID 或项目绑定非法");
-    }
-    return value;
-  }
 }
 
 /** 判断任务是否已经产生任何持久化证据，供首次会话恢复检查使用。 */

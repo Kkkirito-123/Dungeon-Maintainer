@@ -17,9 +17,11 @@ import {
 } from "../src/pi/extension.js";
 import {
   FULL_CODING_TOOLS,
+  PI_BUILTIN_TOOLS,
 } from "../src/pi/tool-policy.js";
-import { INITIAL_TASK_OBJECTIVE } from "../src/task/types.js";
+import { INITIAL_TASK_OBJECTIVE, type TaskEvent } from "../src/task/types.js";
 import { TaskStore } from "../src/task/store.js";
+import { hashFile } from "../src/workspace/git.js";
 import { createTemporaryGitRepository } from "./testSupport.js";
 import { serializeGameToolResult } from "../src/pi/tools/game.js";
 
@@ -85,241 +87,94 @@ function requireHook(
   return hook;
 }
 
+async function createExtensionHarness(suffix: string) {
+  const repository = await createTemporaryGitRepository({ "README.md": "baseline\n" });
+  const dataDir = join(repository.temporaryRoot, "data-request-policy-" + suffix);
+  const store = new TaskStore(dataDir);
+  const task = await store.create({
+    id: "task-request-policy-" + suffix,
+    objective: "验证 Extension 工具生命周期",
+    repoRoot: repository.repoRoot,
+    baseHead: repository.baseHead,
+    worktreeRoot: repository.repoRoot,
+    piSessionDir: join(store.taskDir("task-request-policy-" + suffix), "pi"),
+  });
+  const evidence = new EvidenceStore(dataDir, task);
+  const pi = new RecordingExtensionApi();
+  installDungeonMaintainerExtension(pi as unknown as ExtensionAPI, {
+    config: loadConfig({ LOCALAPPDATA: dataDir, MAINTAINER_API_KEY: "provider-secret" }),
+    store,
+    task,
+    evidenceStore: evidence,
+    gameRuntime: {
+      currentDriver: () => null,
+      requireDriver: () => ({}) as GameDriver,
+      ensure: async () => ({}) as GameDriver,
+      close: async () => undefined,
+    },
+  });
+  let abortCalls = 0;
+  const context = {
+    abort: () => { abortCalls += 1; },
+    ui: { notify: () => undefined },
+  };
+  return {
+    repository,
+    pi,
+    store,
+    task,
+    evidence,
+    context,
+    abortCalls: () => abortCalls,
+    input: requireHook(pi, "input"),
+    call: requireHook(pi, "tool_call"),
+    result: requireHook(pi, "tool_result"),
+  };
+}
+
+async function approveReadmeWrite(pi: RecordingExtensionApi, suffix: string): Promise<void> {
+  const finish = pi.toolDefinitions.get("finish");
+  assert.ok(finish?.execute);
+  await finish.execute(
+    "approve-readme-" + suffix,
+    {
+      status: "proposed",
+      summary: "已定位 README.md 中的测试问题。",
+      risk: "只验证请求边界的写权限回收。",
+      plan: {
+        title: "验证请求写权限回收",
+        steps: ["仅允许修改 README.md。"],
+        verification: "确认新请求或 settled 后旧授权失效。",
+        allowedPaths: ["README.md"],
+      },
+    },
+    undefined,
+    undefined,
+    { ui: { confirm: async () => true } },
+  );
+}
+
+function writeEditInput(path: string, content: string, baseHash = "deadbeef") {
+  return { edits: [{ mode: "write", path, baseHash, content }] };
+}
+
+function createEditInput(path: string, content: string) {
+  return { edits: [{ mode: "create", path, baseHash: "missing", content }] };
+}
+
 describe("Pi Extension 单循环工具、命令和会话阻断", () => {
-  it("相同失败写入只执行两次，第三次由真实 Extension 门禁阻止", async () => {
+  it("证据链新节点持续推进，并能进入修复流程", async () => {
     const repository = await createTemporaryGitRepository({ "README.md": "baseline\n" });
     try {
-      const dataDir = join(repository.temporaryRoot, "data-loop");
+      const dataDir = join(repository.temporaryRoot, "data-evidence-flow");
       const store = new TaskStore(dataDir);
       const task = await store.create({
-        id: "task-loop",
-        objective: "修复重复写入",
-        repoRoot: repository.repoRoot,
-        baseHead: repository.baseHead,
-        worktreeRoot: repository.repoRoot,
-        piSessionDir: join(store.taskDir("task-loop"), "pi"),
-      });
-      const pi = new RecordingExtensionApi();
-      const driver = {} as GameDriver;
-      installDungeonMaintainerExtension(pi as unknown as ExtensionAPI, {
-        config: loadConfig({ LOCALAPPDATA: dataDir, MAINTAINER_API_KEY: "provider-secret" }),
-        store,
-        task,
-        gameRuntime: {
-          currentDriver: () => null,
-          requireDriver: () => driver,
-          ensure: async () => driver,
-          close: async () => undefined,
-        },
-      });
-      const finish = pi.toolDefinitions.get("finish");
-      assert.ok(finish?.execute);
-      await finish.execute(
-        "approve-loop",
-        {
-          status: "proposed",
-          summary: "定位到 README 测试问题。",
-          risk: "仅测试门禁。",
-          plan: {
-            title: "验证失败写入门禁",
-            steps: ["尝试同一精确补丁。"],
-            verification: "确认第三次执行前阻止。",
-            allowedPaths: ["README.md"],
-          },
-        },
-        undefined,
-        undefined,
-        { ui: { confirm: async () => true } },
-      );
-      const call = requireHook(pi, "tool_call");
-      const result = requireHook(pi, "tool_result");
-      const input = {
-        edits: [{
-          path: "README.md",
-          baseHash: "deadbeef",
-          oldText: "baseline",
-          newText: "changed",
-        }],
-      };
-      for (const id of ["failed-patch-1", "failed-patch-2"]) {
-        assert.equal(await call({
-          type: "tool_call",
-          toolCallId: id,
-          toolName: "patch",
-          input,
-        }, { ui: { notify: () => undefined } }), undefined);
-        await result({
-          type: "tool_result",
-          toolCallId: id,
-          toolName: "patch",
-          input,
-          content: [{ type: "text", text: "baseHash conflict" }],
-          details: undefined,
-          isError: true,
-        }, { ui: { notify: () => undefined } });
-      }
-      const blocked = await call({
-        type: "tool_call",
-        toolCallId: "failed-patch-3",
-        toolName: "patch",
-        input,
-      }, { ui: { notify: () => undefined } }) as {
-        block: boolean;
-        terminate: boolean;
-        reason: string;
-      };
-      assert.equal(blocked.block, true);
-      assert.match(blocked.reason, /循环门禁/u);
-
-      const events = (await readFile(join(store.taskDir(task.id), "events.jsonl"), "utf8"))
-        .split(/\r?\n/u)
-        .filter(Boolean)
-        .map((row) => JSON.parse(row) as { type: string; detail: Record<string, unknown> });
-      const writes = events.filter((event) => event.type === "tool.write_outcome");
-      assert.deepEqual(writes.map((event) => event.detail.outcome), [
-        "failed",
-        "failed",
-        "rejected",
-      ]);
-      assert.equal(events.filter((event) => event.type === "tool.loop_guard").length, 1);
-      assert.doesNotMatch(JSON.stringify(events), /baseline|changed|deadbeef/u);
-    } finally {
-      await repository.dispose();
-    }
-  });
-
-  it("并行相同写入只允许两个 pending，结果与异常回合都会释放计数", async () => {
-    const repository = await createTemporaryGitRepository({ "README.md": "baseline\n" });
-    try {
-      const dataDir = join(repository.temporaryRoot, "data-pending-write");
-      const store = new TaskStore(dataDir);
-      const task = await store.create({
-        id: "task-pending-write",
-        objective: "修复并行重复写入",
-        repoRoot: repository.repoRoot,
-        baseHead: repository.baseHead,
-        worktreeRoot: repository.repoRoot,
-        piSessionDir: join(store.taskDir("task-pending-write"), "pi"),
-      });
-      const pi = new RecordingExtensionApi();
-      const driver = {} as GameDriver;
-      installDungeonMaintainerExtension(pi as unknown as ExtensionAPI, {
-        config: loadConfig({ LOCALAPPDATA: dataDir, MAINTAINER_API_KEY: "provider-secret" }),
-        store,
-        task,
-        gameRuntime: {
-          currentDriver: () => null,
-          requireDriver: () => driver,
-          ensure: async () => driver,
-          close: async () => undefined,
-        },
-      });
-      const finish = pi.toolDefinitions.get("finish");
-      assert.ok(finish?.execute);
-      await finish.execute(
-        "approve-pending-write",
-        {
-          status: "proposed",
-          summary: "定位到并行写入门禁测试路径。",
-          risk: "仅验证执行前拒绝。",
-          plan: {
-            title: "验证并行 pending 门禁",
-            steps: ["并行请求同一原生写入。"],
-            verification: "第三个请求执行前被拒绝。",
-            allowedPaths: ["README.md"],
-          },
-        },
-        undefined,
-        undefined,
-        { ui: { confirm: async () => true } },
-      );
-      const call = requireHook(pi, "tool_call");
-      const result = requireHook(pi, "tool_result");
-      const turnEnd = requireHook(pi, "turn_end");
-      const context = { ui: { notify: () => undefined } };
-      const input = { path: "README.md", content: "changed\n" };
-      for (const id of ["pending-write-1", "pending-write-2"]) {
-        assert.equal(await call({
-          type: "tool_call",
-          toolCallId: id,
-          toolName: "write",
-          input,
-        }, context), undefined);
-      }
-      const third = await call({
-        type: "tool_call",
-        toolCallId: "pending-write-3",
-        toolName: "write",
-        input,
-      }, context) as { block: boolean; terminate: boolean; reason: string };
-      assert.equal(third.block, true);
-      assert.equal(third.terminate, false);
-      assert.match(third.reason, /循环门禁/u);
-
-      await result({
-        type: "tool_result",
-        toolCallId: "pending-write-1",
-        toolName: "write",
-        input,
-        content: [{ type: "text", text: "write noop" }],
-        details: undefined,
-        isError: false,
-      }, context);
-      await result({
-        type: "tool_result",
-        toolCallId: "pending-write-2",
-        toolName: "write",
-        input,
-        content: [{ type: "text", text: "write failed" }],
-        details: undefined,
-        isError: true,
-      }, context);
-      assert.equal(await call({
-        type: "tool_call",
-        toolCallId: "pending-write-4",
-        toolName: "write",
-        input,
-      }, context), undefined);
-
-      await turnEnd({}, context);
-      assert.equal(await call({
-        type: "tool_call",
-        toolCallId: "pending-write-5",
-        toolName: "write",
-        input,
-      }, context), undefined);
-      await turnEnd({}, context);
-
-      const events = (await readFile(join(store.taskDir(task.id), "events.jsonl"), "utf8"))
-        .split(/\r?\n/u)
-        .filter(Boolean)
-        .map((row) => JSON.parse(row) as { type: string; detail: Record<string, unknown> });
-      assert.equal(events.filter((event) => (
-        event.type === "tool.loop_guard"
-        && event.detail.reasonCode === "block-pending_action"
-      )).length, 1);
-      assert.equal(events.filter((event) => (
-        event.type === "tool.write_outcome"
-        && event.detail.outcome === "rejected"
-        && event.detail.reasonCode === "loop-guard-pending_action"
-      )).length, 1);
-    } finally {
-      await repository.dispose();
-    }
-  });
-
-  it("累计无进展不冻结正常流程，evidence 与 finish 始终可用", async () => {
-    const repository = await createTemporaryGitRepository({ "README.md": "baseline\n" });
-    try {
-      const dataDir = join(repository.temporaryRoot, "data-light-loop-guard");
-      const store = new TaskStore(dataDir);
-      const task = await store.create({
-        id: "task-light-loop-guard",
+        id: "task-evidence-flow",
         objective: "修复持续无进展后的正常流程",
         repoRoot: repository.repoRoot,
         baseHead: repository.baseHead,
         worktreeRoot: repository.repoRoot,
-        piSessionDir: join(store.taskDir("task-light-loop-guard"), "pi"),
+        piSessionDir: join(store.taskDir("task-evidence-flow"), "pi"),
       });
       const pi = new RecordingExtensionApi();
       const driver = {} as GameDriver;
@@ -337,21 +192,22 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       const call = requireHook(pi, "tool_call");
       const result = requireHook(pi, "tool_result");
       const context = { ui: { notify: () => undefined } };
+      await requireHook(pi, "input")({ source: "rpc", text: task.objective }, context);
       const completeEvidenceRead = async (
         evidenceId: string,
         toolCallId: string,
       ): Promise<void> => {
-        const input = { action: "get", evidenceId };
+        const input = { action: "evidence_get", evidenceId };
         assert.equal(await call({
           type: "tool_call",
           toolCallId,
-          toolName: "evidence",
+          toolName: "inspect",
           input,
         }, context), undefined);
         await result({
           type: "tool_result",
           toolCallId,
-          toolName: "evidence",
+          toolName: "inspect",
           input,
           content: [{ type: "text", text: "existing evidence" }],
           details: { action: "get" },
@@ -361,19 +217,13 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       await completeEvidenceRead("aaaaaaaaaaaaaaaa", "alternating-a-1");
       await completeEvidenceRead("bbbbbbbbbbbbbbbb", "alternating-b-1");
       await completeEvidenceRead("aaaaaaaaaaaaaaaa", "alternating-a-2");
-      const alternating = await call({
-        type: "tool_call",
-        toolCallId: "alternating-b-2",
-        toolName: "evidence",
-        input: { action: "get", evidenceId: "bbbbbbbbbbbbbbbb" },
-      }, context) as { block: boolean; terminate: boolean };
-      assert.equal(alternating, undefined);
+      await completeEvidenceRead("bbbbbbbbbbbbbbbb", "alternating-b-2");
 
-      let completedCalls = 3;
+      let completedCalls = 4;
       let attempts = 0;
-      while (completedCalls < 12) {
+      while (completedCalls < 8) {
         const input = {
-          action: "get",
+          action: "evidence_get",
           evidenceId: completedCalls.toString(16).padStart(16, "0"),
         };
         const toolCallId = "no-progress-" + String(attempts);
@@ -381,13 +231,13 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
         assert.equal(await call({
           type: "tool_call",
           toolCallId,
-          toolName: "evidence",
+          toolName: "inspect",
           input,
         }, context), undefined);
         await result({
           type: "tool_result",
           toolCallId,
-          toolName: "evidence",
+          toolName: "inspect",
           input,
           content: [{ type: "text", text: "existing evidence" }],
           details: { action: "get" },
@@ -433,7 +283,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       assert.equal(finishResult.details.executionApproved, true);
       const approvedText = finishResult.content.map((item) => item.text).join("\n");
       assert.match(approvedText, /调查阶段结束/u);
-      assert.match(approvedText, /patch\/write/u);
+      assert.match(approvedText, /edit/u);
       assert.doesNotMatch(approvedText, /证据提示/u);
       await result({
         type: "tool_result",
@@ -444,17 +294,17 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
         details: finishResult.details,
         isError: false,
       }, context);
-      const evidenceInput = { action: "get", evidenceId: "dddddddddddddddd" };
+      const evidenceInput = { action: "evidence_get", evidenceId: "dddddddddddddddd" };
       assert.equal(await call({
         type: "tool_call",
         toolCallId: "evidence-after-approval",
-        toolName: "evidence",
+        toolName: "inspect",
         input: evidenceInput,
       }, context), undefined);
       await result({
         type: "tool_result",
         toolCallId: "evidence-after-approval",
-        toolName: "evidence",
+        toolName: "inspect",
         input: evidenceInput,
         content: [{ type: "text", text: "existing evidence" }],
         details: { action: "get" },
@@ -497,6 +347,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
 
       const patchInput = {
         edits: [{
+          mode: "replace",
           path: "README.md",
           baseHash: "deadbeef",
           oldText: "baseline",
@@ -506,113 +357,327 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       assert.equal(await call({
         type: "tool_call",
         toolCallId: "patch-after-approval",
-        toolName: "patch",
+        toolName: "edit",
         input: patchInput,
       }, context), undefined);
       await result({
         type: "tool_result",
         toolCallId: "patch-after-approval",
-        toolName: "patch",
+        toolName: "edit",
         input: patchInput,
         content: [{ type: "text", text: "baseHash conflict" }],
         details: undefined,
         isError: true,
       }, context);
 
-      const events = (await readFile(join(store.taskDir(task.id), "events.jsonl"), "utf8"))
-        .split(/\r?\n/u)
-        .filter(Boolean)
-        .map((row) => JSON.parse(row) as { type: string; detail: Record<string, unknown> });
-      assert.equal(events.some((event) => event.type === "tool.loop_guard"), false);
     } finally {
       await repository.dispose();
     }
   });
 
-  it("每轮注入同项目历史方案的低敏候选并记录命中事件", async () => {
+  it("并行 edit 事件不会中止当前请求", async () => {
+    const harness = await createExtensionHarness("parallel-native-write-attribution");
+    try {
+      const { abortCalls, call, context, input, pi, result, task } = harness;
+      const noopPaths = Array.from({ length: 5 }, (_, index) => (
+        "noop-" + String(index) + ".txt"
+      ));
+      for (const path of noopPaths) {
+        await writeFile(join(task.worktreeRoot, path), "same\n", "utf8");
+      }
+      await input({ source: "rpc", text: "验证并行写入进展归因" }, context);
+      const finish = pi.toolDefinitions.get("finish");
+      assert.ok(finish?.execute);
+      await finish.execute(
+        "approve-parallel-write-attribution",
+        {
+          status: "proposed",
+          summary: "已限定并行写入测试文件。",
+          risk: "仅验证证据链进展归因。",
+          plan: {
+            title: "验证并行写入归因",
+            steps: ["写入 README，并对五个文件执行无变化写入。"],
+            verification: "只有 README 调用应被记为进展。",
+            allowedPaths: ["README.md", ...noopPaths],
+          },
+        },
+        undefined,
+        undefined,
+        { ui: { confirm: async () => true } },
+      );
+
+      const writes = [
+        {
+          toolCallId: "parallel-write-progress",
+          input: writeEditInput("README.md", "changed\n"),
+        },
+        ...noopPaths.map((path, index) => ({
+          toolCallId: "parallel-write-noop-" + String(index),
+          input: writeEditInput(path, "same\n"),
+        })),
+      ];
+      for (const write of writes) {
+        assert.equal(await call({
+          type: "tool_call",
+          toolCallId: write.toolCallId,
+          toolName: "edit",
+          input: write.input,
+        }, context), undefined);
+      }
+
+      // 模拟 Pi 并行批次中只有第一个 write 真正改变目标文件；其余五个调用
+      // 即使观察到整个 worktree 已变化，也只能根据自己的目标文件判定为 noop。
+      await writeFile(join(task.worktreeRoot, "README.md"), "changed\n", "utf8");
+      for (const write of writes) {
+        await result({
+          type: "tool_result",
+          toolCallId: write.toolCallId,
+          toolName: "edit",
+          input: write.input,
+          content: [{ type: "text", text: "edit completed" }],
+          details: undefined,
+          isError: false,
+        }, context);
+      }
+
+      assert.equal(abortCalls(), 0);
+      assert.equal(await call({
+        type: "tool_call",
+        toolCallId: "after-parallel-write-noops",
+        toolName: "inspect",
+        input: { action: "evidence_list" },
+      }, context), undefined);
+    } finally {
+      await harness.repository.dispose();
+    }
+  });
+
+  it("turn_end 清理缺失的 edit 写前归因", async () => {
+    const harness = await createExtensionHarness("missing-native-results");
+    try {
+      const { abortCalls, call, context, input, pi, result, store, task } = harness;
+      const missingPaths = Array.from({ length: 5 }, (_, index) => (
+        "missing-result-" + String(index) + ".txt"
+      ));
+      await input({ source: "rpc", text: "验证缺失工具结果收敛" }, context);
+      const finish = pi.toolDefinitions.get("finish");
+      assert.ok(finish?.execute);
+      await finish.execute(
+        "approve-missing-native-results",
+        {
+          status: "proposed",
+          summary: "已限定缺失结果测试文件。",
+          risk: "仅验证 turn_end 归因。",
+          plan: {
+            title: "验证缺失结果归因",
+            steps: ["保留一个真实写入，并模拟五个缺失结果。"],
+            verification: "缺失结果必须统一记为失败和无进展。",
+            allowedPaths: ["README.md", ...missingPaths],
+          },
+        },
+        undefined,
+        undefined,
+        { ui: { confirm: async () => true } },
+      );
+
+      const successful = {
+        toolCallId: "write-with-real-result",
+        input: writeEditInput("README.md", "changed\n"),
+      };
+      const missing = missingPaths.map((path, index) => ({
+        toolCallId: "write-without-result-" + String(index),
+        input: writeEditInput(path, "content-" + String(index) + "\n"),
+      }));
+      for (const write of [successful, ...missing]) {
+        assert.equal(await call({
+          type: "tool_call",
+          toolCallId: write.toolCallId,
+          toolName: "edit",
+          input: write.input,
+        }, context), undefined);
+      }
+      await writeFile(join(task.worktreeRoot, "README.md"), "changed\n", "utf8");
+      await result({
+        type: "tool_result",
+        toolCallId: successful.toolCallId,
+        toolName: "edit",
+        input: successful.input,
+        content: [{ type: "text", text: "edit completed" }],
+        details: undefined,
+        isError: false,
+      }, context);
+      await requireHook(pi, "turn_end")({}, context);
+
+      assert.equal(abortCalls(), 0);
+      assert.equal(await call({
+        type: "tool_call",
+        toolCallId: "after-missing-native-results",
+        toolName: "inspect",
+        input: { action: "evidence_list" },
+      }, context), undefined);
+
+      const events = (await readFile(join(store.taskDir(task.id), "events.jsonl"), "utf8"))
+        .split(/\r?\n/u)
+        .filter(Boolean)
+        .map((row) => JSON.parse(row) as { type: string; detail: Record<string, unknown> });
+      const writeOutcomes = events
+        .filter((event) => event.type === "tool.write_outcome")
+        .map((event) => event.detail.outcome);
+      assert.equal(writeOutcomes.filter((outcome) => outcome === "mutated").length, 1);
+      assert.equal(writeOutcomes.filter((outcome) => outcome === "failed").length, 0);
+      assert.equal(writeOutcomes.includes("mutated_replay_failed"), false);
+    } finally {
+      await harness.repository.dispose();
+    }
+  });
+
+  it("拒绝写入的审批日志失败仍只阻止当前调用", async () => {
+    const harness = await createExtensionHarness("approval-audit-failure");
+    try {
+      const { abortCalls, call, input, store } = harness;
+      const context = {
+        abort: harness.context.abort,
+        hasUI: true,
+        ui: {
+          notify: () => undefined,
+          confirm: async () => false,
+        },
+      };
+      await input({ source: "rpc", text: "验证审批日志故障" }, context);
+      const append = store.append.bind(store);
+      store.append = async (taskId: string, event: TaskEvent): Promise<void> => {
+        if (event.type === "execution.approval") {
+          throw new Error("injected approval audit failure");
+        }
+        await append(taskId, event);
+      };
+
+      const blocked = await call({
+        type: "tool_call",
+        toolCallId: "denied-write-with-audit-failure",
+        toolName: "edit",
+        input: writeEditInput("README.md", "changed\n"),
+      }, context) as { block: boolean; terminate: boolean; reason: string };
+      assert.equal(blocked.block, true);
+      assert.equal(blocked.terminate, false);
+      assert.match(blocked.reason, /未批准/u);
+      assert.equal(abortCalls(), 0);
+      assert.equal(await call({
+        type: "tool_call",
+        toolCallId: "after-approval-denial",
+        toolName: "inspect",
+        input: { action: "evidence_list" },
+      }, context), undefined);
+    } finally {
+      await harness.repository.dispose();
+    }
+  });
+
+  it("agent_settled 关闭持久化写权限", async () => {
     const repository = await createTemporaryGitRepository({ "README.md": "baseline\n" });
     try {
-      const dataDir = join(repository.temporaryRoot, "data-solution-context");
+      const dataDir = join(repository.temporaryRoot, "data-settled-log-failure");
       const store = new TaskStore(dataDir);
-      const historicalTask = await store.create({
-        id: "task-solution-history",
-        objective: "修复首领后传送门卡住",
-        repoRoot: repository.repoRoot,
-        baseHead: repository.baseHead,
-        worktreeRoot: repository.repoRoot,
-        piSessionDir: join(store.taskDir("task-solution-history"), "pi"),
-      });
-      const historicalEvidence = new EvidenceStore(dataDir, historicalTask);
-      await historicalEvidence.saveSolution({
-        id: "1111111111111111",
-        taskId: historicalTask.id,
-        title: "修复传送门推进状态",
-        symptom: "击败首领后仍停留在原楼层",
-        rootCause: "结算分支没有恢复传送门状态",
-        planTitle: "恢复传送门状态",
-        steps: ["在结算分支写入 ready 状态"],
-        verification: "运行聚焦测试并重放传送动作",
-        relatedPaths: ["game/src/domain/portal.ts"],
-        evidenceRefs: ["2222222222222222"],
-        buggyHashes: { "game/src/domain/portal.ts": "old-hash" },
-        fixedHashes: { worktree: "fixed-hash" },
-        createdAt: "2026-08-26T00:00:00.000Z",
-      });
       const task = await store.create({
-        id: "task-solution-current",
-        objective: "击败首领后传送门卡住，请检查并修复",
+        id: "task-settled-log-failure",
+        objective: "验证 settled 收权顺序",
         repoRoot: repository.repoRoot,
         baseHead: repository.baseHead,
         worktreeRoot: repository.repoRoot,
-        piSessionDir: join(store.taskDir("task-solution-current"), "pi"),
+        piSessionDir: join(store.taskDir("task-settled-log-failure"), "pi"),
       });
       const pi = new RecordingExtensionApi();
-      const driver = {} as GameDriver;
       installDungeonMaintainerExtension(pi as unknown as ExtensionAPI, {
         config: loadConfig({ LOCALAPPDATA: dataDir, MAINTAINER_API_KEY: "provider-secret" }),
         store,
         task,
         gameRuntime: {
           currentDriver: () => null,
-          requireDriver: () => driver,
-          ensure: async () => driver,
+          requireDriver: () => ({}) as GameDriver,
+          ensure: async () => ({}) as GameDriver,
           close: async () => undefined,
         },
       });
+      const context = { ui: { notify: () => undefined } };
+      await requireHook(pi, "input")({ source: "rpc", text: task.objective }, context);
+      await approveReadmeWrite(pi, "settled");
+      assert.equal(task.writeScope.state, "approved");
 
-      const dynamic = await requireHook(pi, "before_agent_start")(
-        {
-          prompt: task.objective,
-          systemPrompt: "PROJECT AGENTS SENTINEL",
-        },
-        { getContextUsage: () => undefined },
-      ) as { message?: unknown };
-      const text = JSON.stringify(dynamic.message);
-      assert.match(text, /同项目历史解决方案候选/u);
-      assert.match(text, /修复传送门推进状态/u);
-      assert.match(text, /game\/src\/domain\/portal\.ts/u);
-      assert.doesNotMatch(text, /1111111111111111|2222222222222222|old-hash|fixed-hash/u);
-      const events = (await readFile(join(store.taskDir(task.id), "events.jsonl"), "utf8"))
-        .split(/\r?\n/u)
-        .filter(Boolean)
-        .map((row) => JSON.parse(row) as { type: string; detail: Record<string, unknown> });
-      assert.equal(events.some((event) => (
-        event.type === "evidence.solution_lookup"
-        && event.detail.outcome === "hit"
-        && event.detail.matchCount === 1
-      )), true);
+      await requireHook(pi, "agent_settled")({}, context);
+      assert.equal(task.writeScope.state, "closed");
     } finally {
       await repository.dispose();
     }
   });
 
-  it("注册十一个领域工具，并用执行门禁保护固定 Coding 工具面", async () => {
+  it("新 input 撤销上一请求的运行时写授权", async () => {
+    const repository = await createTemporaryGitRepository({ "README.md": "baseline\n" });
+    try {
+      const dataDir = join(repository.temporaryRoot, "data-input-log-failure");
+      const store = new TaskStore(dataDir);
+      const task = await store.create({
+        id: "task-input-log-failure",
+        objective: "验证新请求收权顺序",
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(store.taskDir("task-input-log-failure"), "pi"),
+      });
+      const pi = new RecordingExtensionApi();
+      installDungeonMaintainerExtension(pi as unknown as ExtensionAPI, {
+        config: loadConfig({ LOCALAPPDATA: dataDir, MAINTAINER_API_KEY: "provider-secret" }),
+        store,
+        task,
+        gameRuntime: {
+          currentDriver: () => null,
+          requireDriver: () => ({}) as GameDriver,
+          ensure: async () => ({}) as GameDriver,
+          close: async () => undefined,
+        },
+      });
+      const input = requireHook(pi, "input");
+      const context = { ui: { notify: () => undefined } };
+      await input({ source: "rpc", text: task.objective }, context);
+      await approveReadmeWrite(pi, "new-input");
+      assert.equal(task.writeScope.state, "approved");
+
+      await input({ source: "rpc", text: "开始下一请求" }, context);
+      assert.equal(task.writeScope.state, "closed");
+
+      let confirmations = 0;
+      const blocked = await requireHook(pi, "tool_call")({
+        type: "tool_call",
+        toolCallId: "write-after-input-log-failure",
+        toolName: "edit",
+        input: writeEditInput("README.md", "changed\n"),
+      }, {
+        abort: () => undefined,
+        hasUI: true,
+        ui: {
+          notify: () => undefined,
+          confirm: async () => {
+            confirmations += 1;
+            return false;
+          },
+        },
+      }) as { block: boolean; terminate: boolean; reason: string };
+      assert.equal(confirmations, 1);
+      assert.equal(blocked.block, true);
+      assert.equal(blocked.terminate, false);
+      assert.match(blocked.reason, /未批准/u);
+    } finally {
+      await repository.dispose();
+    }
+  });
+
+  it("注册且只注册八个模型工具，并用执行门禁保护 edit", async () => {
     const repository = await createTemporaryGitRepository({
       ".maintainer/project.json": JSON.stringify({
         schemaVersion: 1,
         adapter: "sql-dungeon",
       }) + "\n",
       "README.md": "test\n",
+      "whole.txt": "before\n",
       "long.txt": Array.from({ length: 120 }, (_value, index) => (
         "line-" + String(index + 1)
       )).join("\n") + "\n",
@@ -628,6 +693,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
         worktreeRoot: repository.repoRoot,
         piSessionDir: join(store.taskDir("task-extension"), "pi"),
       });
+      await store.transition(task, "active");
       const pi = new RecordingExtensionApi();
       const evidence = new EvidenceStore(dataDir, task);
       const config = loadConfig({
@@ -687,7 +753,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
             verifiedAt: new Date().toISOString(),
           };
           task.state = "ready_to_apply";
-          task.changedPaths = ["first.txt", "second.txt"];
+          task.changedPaths = ["README.md", "created.txt", "whole.txt"];
           task.verification = record;
           return {
             record,
@@ -697,22 +763,36 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
         },
       });
 
+      assert.deepEqual([...pi.hooks.keys()], [
+        "user_bash",
+        "session_before_switch",
+        "session_before_fork",
+        "session_before_tree",
+        "session_start",
+        "before_agent_start",
+        "input",
+        "tool_call",
+        "tool_result",
+        "turn_end",
+        "agent_end",
+        "agent_settled",
+        "session_shutdown",
+      ]);
+
       assert.deepEqual(pi.tools, [
         "inspect",
-        "evidence",
-        "patch",
+        "edit",
         "check",
         "finish",
         "look",
-        "go",
-        "use",
-        "input_sql",
+        "act",
         "query",
-        "tree",
+        "workspace",
       ]);
-      const treeTool = pi.toolDefinitions.get("tree");
-      assert.ok(treeTool?.execute);
-      const localTreeListResult = await treeTool.execute(
+      assert.deepEqual([...PI_BUILTIN_TOOLS], []);
+      const workspaceTool = pi.toolDefinitions.get("workspace");
+      assert.ok(workspaceTool?.execute);
+      const localTreeListResult = await workspaceTool.execute(
         "call-tree",
         { action: "list" },
         undefined,
@@ -733,6 +813,23 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       assert.match(inspectPage.content[0]?.text ?? "", /line-5/u);
       assert.match(inspectPage.content[0]?.text ?? "", /line-7/u);
       assert.doesNotMatch(inspectPage.content[0]?.text ?? "", /line-8/u);
+      const evidenceList = await inspectTool.execute(
+        "call-evidence-list",
+        { action: "evidence_list", status: "active" },
+        undefined,
+        undefined,
+        {},
+      ) as { content: Array<{ text: string }> };
+      const evidenceId = /id=([a-f0-9]{16})/u.exec(evidenceList.content[0]?.text ?? "")?.[1];
+      assert.ok(evidenceId);
+      const evidenceGet = await inspectTool.execute(
+        "call-evidence-get",
+        { action: "evidence_get", evidenceId },
+        undefined,
+        undefined,
+        {},
+      ) as { content: Array<{ text: string }> };
+      assert.match(evidenceGet.content[0]?.text ?? "", new RegExp(evidenceId, "u"));
       for (const command of ["play", "diff", "verify", "apply", "discard"]) {
         assert.ok(pi.commands.has(command));
       }
@@ -747,90 +844,19 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
         apiKey?: string;
         models?: Array<{ id?: string; reasoning?: boolean }>;
       };
-      assert.equal(provider.apiKey, "$DUNGEON_MAINTAINER_PROFILE_KEY_DEFAULT");
+      assert.equal(provider.apiKey, "$MAINTAINER_API_KEY");
       const registeredModel = provider.models?.[0];
       assert.ok(registeredModel);
       assert.equal(registeredModel.id, "fixed-model");
       assert.equal(registeredModel.reasoning, true);
       assert.ok(!JSON.stringify(provider).includes("provider-secret"));
 
-      const repeatedToolText = "相同证据".repeat(100);
-      const contextResult = await requireHook(pi, "context")({
-        messages: [
-          {
-            role: "toolResult",
-            toolCallId: "older-call",
-            toolName: "inspect",
-            content: [{ type: "text", text: repeatedToolText }],
-            isError: false,
-            timestamp: 1,
-          },
-          {
-            role: "toolResult",
-            toolCallId: "newer-call",
-            toolName: "inspect",
-            content: [{ type: "text", text: repeatedToolText }],
-            isError: false,
-            timestamp: 2,
-          },
-        ],
-      }) as { messages: Array<{ content: Array<{ text: string }> }> };
-      assert.equal(contextResult.messages[0]?.content[0]?.text, repeatedToolText);
-      assert.equal(contextResult.messages[1]?.content[0]?.text, repeatedToolText);
+      assert.equal(pi.hooks.has("context"), false);
 
-      const oversizedContext = await requireHook(pi, "context")({
-        messages: Array.from({ length: 32 }, (_value, index) => ({
-          role: "toolResult",
-          toolCallId: "large-call-" + String(index),
-          toolName: "read",
-          content: [{
-            type: "text",
-            text: String(index).padStart(2, "0") + "-" + "x".repeat(5_000),
-          }],
-          isError: false,
-          timestamp: index,
-        })),
-      }) as { messages: Array<{ content: Array<{ text: string }> }> };
-      const boundedTexts = oversizedContext.messages.map(
-        (message) => message.content[0]?.text ?? "",
-      );
-      assert.equal(boundedTexts.length, 32);
-      assert.ok(boundedTexts.reduce((sum, text) => sum + text.length, 0) <= 16_384);
-      assert.ok(boundedTexts.some((text) => text.includes("TOOL_RESULT_RECEIPT")));
-      assert.equal(boundedTexts.at(-1)?.length, 4_096);
-      assert.match(boundedTexts.at(-1) ?? "", /工具结果稳定截断/u);
-      assert.match(boundedTexts.at(-1) ?? "", /^31-/u);
-      assert.match(boundedTexts.at(0) ?? "", /TOOL_RESULT_RECEIPT/u);
-
-      const resetAcrossUsers = await requireHook(pi, "context")({
-        messages: [
-          {
-            role: "user",
-            content: [{ type: "text", text: "first" }],
-          },
-          {
-            role: "toolResult",
-            toolCallId: "turn-one",
-            toolName: "inspect",
-            content: [{ type: "text", text: repeatedToolText }],
-            isError: false,
-          },
-          {
-            role: "user",
-            content: [{ type: "text", text: "second" }],
-          },
-          {
-            role: "toolResult",
-            toolCallId: "turn-two",
-            toolName: "inspect",
-            content: [{ type: "text", text: repeatedToolText }],
-            isError: false,
-          },
-        ],
-      }) as { messages: Array<{ role: string; content: Array<{ text: string }> }> };
-      assert.equal(resetAcrossUsers.messages.length, 4);
-      assert.equal(resetAcrossUsers.messages[3]?.content[0]?.text, repeatedToolText);
-
+      await requireHook(pi, "input")({
+        source: "rpc",
+        text: "当前在哪一层，状态是什么？",
+      });
       const promptResult = await requireHook(pi, "before_agent_start")(
         {
           prompt: "当前在哪一层，状态是什么？",
@@ -847,19 +873,23 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       assert.ok(!fixedToolNames.has("grep"));
       assert.ok(!fixedToolNames.has("find"));
       assert.ok(!fixedToolNames.has("ls"));
-      assert.ok(!fixedToolNames.has("edit"));
-      assert.ok(fixedToolNames.has("write"));
+      assert.ok(fixedToolNames.has("edit"));
+      assert.ok(!fixedToolNames.has("write"));
+      assert.ok(!fixedToolNames.has("patch"));
+      assert.ok(!fixedToolNames.has("evidence"));
+      assert.ok(!fixedToolNames.has("tree"));
+      assert.ok(!fixedToolNames.has("go"));
+      assert.ok(!fixedToolNames.has("use"));
+      assert.ok(!fixedToolNames.has("input_sql"));
       assert.ok(!fixedToolNames.has("bash"));
       assert.match(promptResult.systemPrompt, /SQL Dungeon/u);
       assert.match(promptResult.systemPrompt, /PROJECT AGENTS SENTINEL/u);
       assert.match(promptResult.systemPrompt, /一个 Pi Agent Loop/u);
-      assert.match(promptResult.systemPrompt, /finish\(status=proposed\)/u);
-      assert.match(promptResult.systemPrompt, /第一次调用 write\/patch 时.*写入批准/u);
+      assert.match(promptResult.systemPrompt, /finish\(status=reproduced\)/u);
+      assert.match(promptResult.systemPrompt, /第一次调用 edit 时.*写入批准/u);
       assert.match(promptResult.systemPrompt, /结构化断言/u);
-      assert.match(JSON.stringify(promptResult.message), /本轮最高优先级请求/u);
-      assert.match(JSON.stringify(promptResult.message), /当前在哪一层/u);
-      assert.match(JSON.stringify(promptResult.message), /full-view-sentinel/u);
-      assert.match(promptResult.systemPrompt, /不加载 Bash/u);
+      assert.equal(promptResult.message, undefined);
+      assert.match(promptResult.systemPrompt, /不加载任何 Pi 原生工具或 Bash/u);
 
       const finishTool = pi.toolDefinitions.get("finish");
       assert.ok(finishTool?.execute);
@@ -920,7 +950,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
               "刷新游戏并重放传送步骤。",
             ],
             verification: "运行聚焦测试，并在右侧游戏重放相同步骤。",
-            allowedPaths: ["first.txt", "second.txt"],
+            allowedPaths: ["README.md", "whole.txt", "created.txt"],
           },
         },
         undefined,
@@ -952,49 +982,59 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
           notify: (message: string) => refreshNotifications.push(message),
         },
       };
-      assert.equal(await toolCallHook({
-        type: "tool_call",
-        toolCallId: "native-one",
-        toolName: "write",
-        input: { path: "first.txt", content: "one\n" },
-      }, refreshContext), undefined);
-      assert.equal(await toolCallHook({
-        type: "tool_call",
-        toolCallId: "native-two",
-        toolName: "write",
-        input: { path: "second.txt", content: "two\n" },
-      }, refreshContext), undefined);
-      await writeFile(join(task.worktreeRoot, "first.txt"), "one\n", "utf8");
-      await writeFile(join(task.worktreeRoot, "second.txt"), "two\n", "utf8");
-      const firstNativeResult = await toolResultHook({
-        type: "tool_result",
-        toolCallId: "native-one",
-        toolName: "write",
-        input: { path: "first.txt", content: "one\n" },
-        content: [{ type: "text", text: "first written" }],
-        details: undefined,
-        isError: false,
-      }, refreshContext);
-      assert.equal(firstNativeResult, undefined);
-      assert.deepEqual(lifecycle, ["checkpoint"]);
-      const secondNativeResult = await toolResultHook({
-        type: "tool_result",
-        toolCallId: "native-two",
-        toolName: "write",
-        input: { path: "second.txt", content: "two\n" },
-        content: [{ type: "text", text: "second written" }],
-        details: undefined,
-        isError: false,
-      }, refreshContext) as {
-        content: Array<{ text: string }>;
-        isError?: boolean;
+      const editInput = {
+        edits: [{
+          mode: "replace",
+          path: "README.md",
+          baseHash: await hashFile(task.worktreeRoot, "README.md"),
+          oldText: "test\n",
+          newText: "updated\n",
+        }, {
+          mode: "write",
+          path: "whole.txt",
+          baseHash: await hashFile(task.worktreeRoot, "whole.txt"),
+          content: "after\n",
+        }, {
+          mode: "create",
+          path: "created.txt",
+          baseHash: "missing",
+          content: "created\n",
+        }],
       };
-      assert.deepEqual(lifecycle, ["checkpoint", "reload"]);
-      assert.equal(secondNativeResult.content[0]?.text, "second written");
-      assert.match(secondNativeResult.content[1]?.text ?? "", /已刷新/u);
-      assert.equal(secondNativeResult.isError, undefined);
-      assert.deepEqual([...task.changedPaths].sort(), ["first.txt", "second.txt"]);
-      assert.equal(refreshNotifications.length, 1);
+      assert.equal(await toolCallHook({
+        type: "tool_call",
+        toolCallId: "edit-three-modes",
+        toolName: "edit",
+        input: editInput,
+      }, refreshContext), undefined);
+      const editTool = pi.toolDefinitions.get("edit");
+      assert.ok(editTool?.execute);
+      const editResult = await editTool.execute(
+        "edit-three-modes",
+        editInput,
+        undefined,
+        undefined,
+        refreshContext,
+      ) as {
+        content: Array<{ type: "text"; text: string }>;
+        details: Record<string, unknown>;
+      };
+      assert.equal(await toolResultHook({
+        type: "tool_result",
+        toolCallId: "edit-three-modes",
+        toolName: "edit",
+        input: editInput,
+        content: editResult.content,
+        details: editResult.details,
+        isError: false,
+      }, refreshContext), undefined);
+      assert.deepEqual(lifecycle, ["checkpoint"]);
+      assert.match(editResult.content[0]?.text ?? "", /README\.md, whole\.txt, created\.txt/u);
+      assert.equal(await readFile(join(task.worktreeRoot, "README.md"), "utf8"), "updated\n");
+      assert.equal(await readFile(join(task.worktreeRoot, "whole.txt"), "utf8"), "after\n");
+      assert.equal(await readFile(join(task.worktreeRoot, "created.txt"), "utf8"), "created\n");
+      assert.deepEqual([...task.changedPaths].sort(), ["README.md", "created.txt", "whole.txt"]);
+      assert.equal(refreshNotifications.length, 0);
       assert.equal(pi.sentMessages.length, 0);
 
       const checkGate = await toolCallHook({
@@ -1042,7 +1082,6 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       assert.match(conclusionNotifications.at(-1) ?? "", /可以执行 \/apply/u);
       assert.deepEqual(lifecycle, [
         "checkpoint",
-        "reload",
         "check-gate",
         "verify",
       ]);
@@ -1166,6 +1205,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       });
       const notifications: string[] = [];
       const hookContext = {
+        abort: () => undefined,
         getContextUsage: () => ({ percent: 20 }),
         ui: {
           notify: (message: string) => notifications.push(message),
@@ -1188,12 +1228,9 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
         { prompt: repairRequest, systemPrompt: "PROJECT AGENTS SENTINEL" },
         hookContext,
       ) as { systemPrompt: string; message?: unknown };
-      const dynamicText = JSON.stringify(dynamic.message);
       assert.match(dynamic.systemPrompt, /PROJECT AGENTS SENTINEL/u);
-      assert.match(dynamicText, /本轮最高优先级请求/u);
-      assert.match(dynamicText, /SELECT 战斗后终端不出现/u);
-      assert.match(dynamicText, /SELECT id FROM monsters/u);
-      assert.doesNotMatch(dynamicText, /滚动任务|阶段指令|诊断门禁|active 证据卡/u);
+      assert.equal(dynamic.message, undefined);
+      assert.equal(pi.hooks.has("context"), false);
 
       const inspectGate = await requireHook(pi, "tool_call")({
         type: "tool_call",
@@ -1205,8 +1242,8 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       const unapprovedWrite = await requireHook(pi, "tool_call")({
         type: "tool_call",
         toolCallId: "unapproved-write",
-        toolName: "write",
-        input: { path: "README.md", content: "forbidden\n" },
+        toolName: "edit",
+        input: writeEditInput("README.md", "forbidden\n"),
       }, hookContext) as { block: boolean; terminate: boolean; reason: string };
       assert.equal(unapprovedWrite.block, true);
       assert.equal(unapprovedWrite.terminate, false);
@@ -1244,7 +1281,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
     }
   });
 
-  it("刷新失败合并进最后一个原生工具结果，并阻断后续检查和 result", async () => {
+  it("edit 刷新失败会阻断后续检查和 result", async () => {
     const repository = await createTemporaryGitRepository({
       "README.md": "baseline\n",
     });
@@ -1285,6 +1322,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
           throw new Error("刷新失败时不应进入 verifyTask");
         },
       });
+      await requireHook(pi, "input")({ source: "rpc", text: task.objective });
       const finishTool = pi.toolDefinitions.get("finish");
       assert.ok(finishTool?.execute);
       await finishTool.execute(
@@ -1307,45 +1345,39 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
 
       const toolCallHook = requireHook(pi, "tool_call");
       const toolResultHook = requireHook(pi, "tool_result");
-      const notifications: string[] = [];
       const hookContext = {
-        ui: { notify: (message: string) => notifications.push(message) },
+        ui: { notify: () => undefined },
       };
+      const failingInput = createEditInput("changed.txt", "changed\n");
       assert.equal(await toolCallHook({
         type: "tool_call",
         toolCallId: "write-failing-refresh",
-        toolName: "write",
-        input: { path: "changed.txt", content: "changed\n" },
+        toolName: "edit",
+        input: failingInput,
       }, hookContext), undefined);
       await writeFile(join(task.worktreeRoot, "changed.txt"), "changed\n", "utf8");
-      const nativeResult = await toolResultHook({
+      const editResult = await toolResultHook({
         type: "tool_result",
         toolCallId: "write-failing-refresh",
-        toolName: "write",
-        input: { path: "changed.txt", content: "changed\n" },
-        content: [{ type: "text", text: "native write completed" }],
-        details: undefined,
-        isError: false,
-      }, hookContext) as {
-        content: Array<{ text: string }>;
-        isError: boolean;
-      };
-      assert.equal(reloadCount, 1);
-      assert.equal(nativeResult.isError, true);
-      assert.equal(nativeResult.content[0]?.text, "native write completed");
-      assert.match(nativeResult.content[1]?.text ?? "", /刷新重放未通过/u);
-      assert.match(notifications.at(-1) ?? "", /刷新重放未通过/u);
+        toolName: "edit",
+        input: failingInput,
+        content: [{ type: "text", text: "bridge unavailable" }],
+        details: { replay: { passed: false, actionCount: 0, failure: "bridge unavailable" } },
+        isError: true,
+      }, hookContext);
+      assert.equal(editResult, undefined);
+      assert.equal(reloadCount, 0);
 
       // 正常路径已经在 tool_result 刷新；turn_end 只兜底处理缺失的结果事件。
       assert.equal(await toolCallHook({
         type: "tool_call",
         toolCallId: "write-without-result-event",
-        toolName: "write",
-        input: { path: "fallback.txt", content: "fallback\n" },
+        toolName: "edit",
+        input: createEditInput("fallback.txt", "fallback\n"),
       }, hookContext), undefined);
       await writeFile(join(task.worktreeRoot, "fallback.txt"), "fallback\n", "utf8");
       await requireHook(pi, "turn_end")({}, hookContext);
-      assert.equal(reloadCount, 2);
+      assert.equal(reloadCount, 0);
 
       const blockedCheck = await toolCallHook({
         type: "tool_call",
@@ -1384,6 +1416,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
         worktreeRoot: repository.repoRoot,
         piSessionDir: join(store.taskDir("task-settled-no-auto-verify"), "pi"),
       });
+      await store.transition(task, "active");
       const pi = new RecordingExtensionApi();
       let verifyCalls = 0;
       installDungeonMaintainerExtension(pi as unknown as ExtensionAPI, {
@@ -1401,6 +1434,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
           throw new Error("不应由 agent_settled 调用");
         },
       });
+      await requireHook(pi, "input")({ source: "rpc", text: task.objective });
       const finishTool = pi.toolDefinitions.get("finish");
       assert.ok(finishTool?.execute);
       await finishTool.execute(
@@ -1423,20 +1457,29 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       const toolCallHook = requireHook(pi, "tool_call");
       const toolResultHook = requireHook(pi, "tool_result");
       const hookContext = { ui: { notify: () => undefined } };
+      const editInput = createEditInput("changed.txt", "changed\n");
       assert.equal(await toolCallHook({
         type: "tool_call",
         toolCallId: "settled-write",
-        toolName: "write",
-        input: { path: "changed.txt", content: "changed\n" },
+        toolName: "edit",
+        input: editInput,
       }, hookContext), undefined);
-      await writeFile(join(task.worktreeRoot, "changed.txt"), "changed\n", "utf8");
+      const editTool = pi.toolDefinitions.get("edit");
+      assert.ok(editTool?.execute);
+      const editResult = await editTool.execute(
+        "settled-write",
+        editInput,
+        undefined,
+        undefined,
+        hookContext,
+      ) as { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> };
       await toolResultHook({
         type: "tool_result",
         toolCallId: "settled-write",
-        toolName: "write",
-        input: { path: "changed.txt", content: "changed\n" },
-        content: [{ type: "text", text: "written" }],
-        details: undefined,
+        toolName: "edit",
+        input: editInput,
+        content: editResult.content,
+        details: editResult.details,
         isError: false,
       }, hookContext);
 
@@ -1450,7 +1493,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
     }
   });
 
-  it("旧 write 刷新失败后，成功 patch 清除统一刷新门禁", async () => {
+  it("edit 刷新失败后，后续成功 edit 清除统一刷新门禁", async () => {
     const repository = await createTemporaryGitRepository({
       "README.md": "baseline\n",
     });
@@ -1486,6 +1529,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
           close: async () => undefined,
         },
       });
+      await requireHook(pi, "input")({ source: "rpc", text: task.objective });
       const finishTool = pi.toolDefinitions.get("finish");
       assert.ok(finishTool?.execute);
       await finishTool.execute(
@@ -1509,24 +1553,24 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       const toolCallHook = requireHook(pi, "tool_call");
       const toolResultHook = requireHook(pi, "tool_result");
       const hookContext = { ui: { notify: () => undefined } };
-      const writeInput = { path: "changed.txt", content: "changed\n" };
+      const writeInput = createEditInput("changed.txt", "changed\n");
       assert.equal(await toolCallHook({
         type: "tool_call",
         toolCallId: "write-before-patch-recovery",
-        toolName: "write",
+        toolName: "edit",
         input: writeInput,
       }, hookContext), undefined);
       await writeFile(join(task.worktreeRoot, "changed.txt"), "changed\n", "utf8");
       const failedWrite = await toolResultHook({
         type: "tool_result",
         toolCallId: "write-before-patch-recovery",
-        toolName: "write",
+        toolName: "edit",
         input: writeInput,
-        content: [{ type: "text", text: "native write completed" }],
-        details: undefined,
-        isError: false,
-      }, hookContext) as { isError: boolean };
-      assert.equal(failedWrite.isError, true);
+        content: [{ type: "text", text: "bridge unavailable" }],
+        details: { replay: { passed: false, actionCount: 0, failure: "bridge unavailable" } },
+        isError: true,
+      }, hookContext);
+      assert.equal(failedWrite, undefined);
       const blockedBeforePatch = await toolCallHook({
         type: "tool_call",
         toolCallId: "check-before-patch-recovery",
@@ -1537,6 +1581,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
 
       const patchInput = {
         edits: [{
+          mode: "replace",
           path: "README.md",
           baseHash: "baseline-hash",
           oldText: "baseline",
@@ -1546,14 +1591,14 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       assert.equal(await toolCallHook({
         type: "tool_call",
         toolCallId: "patch-refresh-recovery",
-        toolName: "patch",
+        toolName: "edit",
         input: patchInput,
       }, hookContext), undefined);
       await writeFile(join(task.worktreeRoot, "README.md"), "fixed\n", "utf8");
       await toolResultHook({
         type: "tool_result",
         toolCallId: "patch-refresh-recovery",
-        toolName: "patch",
+        toolName: "edit",
         input: patchInput,
         content: [{ type: "text", text: "patch replay passed" }],
         details: {
@@ -1589,7 +1634,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
     }
   });
 
-  it("patch 自身重放失败后，统一刷新门禁阻断 check 和 result", async () => {
+  it("edit 自身重放失败后，统一刷新门禁阻断 check 和 result", async () => {
     const repository = await createTemporaryGitRepository({
       "README.md": "baseline\n",
     });
@@ -1620,6 +1665,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
           close: async () => undefined,
         },
       });
+      await requireHook(pi, "input")({ source: "rpc", text: task.objective });
       const finishTool = pi.toolDefinitions.get("finish");
       assert.ok(finishTool?.execute);
       await finishTool.execute(
@@ -1645,6 +1691,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       const hookContext = { ui: { notify: () => undefined } };
       const patchInput = {
         edits: [{
+          mode: "replace",
           path: "README.md",
           baseHash: "baseline-hash",
           oldText: "baseline",
@@ -1654,14 +1701,14 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       assert.equal(await toolCallHook({
         type: "tool_call",
         toolCallId: "patch-refresh-failure",
-        toolName: "patch",
+        toolName: "edit",
         input: patchInput,
       }, hookContext), undefined);
       await writeFile(join(task.worktreeRoot, "README.md"), "changed\n", "utf8");
       await toolResultHook({
         type: "tool_result",
         toolCallId: "patch-refresh-failure",
-        toolName: "patch",
+        toolName: "edit",
         input: patchInput,
         content: [{
           type: "text",
@@ -1679,7 +1726,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       }, hookContext) as { block: boolean; terminate: boolean; reason: string };
       assert.equal(blockedCheck.block, true);
       assert.equal(blockedCheck.terminate, false);
-      assert.match(blockedCheck.reason, /精确补丁已写入/u);
+      assert.match(blockedCheck.reason, /edit 已写入/u);
       const blockedResult = await toolCallHook({
         type: "tool_call",
         toolCallId: "result-after-patch-refresh-failure",
@@ -1696,7 +1743,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
         .map((row) => JSON.parse(row) as { type: string; detail: Record<string, unknown> });
       const write = events.find((event) => (
         event.type === "tool.write_outcome"
-        && event.detail.toolName === "patch"
+        && event.detail.toolName === "edit"
       ));
       assert.ok(write);
       assert.equal(write.detail.outcome, "mutated_replay_failed");
@@ -1706,7 +1753,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
     }
   });
 
-  it("拒绝越界原生路径和无代码变化的 result，并保留本轮修改权限", async () => {
+  it("拒绝 edit 越界路径和无代码变化的 result，并保留本轮修改权限", async () => {
     const repository = await createTemporaryGitRepository({
       "README.md": "baseline\n",
     });
@@ -1741,6 +1788,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
           close: async () => undefined,
         },
       });
+      await requireHook(pi, "input")({ source: "rpc", text: task.objective });
       const finishTool = pi.toolDefinitions.get("finish");
       assert.ok(finishTool?.execute);
       await finishTool.execute(
@@ -1764,32 +1812,29 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       const formalRepositoryPath = await toolCallHook({
         type: "tool_call",
         toolCallId: "formal-repo-write",
-        toolName: "write",
-        input: {
-          path: join(task.repoRoot, "README.md"),
-          content: "forbidden\n",
-        },
-      }, { ui: { notify: () => undefined } }) as {
+        toolName: "edit",
+        input: writeEditInput(join(task.repoRoot, "README.md"), "forbidden\n"),
+      }, { abort: () => undefined, ui: { notify: () => undefined } }) as {
         block: boolean;
         terminate: boolean;
         reason: string;
       };
       assert.equal(formalRepositoryPath.block, true);
       assert.equal(formalRepositoryPath.terminate, false);
-      assert.match(formalRepositoryPath.reason, /正式仓库绝对路径/u);
+      assert.match(formalRepositoryPath.reason, /项目相对路径|正式仓库绝对路径/u);
       const parentTraversal = await toolCallHook({
         type: "tool_call",
         toolCallId: "parent-traversal-write",
-        toolName: "write",
-        input: { path: "../escape.txt", content: "b" },
-      }, { ui: { notify: () => undefined } }) as {
+        toolName: "edit",
+        input: writeEditInput("../escape.txt", "b"),
+      }, { abort: () => undefined, ui: { notify: () => undefined } }) as {
         block: boolean;
         terminate: boolean;
         reason: string;
       };
       assert.equal(parentTraversal.block, true);
       assert.equal(parentTraversal.terminate, false);
-      assert.match(parentTraversal.reason, /不能包含 \.\./u);
+      assert.match(parentTraversal.reason, /路径不得离开项目根目录|不能包含 \.\./u);
 
       const outsideDirectory = join(repository.temporaryRoot, "outside-native-write");
       const linkedDirectory = join(task.worktreeRoot, "linked-outside");
@@ -1802,18 +1847,41 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       const linkedEscape = await toolCallHook({
         type: "tool_call",
         toolCallId: "linked-escape-write",
-        toolName: "write",
-        input: { path: "linked-outside/escape.txt", content: "forbidden\n" },
-      }, { ui: { notify: () => undefined } }) as {
+        toolName: "edit",
+        input: createEditInput("linked-outside/escape.txt", "forbidden\n"),
+      }, { abort: () => undefined, ui: { notify: () => undefined } }) as {
         block: boolean;
         terminate: boolean;
         reason: string;
       };
       assert.equal(linkedEscape.block, true);
       assert.equal(linkedEscape.terminate, false);
-      assert.match(linkedEscape.reason, /realpath/u);
+      assert.match(linkedEscape.reason, /realpath|符号链接|junction/u);
       assert.equal(runtimeEnsureCount, 0);
 
+      // 三次路径安全失败都只拒绝当前调用，请求与写授权仍有效。下一个自然输入
+      // 按设计关闭旧写授权，重新批准后再独立验证“没有 worktree 变化不能提交 result”。
+      await requireHook(pi, "input")({
+        source: "rpc",
+        text: "继续验证无代码变化的结果门禁",
+      });
+      await finishTool.execute(
+        "reapprove-no-change",
+        {
+          status: "proposed",
+          summary: "路径边界已验证，继续检查空变更结果。",
+          risk: "不执行实际写入。",
+          plan: {
+            title: "验证空变更结果门禁",
+            steps: ["不修改文件，直接提交结果。"],
+            verification: "结果工具必须拒绝空 worktree 变化。",
+            allowedPaths: ["README.md"],
+          },
+        },
+        undefined,
+        undefined,
+        { ui: { confirm: async () => true } },
+      );
       const notifications: string[] = [];
       await assert.rejects(
         async () => {
@@ -1838,7 +1906,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       await repository.dispose();
     }
   });
-  it("首次 write 直接触发一次批准并继续原调用", async () => {
+  it("首次 edit 直接触发一次批准并继续原调用", async () => {
     const repository = await createTemporaryGitRepository({ "README.md": "baseline\n" });
     try {
       const dataDir = join(repository.temporaryRoot, "data-first-write");
@@ -1863,6 +1931,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
           close: async () => undefined,
         },
       });
+      await requireHook(pi, "input")({ source: "rpc", text: task.objective });
       let confirmations = 0;
       const context = {
         hasUI: true,
@@ -1878,11 +1947,11 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       };
       const call = requireHook(pi, "tool_call");
       const result = requireHook(pi, "tool_result");
-      const input = { path: "README.md", content: "fixed\n" };
+      const input = writeEditInput("README.md", "fixed\n");
       assert.equal(await call({
         type: "tool_call",
         toolCallId: "first-write",
-        toolName: "write",
+        toolName: "edit",
         input,
       }, context), undefined);
       assert.equal(confirmations, 1);
@@ -1891,7 +1960,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       await result({
         type: "tool_result",
         toolCallId: "first-write",
-        toolName: "write",
+        toolName: "edit",
         input,
         content: [{ type: "text", text: "written" }],
         details: undefined,
@@ -1905,11 +1974,13 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
 
   it("长 SQL 输入不会挤掉最新终端状态", () => {
     const view: PlayView = {
+      revision: "00000001",
       floor: 1,
       mode: "combat",
       hp: { current: 2, max: 2, armor: 0 },
       progress: { lessons: 0, rooms: 1, moves: 0, queries: 1, hintLevel: 0 },
-      actions: [{ id: "query", label: "提交" }],
+      actions: [{ id: "query", label: "提交", tool: "query" }],
+      target: null,
       room: "测试房间",
       mission: { title: "题目", body: "目标", lesson: "说明" },
       record: null,

@@ -13,6 +13,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { appendEvent } from "../logging/events.js";
+import { selectChangeUpstreamIds } from "../evidence/links.js";
 import { changeEvidence } from "../evidence/projector.js";
 import type { EvidenceStore } from "../evidence/store.js";
 import { containsCredentialText } from "../logging/redact.js";
@@ -295,17 +296,16 @@ export async function applyPrecisePatch(
   ]));
   if (context.evidence) {
     const worktreeHash = await hashWorktree(task.worktreeRoot);
+    const paths = staged.map((item) => item.relative);
+    const links = selectChangeUpstreamIds(await context.evidence.active(), paths);
     await context.evidence.invalidatePaths(
-      staged.map((item) => item.relative),
+      paths,
       worktreeHash,
     );
-    const proposed = (await context.evidence.active("claim"))
-      .filter((record) => record.metadata.finishStatus === "proposed")
-      .at(-1);
     await context.evidence.capture(changeEvidence(
-      staged.map((item) => item.relative),
+      paths,
       worktreeHash,
-      proposed ? [proposed.id] : [],
+      links,
     ));
   }
   // 核心审批无论批准或拒绝都会回到 active；非核心补丁从入口起也保持 active。

@@ -1,8 +1,0 @@
-{
-  "schemaVersion": 2,
-  "id": "final-stage-boss-stuck-at-one-hp",
-  "base": "game-repair",
-  "sourcePatch": "source.patch",
-  "patchSha256": "cd3c5adf3fefa51143972aaa3b6ff4d90a42b6330614aa3f5676b90ac77f98f8",
-  "dirtyPaths": ["game/src/domain/session/GameSession.ts"]
-}

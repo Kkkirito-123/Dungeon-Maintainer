@@ -1,5 +1,5 @@
 /** 与具体 Agent 工具框架无关的受限源码检查契约。 */
-export type InspectAction = "status" | "tree" | "search" | "bundle" | "read" | "read_many" | "diff";
+export type InspectAction = "status" | "files" | "search" | "bundle" | "read" | "read_many" | "diff";
 
 /** `read_many` 中一个受限源码范围。 */
 export interface InspectReadRange {
@@ -15,9 +15,6 @@ export interface InspectInput {
   query?: string;
   startLine?: number;
   lineCount?: number;
-  partitionId?: string;
-  featureId?: string;
-  floorId?: string;
   ranges?: InspectReadRange[];
 }
 
@@ -42,19 +39,14 @@ export interface InspectDetails {
   actionKey: string;
   /** exact 未执行外部读取；semantic 已执行但结果与现有证据相同，只返回短回执。 */
   cacheKind: "none" | "exact" | "semantic";
+  /** 本次结果实际命中的范围；零命中时为已搜索并排除的范围。 */
   scope?: string[];
   matchCount?: number;
   complete?: boolean;
-  expanded?: boolean;
-  expansionLevel?: string;
   bundleWindows?: number;
   /** 本次搜索阶段实际产生候选命中的不同文件数。 */
   candidateFiles?: number;
   /** Bundle 最终展示源码窗口所覆盖的不同文件数。 */
   selectedFiles?: number;
-  /** 功能三级路由首次命中的层级；没有功能路由时为 none。 */
-  featureRouteLevel?: "primary" | "adjacent" | "shared" | "fallback" | "none";
-  floorRouteLevel?: "current" | "adjacent" | "shared" | "fallback" | "none";
-  floorScopeCount?: number;
   items?: InspectItemDetails[];
 }

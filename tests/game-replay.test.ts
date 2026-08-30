@@ -3,7 +3,11 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { GameBrowser, GameBrowserError } from "../src/game/browser.js";
+import {
+  GameBrowser,
+  GameBrowserError,
+  isOptionalPresenceError,
+} from "../src/game/browser.js";
 import { GameDriver } from "../src/game/driver.js";
 import type {
   PlayJudge,
@@ -24,8 +28,19 @@ import {
 } from "../src/workspace/check.js";
 import { createTaskRecordFixture } from "./testSupport.js";
 
+describe("试玩页可选服务错误分类", () => {
+  it("只忽略同源 /api/presence，不吞掉其它控制台错误", () => {
+    const gameUrl = "http://127.0.0.1:4173";
+    assert.equal(isOptionalPresenceError(gameUrl, gameUrl + "/api/presence"), true);
+    assert.equal(isOptionalPresenceError(gameUrl, gameUrl + "/api/game"), false);
+    assert.equal(isOptionalPresenceError(gameUrl, "http://127.0.0.1:4174/api/presence"), false);
+    assert.equal(isOptionalPresenceError(gameUrl, "not-a-url"), false);
+  });
+});
+
 function playView(overrides: Partial<PlayView> = {}): PlayView {
   return {
+    revision: "00000001",
     floor: 1,
     mode: "explore",
     hp: { current: 2, max: 2, armor: 0 },
@@ -37,9 +52,15 @@ function playView(overrides: Partial<PlayView> = {}): PlayView {
       hintLevel: 0,
     },
     actions: [
-      { id: "objective", label: "前往目标" },
-      { id: "interact", label: "交互" },
+      { id: "objective", label: "前往目标", tool: "act" },
+      { id: "interact", label: "交互", tool: "act" },
     ],
+    target: {
+      kind: "objective",
+      label: "当前目标",
+      prerequisites: [],
+      actionId: "objective",
+    },
     room: "入口",
     mission: { title: "SELECT", body: "找到目标", lesson: "投影" },
     record: null,
@@ -52,6 +73,30 @@ function playView(overrides: Partial<PlayView> = {}): PlayView {
 
 function playResult(event: string, view = playView()): PlayResult {
   return { ok: true, event, steps: event.startsWith("go") ? 2 : 0, view };
+}
+
+function combatView(inputSql = ""): PlayView {
+  return playView({
+    mode: "combat",
+    actions: [{ id: "query", label: "提交答案", tool: "query" }],
+    target: null,
+    terminal: {
+      kind: "combat",
+      title: "SELECT",
+      objective: "查询目标",
+      lessonId: "select",
+      stageId: "select-1",
+      stageIndex: 0,
+      task: null,
+      schema: ["monsters"],
+      locks: [],
+      hints: [],
+      inputSql,
+      status: { kind: "neutral", text: "" },
+      result: "",
+      plan: [],
+    },
+  });
 }
 
 class RecordingBrowser {
@@ -86,10 +131,7 @@ class RecordingBrowser {
       return playView({ floor: 2, mode: "explore" });
     }
     if (this.queryReady) {
-      return playView({
-        mode: "combat",
-        actions: [{ id: "query", label: "提交答案" }],
-      });
+      return combatView(this.inputValue);
     }
     return playView();
   }
@@ -117,6 +159,12 @@ class RecordingBrowser {
     return playResult("go-complete");
   }
 
+  async act(_revision: string, actionId: string): Promise<PlayResult> {
+    return actionId === "objective" || actionId === "frontier"
+      ? await this.go()
+      : await this.use();
+  }
+
   async use(): Promise<PlayResult> {
     this.calls.push("use");
     if (this.failNextUseAsUnavailable) {
@@ -125,25 +173,7 @@ class RecordingBrowser {
     }
     if (this.terminalOpenOnUse) {
       this.queryReady = true;
-      return playResult("action:terminal", playView({
-        mode: "combat",
-        terminal: {
-          kind: "combat",
-          title: "SELECT",
-          objective: "查询目标",
-          lessonId: "select",
-          stageId: "select-1",
-          stageIndex: 0,
-          task: null,
-          schema: ["monsters"],
-          locks: [],
-          hints: [],
-          inputSql: "",
-          status: { kind: "neutral", text: "" },
-          result: "",
-          plan: [],
-        },
-      }));
+      return playResult("action:terminal", combatView());
     }
     if (this.transitionOnUse) {
       this.transitionPending = true;
@@ -153,17 +183,18 @@ class RecordingBrowser {
     return playResult("action:interact");
   }
 
-  async query(): Promise<PlayResult> {
+  async query(_revision?: string, sql?: string): Promise<PlayResult> {
     this.calls.push("query");
+    if (sql !== undefined) this.inputValue = sql;
     const queued = this.queryResults.shift();
     if (queued) {
       this.queryReady = queued.view.mode === "combat" || queued.view.mode === "challenge";
       return queued;
     }
-    this.queryReady = false;
+    this.queryReady = true;
     const event = this.queryAccepted ? "query-accepted" : "query-rejected";
     return {
-      ...playResult(event, playView({ mode: "combat" })),
+      ...playResult(event, combatView(this.inputValue)),
       ok: this.queryAccepted,
     };
   }
@@ -175,25 +206,7 @@ class RecordingBrowser {
       return { ...playResult("terminal-not-open"), ok: false };
     }
     this.queryReady = true;
-    return playResult("input-accepted", playView({
-      mode: "combat",
-      terminal: {
-        kind: "combat",
-        title: "SELECT",
-        objective: "查询目标",
-        lessonId: "select",
-        stageId: "select-1",
-        stageIndex: 0,
-        task: null,
-        schema: ["monsters"],
-        locks: [],
-        hints: [],
-        inputSql: sql,
-        status: { kind: "neutral", text: "" },
-        result: "",
-        plan: [],
-      },
-    }));
+    return playResult("input-accepted", combatView(sql));
   }
 
   async judge(): Promise<PlayJudge> {
@@ -210,7 +223,7 @@ describe("浏览器检查点、刷新、恢复和语义重放", () => {
   it("游戏桥只接受当前协议", async () => {
     const browser = new GameBrowser("http://127.0.0.1:5173", () => undefined, null);
     const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
-    let version = 3;
+    let version = 1;
     const frame = {
       evaluate: async <T>(operation: () => T): Promise<T> => {
         Object.defineProperty(globalThis, "window", {
@@ -233,8 +246,8 @@ describe("浏览器检查点、刷新、恢复和语义重放", () => {
     };
     internals.needGameFrame = async () => frame;
 
-    assert.equal(await browser.protocolVersion(), 3);
-    version = 2;
+    assert.equal(await browser.protocolVersion(), 1);
+    version = 0;
     await assert.rejects(browser.protocolVersion(), GameBrowserError);
   });
 
@@ -260,8 +273,8 @@ describe("浏览器检查点、刷新、恢复和语义重放", () => {
           configurable: true,
           value: {
             __DUNGEON_PLAYTEST__: {
-              go: async () => {
-                calls.push("go");
+              act: async () => {
+                calls.push("act");
                 return playResult("move-complete");
               },
             },
@@ -288,10 +301,10 @@ describe("浏览器检查点、刷新、恢复和语义重放", () => {
     };
     internals.needGameFrame = async () => frame;
 
-    const result = await browser.go("objective", 8);
+    const result = await browser.act("00000001", "objective", 8);
 
     assert.equal(result.ok, true);
-    assert.deepEqual(calls, ["focus", "go"]);
+    assert.deepEqual(calls, ["focus", "act"]);
   });
 
   it("Vite 自动恢复只跳过一次导航，后续验证会真正消费新 checkpoint", async () => {
@@ -338,14 +351,14 @@ describe("浏览器检查点、刷新、恢复和语义重放", () => {
     assert.deepEqual(driver.trace.snapshot(), []);
   });
 
-  it("一次 objective 工具调用内部跨过非终止 action/task 边界直到进入目标模式", async () => {
+  it("一次 objective 动作在首个交互边界停止", async () => {
     const browser = new RecordingBrowser();
     browser.goResults.push(
       { ...playResult("action"), steps: 6 },
       { ...playResult("task"), steps: 2 },
       playResult("mode", playView({
         mode: "combat",
-        actions: [{ id: "terminal", label: "打开当前 SQL 战斗终端" }],
+        actions: [{ id: "terminal", label: "打开当前 SQL 战斗终端", tool: "act" }],
       })),
     );
     const driver = new GameDriver(browser as unknown as GameBrowser);
@@ -354,30 +367,35 @@ describe("浏览器检查点、刷新、恢复和语义重放", () => {
     browser.calls.length = 0;
     const result = await driver.go("objective", 64);
 
-    assert.equal(result.event, "mode");
-    assert.equal(result.view.mode, "combat");
-    assert.equal(result.steps, 8);
-    assert.deepEqual(browser.calls, ["go", "go", "go"]);
+    assert.equal(result.event, "action");
+    assert.equal(result.steps, 6);
+    assert.deepEqual(browser.calls, ["go"]);
     assert.deepEqual(driver.trace.snapshot().map((entry) => entry.action), ["go"]);
   });
 
   it("源码刷新后先恢复并重建同一起点检查点，再按原顺序重放", async () => {
     const browser = new RecordingBrowser();
+    browser.terminalOpenOnUse = true;
     const driver = new GameDriver(browser as unknown as GameBrowser);
 
     await driver.beginReproduction();
     await driver.ensureReproductionCheckpoint();
     await driver.go("objective", 8);
     await driver.use("interact");
-    await driver.query();
+    await driver.query("SELECT 1");
     const actions = driver.trace.snapshot();
-    assert.deepEqual(actions.map((entry) => entry.action), ["go", "use", "query"]);
+    assert.deepEqual(actions.map((entry) => entry.action), [
+      "go",
+      "use",
+      "input-sql",
+      "query",
+    ]);
     assert.equal(browser.checkpointCount, 1);
 
     browser.calls.length = 0;
     const replay = await driver.reloadAndReplay(actions);
     assert.equal(replay.passed, true);
-    assert.equal(replay.actionCount, 3);
+    assert.equal(replay.actionCount, 4);
     assert.deepEqual(browser.calls, [
       "reload",
       "checkpoint",
@@ -385,6 +403,7 @@ describe("浏览器检查点、刷新、恢复和语义重放", () => {
       "go",
       "look",
       "use",
+      "look",
       "look",
       "query",
     ]);
@@ -408,8 +427,9 @@ describe("浏览器检查点、刷新、恢复和语义重放", () => {
     assert.deepEqual(browser.calls, ["reload", "checkpoint", "look", "go"]);
   });
 
-  it("input_sql 只保存长度并可在同一进程刷新重放", async () => {
+  it("合并 query 只在 Trace 保存 SQL 长度并可在同一进程刷新重放", async () => {
     const browser = new RecordingBrowser();
+    browser.terminalOpenOnUse = true;
     const driver = new GameDriver(browser as unknown as GameBrowser);
     await driver.beginReproduction();
     await driver.use("interact");
@@ -424,11 +444,13 @@ describe("浏览器检查点、刷新、恢复和语义重放", () => {
     const replay = await driver.reloadAndReplay(actions);
     assert.equal(replay.passed, true);
     assert.equal(replay.actionCount, 3);
-    assert.ok(browser.calls.includes("inputSql"));
+    assert.equal(browser.calls.includes("inputSql"), false);
+    assert.equal(browser.inputValue, "SELECT id FROM monsters");
   });
 
   it("任务重启后缺少内存 SQL 正文会明确阻断重放", async () => {
     const originalBrowser = new RecordingBrowser();
+    originalBrowser.terminalOpenOnUse = true;
     const originalDriver = new GameDriver(originalBrowser as unknown as GameBrowser);
     await originalDriver.beginReproduction();
     await originalDriver.use("interact");
@@ -519,7 +541,6 @@ describe("浏览器检查点、刷新、恢复和语义重放", () => {
       "look",
       "use",
       "look",
-      "inputSql",
     ]);
 
     const queryFailure = replayableTraceActions([
@@ -633,11 +654,12 @@ describe("浏览器检查点、刷新、恢复和语义重放", () => {
       const store = new TaskStore(dataRoot);
       const task = createTaskRecordFixture({ id: "query-rejected" });
       const browser = new RecordingBrowser();
+      browser.terminalOpenOnUse = true;
       const driver = new GameDriver(browser as unknown as GameBrowser);
       await driver.beginReproduction();
       await driver.use("interact");
       browser.queryAccepted = false;
-      await driver.query();
+      await driver.query("SELECT 1");
       const reproduction: ReproductionRecord = {
         schemaVersion: 2,
         id: "query-reproduction",
@@ -719,11 +741,12 @@ describe("浏览器检查点、刷新、恢复和语义重放", () => {
       const store = new TaskStore(dataRoot);
       const task = createTaskRecordFixture({ id: "combat-stage-stalled" });
       const browser = new RecordingBrowser();
+      browser.terminalOpenOnUse = true;
       const driver = new GameDriver(browser as unknown as GameBrowser);
       await driver.beginReproduction();
       await driver.use("interact");
-      await driver.query();
-      await driver.query();
+      await driver.query("SELECT 1");
+      await driver.query("SELECT 2");
       const reproduction: ReproductionRecord = {
         schemaVersion: 2,
         id: "combat-stage-reproduction",
@@ -746,7 +769,7 @@ describe("浏览器检查点、刷新、恢复和语义重放", () => {
       };
       const stageView = (stageIndex: number): PlayView => playView({
         mode: "combat",
-        actions: [{ id: "query", label: "提交答案" }],
+        actions: [{ id: "query", label: "提交答案", tool: "query" }],
         terminal: {
           kind: "combat",
           title: "SELECT",
@@ -831,7 +854,6 @@ describe("固定检查白名单", () => {
       "game-related-test",
     ]);
     assert.deepEqual(requiredChecks(["game/tests/session.test.ts"]), ["game-related-test"]);
-    assert.deepEqual(requiredChecks([".maintainer/architecture-map.json"]), ["game-architecture"]);
     assert.deepEqual(requiredChecks(["README.md"]), []);
     assert.deepEqual(requiredApplyChecks(["game/src/domain/session.ts"]), [
       "game-test",

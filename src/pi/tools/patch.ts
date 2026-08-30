@@ -1,5 +1,5 @@
 /**
- * Pi `patch` 精确修改工具。
+ * Pi `edit` 受限修改工具。
  *
  * 本文件只把 Pi 的严格 TypeBox 参数、方案授权和浏览器刷新顺序连接到 workspace
  * patch；真正的路径、realpath、baseHash、唯一匹配、隐私和预算校验均由安全层执行。
@@ -14,7 +14,8 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { readFile } from "node:fs/promises";
+import { Type, type Static } from "typebox";
 import type { GameDriver, ReplayResult } from "../../game/driver.js";
 import type { EvidenceStore } from "../../evidence/store.js";
 import { appendEvent } from "../../logging/events.js";
@@ -28,18 +29,27 @@ import {
 } from "../../workspace/patch.js";
 import { assertWritePathAllowed } from "../../workspace/write-scope.js";
 import { hashWorktree } from "../../workspace/git.js";
+import { resolveProjectPath } from "../../workspace/policy.js";
 
 const PatchEditParameters = Type.Object({
+  mode: Type.Union([
+    Type.Literal("replace"),
+    Type.Literal("write"),
+    Type.Literal("create"),
+  ]),
   path: Type.String({ minLength: 1, maxLength: 300 }),
   baseHash: Type.String({ minLength: 7, maxLength: 64 }),
-  oldText: Type.String({ maxLength: 64 * 1024 }),
-  newText: Type.String({ maxLength: 64 * 1024 }),
+  oldText: Type.Optional(Type.String({ maxLength: 64 * 1024 })),
+  newText: Type.Optional(Type.String({ maxLength: 64 * 1024 })),
+  content: Type.Optional(Type.String({ maxLength: 64 * 1024 })),
 }, { additionalProperties: false });
 
 /** `patch` 的严格参数契约。 */
 export const PatchParameters = Type.Object({
   edits: Type.Array(PatchEditParameters, { minItems: 1, maxItems: 3 }),
 }, { additionalProperties: false });
+
+type EditInput = Static<typeof PatchParameters>;
 
 /** 补丁写入及立即重放的有限结果。 */
 export interface PatchToolDetails extends PrecisePatchResult {
@@ -84,23 +94,23 @@ async function confirmCorePatch(
  * @param pi 当前 Extension API。
  * @param context 与一个 taskId/worktree 绑定的执行依赖。
  */
-export function registerPatchTool(
+export function registerEditTool(
   pi: ExtensionAPI,
   context: PatchToolContext,
 ): void {
   pi.registerTool({
-    name: "patch",
+    name: "edit",
     label: "修改代码",
-    description: "在 detached worktree 中按 baseHash 做唯一文本替换或创建文本文件；最多 3 文件、累计 120 行。",
-    promptSnippet: "用 patch 在隔离 worktree 做精确修改",
+    description: "在 detached worktree 中按 baseHash 做唯一替换、整文件写入或创建文本文件；最多 3 文件、累计 120 行。",
+    promptSnippet: "用 edit 在隔离 worktree 做受限修改",
     promptGuidelines: [
       "运行时问题优先用 finish 保存可重放复现；check 是诊断与验证证据，不是写入资格。",
-      "patch 必须使用最近 inspect read 返回的 baseHash 和唯一 oldText。",
+      "edit 必须使用最近 inspect read 返回的 baseHash；replace 还必须提供唯一 oldText/newText，write/create 只提供 content。",
       "补丁后先观察自动刷新重放结果，再决定是否继续修改。",
     ],
     executionMode: "sequential",
     parameters: PatchParameters,
-    async execute(_toolCallId, input, signal, _onUpdate, extensionContext) {
+    async execute(_toolCallId, input: EditInput, signal, _onUpdate, extensionContext) {
       if (!context.isExecutionApproved()) {
         throw new Error("完整修复方案尚未获用户确认，不能修改代码。");
       }
@@ -117,9 +127,25 @@ export function registerPatchTool(
       // 误判成当前作用域中永远不会发生的控制流，同时不把刷新职责泄漏到安全层。
       const replayState: { current: ReplayResult | null } = { current: null };
       const scopedInput = {
-        edits: input.edits.map((edit) => ({
-          ...edit,
-          path: assertWritePathAllowed(context.task, edit.path),
+        edits: await Promise.all(input.edits.map(async (edit) => {
+          const path = assertWritePathAllowed(context.task, edit.path);
+          if (edit.mode === "replace") {
+            if (edit.content !== undefined || edit.oldText === undefined || edit.newText === undefined) {
+              throw new Error("replace 只接受 oldText 和 newText");
+            }
+            return { path, baseHash: edit.baseHash, oldText: edit.oldText, newText: edit.newText };
+          }
+          if (edit.oldText !== undefined || edit.newText !== undefined || edit.content === undefined) {
+            throw new Error(`${edit.mode} 只接受 content`);
+          }
+          if (edit.mode === "create") {
+            if (edit.baseHash !== "missing") throw new Error("create 必须使用 missing baseHash");
+            return { path, baseHash: edit.baseHash, oldText: "", newText: edit.content };
+          }
+          if (edit.baseHash === "missing") throw new Error("write 不能用于尚未创建的文件");
+          const target = await resolveProjectPath(context.task.worktreeRoot, path, "write");
+          const oldText = await readFile(target.absolute, "utf8");
+          return { path, baseHash: edit.baseHash, oldText, newText: edit.content };
         })),
       };
       const result = await applyPrecisePatch({

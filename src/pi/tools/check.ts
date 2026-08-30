@@ -52,8 +52,8 @@ export function registerCheckTool(
     description: "运行维护器源码登记的 SQL Dungeon 聚焦诊断检查。",
     promptSnippet: "用 check 运行聚焦诊断检查",
     promptGuidelines: [
-      "只有测试、规则或构建症状需要定向诊断时才调用 check；正常修改完成后直接 finish(result)。",
-      "finish(result) 会复用同一 Hash 的检查结果或运行一次候选聚焦验证，不要在写入后预先重复运行 game-related-test。",
+      "只有测试、规则或构建症状需要定向诊断时才调用 check；正常修改完成后自然结束。",
+      "用户明确要求立即验证时，finish(result) 会复用同一 Hash 的检查结果或运行一次候选聚焦验证；不要在写入后预先重复运行 game-related-test。",
       "完整 game-test、game-architecture 和 game-build 不属于模型工具，只在 /apply 前运行一次。",
       "不得把失败检查描述为通过；根据日志尾部继续定位。",
     ],

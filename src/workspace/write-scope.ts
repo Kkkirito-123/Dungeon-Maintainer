@@ -56,7 +56,7 @@ export async function validateWriteScopePaths(
         }
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        // 新文件在方案确认时可以尚不存在；后续 write/patch 仍只允许这个精确路径。
+        // 新文件在方案确认时可以尚不存在；后续 edit 仍只允许这个精确路径。
       }
     },
   ));
@@ -95,7 +95,7 @@ export function assertChangedPathsWithinApprovedScope(
  * 验证单个写入目标属于当前活动白名单。
  *
  * @param task 当前任务。
- * @param path write/patch 提供的项目路径。
+ * @param path edit 提供的项目路径。
  * @returns 规范化项目相对路径。
  * @throws 未批准、范围已关闭或路径未列入方案时拒绝。
  */

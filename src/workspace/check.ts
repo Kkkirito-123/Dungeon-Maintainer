@@ -86,10 +86,7 @@ export function requiredChecks(paths: readonly string[]): CheckId[] {
     (path.startsWith("game/src/") || path.startsWith("game/tests/"))
     && path.endsWith(".ts")
   ))) checks.push("game-related-test");
-  if (paths.some((path) => (
-    path === ".maintainer/architecture-map.json"
-    || path === "game/scripts/check-architecture.mjs"
-  ))) checks.push("game-architecture");
+  if (paths.includes("game/scripts/check-architecture.mjs")) checks.push("game-architecture");
   return checks;
 }
 
@@ -98,10 +95,7 @@ export function requiredApplyChecks(paths: readonly string[]): CheckId[] {
   if (paths.some((path) => path.startsWith("game/src/") || path.startsWith("game/tests/"))) {
     return ["game-test", "game-architecture", "game-build"];
   }
-  if (paths.some((path) => (
-    path === ".maintainer/architecture-map.json"
-    || path === "game/scripts/check-architecture.mjs"
-  ))) return ["game-architecture"];
+  if (paths.includes("game/scripts/check-architecture.mjs")) return ["game-architecture"];
   return [];
 }
 

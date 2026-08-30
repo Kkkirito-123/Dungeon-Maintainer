@@ -30,9 +30,9 @@ export interface GameRuntimeStart {
 }
 
 /**
- * 读取 Benchmark 子进程注入的起点。
+ * 读取 Eval 子进程注入的起点。
  *
- * 只有显式 benchmark mode 才接受楼层、预设和无头模式，避免用户正式 start/resume 被
+ * 只有显式 eval mode 才接受楼层、预设和无头模式，避免用户正式 start/resume 被
  * 外部环境意外改变。fixture 在父进程已经校验一次，这里仍做第二道严格边界检查。
  */
 export function resolveGameRuntimeStart(
@@ -44,15 +44,15 @@ export function resolveGameRuntimeStart(
   const floorText = environment.DUNGEON_MAINTAINER_BENCHMARK_START_FLOOR?.trim() ?? "";
   const floor = Number(floorText);
   if (!Number.isInteger(floor) || floor < 1 || floor > 8) {
-    throw new Error("Benchmark 游戏起点楼层非法");
+    throw new Error("Eval 游戏起点楼层非法");
   }
   const presetText = environment.DUNGEON_MAINTAINER_BENCHMARK_START_PRESET?.trim() ?? "";
   if (presetText && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(presetText)) {
-    throw new Error("Benchmark 游戏起点预设非法");
+    throw new Error("Eval 游戏起点预设非法");
   }
   const headlessText = environment.DUNGEON_MAINTAINER_BENCHMARK_HEADLESS?.trim() ?? "1";
   if (headlessText !== "0" && headlessText !== "1") {
-    throw new Error("Benchmark 浏览器模式非法");
+    throw new Error("Eval 浏览器模式非法");
   }
   return { floor, preset: presetText || null, headless: headlessText === "1" };
 }

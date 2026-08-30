@@ -34,14 +34,28 @@ import {
   type ShellApprovalRequest,
   type ShellActivityState,
   type ShellEvent,
-  type ShellModelOption,
   type ShellStatus,
   type ShellStatusConfig,
   type ShellTaskSwitchRequest,
   type ShellUiResponse,
 } from "./protocol.js";
-
-type JsonRecord = Record<string, unknown>;
+import {
+  assistantStopReason,
+  compactionEstimate,
+  isRecord,
+  isThinkingDelta,
+  jsonBody,
+  modelSummary,
+  parseRpcEvent,
+  sanitizeText,
+  stringValue,
+  textFromAssistantEvent,
+  textFromMessage,
+  visibleModelError,
+  writeJson,
+  writeText,
+  isTerminalAssistantMessage,
+} from "./codec.js";
 type RpcSender = (command: AgentRpcCommand) => Promise<unknown>;
 type ShellClient = { response: ServerResponse; lastEventId: number };
 
@@ -67,173 +81,10 @@ export interface ShellServerOptions extends ShellStatusConfig {
   readEvidenceSnapshot?: () => Promise<EvidenceSnapshot>;
   sendPiCommand: RpcSender;
   onSwitchTask?: (request: ShellTaskSwitchRequest) => Promise<TaskRecord>;
-  listModelProfiles?: () => Promise<unknown>;
-  saveModelProfile?: (
-    profile: unknown,
-    apiKey: string | null,
-    activate: boolean,
-  ) => Promise<unknown>;
   onClose: () => Promise<void>;
 }
 
-const MAX_BODY_BYTES = 64 * 1024;
 const MAX_EVENTS = 500;
-
-function isRecord(value: unknown): value is JsonRecord {
-  return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
-function stringValue(value: unknown): string | null {
-  return typeof value === "string" ? value : null;
-}
-
-function modelOption(value: unknown): ShellModelOption | null {
-  if (!isRecord(value)) return null;
-  const provider = stringValue(value.provider);
-  const id = stringValue(value.id);
-  if (!provider || !id) return null;
-  return {
-    provider,
-    id,
-    name: stringValue(value.name) ?? id,
-    reasoning: value.reasoning === true,
-    contextWindow: typeof value.contextWindow === "number" ? value.contextWindow : null,
-    maxOutputTokens: typeof value.maxTokens === "number" ? value.maxTokens : null,
-  };
-}
-
-function compactionEstimate(value: unknown): number | null {
-  if (!isRecord(value)) return null;
-  return typeof value.estimatedTokensAfter === "number"
-    && Number.isFinite(value.estimatedTokensAfter)
-    && value.estimatedTokensAfter >= 0
-    ? Math.floor(value.estimatedTokensAfter)
-    : null;
-}
-
-function taskProfileId(provider: string, modelId: string): string {
-  if (provider === "dungeon-maintainer") return "default";
-  if (provider.startsWith("dungeon-maintainer-")) {
-    return provider.slice("dungeon-maintainer-".length);
-  }
-  return provider + "/" + modelId;
-}
-
-function sanitizeText(text: string): string {
-  return text
-    .replaceAll(/(?:api[_ -]?key|authorization|bearer)\s*[:=]\s*\S+/giu, "[已隐藏]")
-    .replaceAll(/\bsk-[A-Za-z0-9_-]+\b/gu, "[已隐藏]")
-    .slice(0, 8_000);
-}
-
-function jsonBody(request: IncomingMessage): Promise<JsonRecord> {
-  return new Promise((resolve, reject) => {
-    let size = 0;
-    let text = "";
-    request.setEncoding("utf8");
-    request.on("data", (chunk: string) => {
-      size += Buffer.byteLength(chunk, "utf8");
-      if (size > MAX_BODY_BYTES) {
-        reject(new Error("请求体过大"));
-        request.destroy();
-        return;
-      }
-      text += chunk;
-    });
-    request.on("end", () => {
-      try {
-        const parsed: unknown = text ? JSON.parse(text) : {};
-        if (!isRecord(parsed)) throw new Error("请求体必须是 JSON 对象");
-        resolve(parsed);
-      } catch (error) {
-        reject(error instanceof Error ? error : new Error("请求体无效"));
-      }
-    });
-    request.on("error", reject);
-  });
-}
-
-function writeJson(response: ServerResponse, value: unknown, statusCode = 200): void {
-  response.writeHead(statusCode, {
-    "content-type": "application/json; charset=utf-8",
-    "cache-control": "no-store",
-  });
-  response.end(JSON.stringify(value));
-}
-
-function writeText(response: ServerResponse, value: string, statusCode = 200): void {
-  response.writeHead(statusCode, {
-    "content-type": "text/html; charset=utf-8",
-    "cache-control": "no-store",
-  });
-  response.end(value);
-}
-
-function parseRpcEvent(value: unknown): JsonRecord | null {
-  return isRecord(value) && typeof value.type === "string" ? value : null;
-}
-
-function textFromAssistantEvent(value: JsonRecord): string | null {
-  const event = isRecord(value.assistantMessageEvent)
-    ? value.assistantMessageEvent
-    : null;
-  if (!event || event.type !== "text_delta") return null;
-  return stringValue(event.delta);
-}
-
-function textFromMessage(value: JsonRecord): string | null {
-  const message = isRecord(value.message) ? value.message : null;
-  // message_end 同时覆盖 user、assistant 和 toolResult。这里只允许 assistant 文本进入
-  // Shell，避免把工具完整结果误当回答展示，也避免低敏摘要边界被旁路。
-  if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return null;
-  const chunks = message.content
-    .filter(isRecord)
-    .map((block) => block.type === "text" ? stringValue(block.text) : null)
-    .filter((text): text is string => !!text);
-  return chunks.length > 0 ? chunks.join("") : null;
-}
-
-function isTerminalAssistantMessage(value: JsonRecord): boolean {
-  const message = isRecord(value.message) ? value.message : null;
-  return !!message
-    && message.role === "assistant"
-    && message.stopReason !== "toolUse";
-}
-
-function assistantStopReason(value: JsonRecord): string | null {
-  const message = isRecord(value.message) ? value.message : null;
-  return message?.role === "assistant" ? stringValue(message.stopReason) : null;
-}
-
-function isThinkingDelta(value: JsonRecord): boolean {
-  const event = isRecord(value.assistantMessageEvent)
-    ? value.assistantMessageEvent
-    : null;
-  return event?.type === "thinking_delta";
-}
-
-/**
- * 将 Pi assistant error 转换为可以直接操作的低敏中文提示。
- *
- * Provider 错误常以“空 content + stopReason=error + errorMessage”结束；若只读取正文，
- * Shell 会完全无显示，让用户误以为 Agent 卡住。这里只保留稳定错误类别，不把上游
- * 响应体、请求参数或可能含凭据的正文原样发送到浏览器。
- */
-function visibleModelError(value: JsonRecord): string | null {
-  const message = isRecord(value.message) ? value.message : null;
-  if (!message || message.role !== "assistant" || message.stopReason !== "error") return null;
-  const raw = stringValue(message.errorMessage) ?? "";
-  if (/\b402\b|insufficient balance/iu.test(raw)) {
-    return "模型服务余额不足（HTTP 402），本次消息没有执行。请补充余额或切换可用服务后重试。";
-  }
-  if (/\b401\b|unauthori[sz]ed|invalid api key/iu.test(raw)) {
-    return "模型鉴权失败（HTTP 401），本次消息没有执行。请检查 MAINTAINER_API_KEY 后重试。";
-  }
-  if (/\b429\b|rate limit|too many requests/iu.test(raw)) {
-    return "模型服务触发限流（HTTP 429），本次消息没有执行。请稍后重试。";
-  }
-  return "模型请求失败，本次消息没有执行。请检查模型服务状态后重试。";
-}
 
 /** 创建可供 start/resume 使用的本地 Shell。 */
 export async function startShellServer(options: ShellServerOptions): Promise<ShellHandle> {
@@ -249,6 +100,8 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
   let promptInFlight = false;
   let tokenControlInFlight = false;
   let activeRequestKind: "input" | "command" | null = null;
+  let abortRequested = false;
+  let abortInFlight = false;
   let pendingTerminalError: string | null = null;
   let activityStartedAt: number | null = null;
   let activityText = "";
@@ -257,6 +110,7 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
   let lastStatePayload = "";
   let lastEvidenceRevision = -1;
   let evidenceSync: Promise<void> = Promise.resolve();
+  const isAbortRequested = (): boolean => abortRequested;
   const server: Server = createServer((request, response) => {
     void handleRequest(request, response).catch((error: unknown) => {
       if (!response.headersSent) {
@@ -322,6 +176,8 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
       activityStartedAt = null;
       promptInFlight = false;
       activeRequestKind = null;
+      abortRequested = false;
+      abortInFlight = false;
       return;
     }
     if (!activityTimer) {
@@ -342,6 +198,8 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
   const beginRequest = (kind: "input" | "command"): void => {
     promptInFlight = true;
     activeRequestKind = kind;
+    abortRequested = false;
+    abortInFlight = false;
     pendingTerminalError = null;
     status = {
       ...status,
@@ -350,6 +208,7 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
       cacheReadTokens: 0,
       cacheWriteTokens: 0,
       turnTotalTokens: 0,
+      ...(kind === "input" ? { toolCalls: 0 } : {}),
     };
     publishState();
   };
@@ -371,11 +230,11 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
 
   const toolActivity = (toolName: string): string => {
     if (toolName === "look") return "正在读取右侧游戏当前状态…";
-    if (["go", "use", "input_sql", "query"].includes(toolName)) return "正在右侧游戏中复现问题…";
-    if (["read", "grep", "find", "ls", "inspect", "tree"].includes(toolName)) {
+    if (["act", "query"].includes(toolName)) return "正在右侧游戏中复现问题…";
+    if (["inspect", "workspace"].includes(toolName)) {
       return "正在定位相关代码和证据…";
     }
-    if (["edit", "write", "patch"].includes(toolName)) {
+    if (toolName === "edit") {
       return "正在修改 detached worktree；右侧游戏会自动刷新…";
     }
     if (["bash", "check"].includes(toolName)) return "正在运行检查和验证…";
@@ -476,22 +335,15 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
   };
 
   const syncPiState = async (): Promise<void> => {
-    const [stateValue, modelsValue, levelsValue, statsValue] = await Promise.all([
+    const [stateValue, levelsValue, statsValue] = await Promise.all([
       options.sendPiCommand({ type: "get_state" }),
-      options.sendPiCommand({ type: "get_available_models" }),
       options.sendPiCommand({ type: "get_available_thinking_levels" }),
       options.sendPiCommand({ type: "get_session_stats" }),
     ]);
     const state = isRecord(stateValue) ? stateValue : null;
-    const currentModel = state ? modelOption(state.model) : null;
+    const currentModel = state ? modelSummary(state.model) : null;
     activeMaxOutputTokens = currentModel?.maxOutputTokens ?? activeMaxOutputTokens;
     const contextLimit = currentModel?.contextWindow ?? status.contextLimit;
-    const modelsRecord = isRecord(modelsValue) ? modelsValue : null;
-    const availableModels = Array.isArray(modelsRecord?.models)
-      ? modelsRecord.models.map(modelOption).filter(
-        (model): model is ShellModelOption => model !== null,
-      )
-      : status.availableModels;
     const levelsRecord = isRecord(levelsValue) ? levelsValue : null;
     const levels = Array.isArray(levelsRecord?.levels)
       ? levelsRecord.levels.filter((level): level is string => typeof level === "string")
@@ -500,7 +352,6 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
       ...status,
       modelProvider: currentModel?.provider ?? status.modelProvider,
       model: currentModel?.id ?? status.model,
-      availableModels,
       thinkingLevel: state && typeof state.thinkingLevel === "string"
         ? state.thinkingLevel
         : status.thinkingLevel,
@@ -512,10 +363,7 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
       contextLimit,
       promptTokenLimit: promptTokenLimit(contextLimit, activeMaxOutputTokens),
     };
-    const nextProfileId = taskProfileId(status.modelProvider, status.model);
-    const previousProfileId = task.modelProfileId;
     const previousThinkingLevel = task.thinkingLevel;
-    task.modelProfileId = nextProfileId;
     if (
       status.thinkingLevel === "off"
       || status.thinkingLevel === "minimal"
@@ -528,8 +376,7 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
       task.thinkingLevel = status.thinkingLevel;
     }
     if (
-      previousProfileId !== task.modelProfileId
-      || previousThinkingLevel !== task.thinkingLevel
+      previousThinkingLevel !== task.thinkingLevel
     ) {
       await options.store.save(task);
     }
@@ -543,6 +390,7 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
   };
 
   const compactForTokenControl = async (): Promise<number | null> => {
+    if (isAbortRequested()) throw new Error("当前回合已请求停止");
     status = { ...status, phase: "compacting" };
     publishState();
     publishActivity("working", "上下文超过安全线，正在压缩后再提交本轮消息…", true);
@@ -550,6 +398,7 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
       type: "compact",
       customInstructions: "保留当前任务目标、最新游戏证据、源码定位、已批准修改范围、Diff、验证状态和未解决阻塞；删除重复旧工具正文。",
     });
+    if (isAbortRequested()) throw new Error("当前回合已请求停止");
     const estimatedTokens = compactionEstimate(result);
     await refreshTokenUsage().catch(() => undefined);
     if (estimatedTokens !== null) {
@@ -738,9 +587,9 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
     }
     if (event.type === "tool_execution_start") {
       const toolName = stringValue(event.toolName) ?? "tool";
-      const phase = toolName === "patch"
-        ? "patch"
-        : ["look", "go", "use", "input_sql", "query"].includes(toolName)
+      const phase = toolName === "edit"
+        ? "edit"
+        : ["look", "act", "query"].includes(toolName)
           ? "reproduce"
           : ["check", "finish"].includes(toolName)
             ? "verify"
@@ -771,7 +620,6 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
       status = {
         ...status,
         phase: "diagnose",
-        toolCalls: 0,
         turnInputTokens: 0,
         turnOutputTokens: 0,
         cacheReadTokens: 0,
@@ -796,8 +644,13 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
     if (event.type === "agent_settled") {
       status = { ...status, phase: "idle" };
       if (promptInFlight && activeRequestKind === "input") {
-        if (pendingTerminalError) finishRequest("error", pendingTerminalError);
-        else finishRequest("done", "本轮处理完成", false);
+        if (abortRequested) {
+          finishRequest("done", "本轮已停止，可以继续输入", false);
+        } else if (pendingTerminalError) {
+          finishRequest("error", pendingTerminalError);
+        } else {
+          finishRequest("done", "本轮处理完成", false);
+        }
       } else {
         publishState();
       }
@@ -922,14 +775,6 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
       });
       return;
     }
-    if (request.method === "GET" && url.pathname === "/api/settings/profiles") {
-      if (!options.listModelProfiles) {
-        writeJson(response, { profiles: [] });
-        return;
-      }
-      writeJson(response, { profiles: await options.listModelProfiles() });
-      return;
-    }
     if (request.method !== "POST") {
       writeJson(response, { error: "不支持的请求方法" }, 405);
       return;
@@ -976,6 +821,66 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
       writeJson(response, { ok: true });
       return;
     }
+    if (url.pathname === "/api/steer") {
+      const text = stringValue(body.text)?.trim();
+      if (!text || text.length > 4_000) {
+        writeJson(response, { error: "追加要求为空或过长" }, 400);
+        return;
+      }
+      if (text.startsWith("/")) {
+        writeJson(response, { error: "运行中只能追加文字要求；固定命令请先停止本轮后再发送" }, 400);
+        return;
+      }
+      if (!promptInFlight || activeRequestKind !== "input") {
+        writeJson(response, { error: "固定命令执行中不能追加要求，请等待命令完成或停止本轮" }, 409);
+        return;
+      }
+      if (abortRequested || abortInFlight) {
+        writeJson(response, { error: "正在停止当前回合，请稍候" }, 409);
+        return;
+      }
+      try {
+        // 走 prompt 的 streamingBehavior 路径，让 Pi 在入队前触发 Extension input hook；
+        // 直接 RPC steer 会绕过请求预算继承和最新请求合并。
+        await options.sendPiCommand({
+          id: randomUUID(),
+          type: "prompt",
+          message: text,
+          streamingBehavior: "steer",
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "追加要求发送失败";
+        throw new Error("追加要求发送失败：" + sanitizeText(message), { cause: error });
+      }
+      publish({ type: "chat.user", text: sanitizeText(text) });
+      publishActivity("working", "追加要求已发送，等待当前动作切换…");
+      writeJson(response, { ok: true, accepted: true });
+      return;
+    }
+    if (url.pathname === "/api/abort") {
+      if (!promptInFlight && !tokenControlInFlight) {
+        writeJson(response, { error: "当前没有正在运行的本轮" }, 409);
+        return;
+      }
+      if (abortRequested || abortInFlight) {
+        writeJson(response, { ok: true, accepted: true, duplicate: true });
+        return;
+      }
+      abortRequested = true;
+      abortInFlight = true;
+      publishActivity("working", "正在停止当前回合…", true);
+      try {
+        await options.sendPiCommand({ type: "abort" });
+      } catch (error) {
+        abortRequested = false;
+        abortInFlight = false;
+        const message = error instanceof Error ? error.message : "停止请求发送失败";
+        publishActivity("working", "停止请求失败，当前回合仍在运行…", true);
+        throw new Error("停止当前回合失败：" + sanitizeText(message), { cause: error });
+      }
+      writeJson(response, { ok: true, accepted: true });
+      return;
+    }
     if (url.pathname === "/api/command") {
       const text = stringValue(body.text)?.trim() ?? "";
       const command = text.split(/\s+/u)[0] ?? "";
@@ -1005,7 +910,8 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
         finishRequest("error", "命令发送失败：" + sanitizeText(message));
         throw error;
       }
-      if (pendingTerminalError) finishRequest("error", pendingTerminalError);
+      if (abortRequested) finishRequest("done", "本轮已停止，可以继续输入", false);
+      else if (pendingTerminalError) finishRequest("error", pendingTerminalError);
       else finishRequest("done", command + " 已完成", false);
       writeJson(response, { ok: true });
       return;
@@ -1030,24 +936,6 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
         throw error;
       }
       writeJson(response, { ok: true });
-      return;
-    }
-    if (url.pathname === "/api/pi/model") {
-      if (promptInFlight || status.phase === "compacting" || status.phase === "verify") {
-        writeJson(response, { error: "Pi 正忙，当前不能切换模型" }, 409);
-        return;
-      }
-      const provider = stringValue(body.provider);
-      const modelId = stringValue(body.modelId);
-      if (!provider || !modelId || !status.availableModels.some(
-        (model) => model.provider === provider && model.id === modelId,
-      )) {
-        writeJson(response, { error: "模型不在 Pi 可用列表中" }, 400);
-        return;
-      }
-      await options.sendPiCommand({ type: "set_model", provider, modelId });
-      await syncPiState();
-      writeJson(response, { ok: true, status });
       return;
     }
     if (url.pathname === "/api/pi/thinking") {
@@ -1134,29 +1022,6 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
       updateTask(task);
       publish({ type: "notice", level: "info", text: "任务名称已更新为：" + sanitizeText(task.displayName) });
       writeJson(response, { ok: true, status });
-      return;
-    }
-    if (url.pathname === "/api/settings/profiles") {
-      if (!options.saveModelProfile) {
-        writeJson(response, { error: "当前启动方式不支持模型档案配置" }, 501);
-        return;
-      }
-      if (promptInFlight || status.phase === "compacting" || status.phase === "verify") {
-        writeJson(response, { error: "Pi 正忙，当前不能保存模型档案" }, 409);
-        return;
-      }
-      const apiKey = stringValue(body.apiKey)?.trim() || null;
-      const profile = await options.saveModelProfile({
-        id: body.id,
-        name: body.name,
-        baseUrl: body.baseUrl,
-        modelId: body.modelId,
-        contextWindow: body.contextWindow,
-        maxOutputTokens: body.maxOutputTokens,
-        reasoning: body.reasoning === true,
-      }, apiKey, body.activate === true);
-      await syncPiState().catch(() => undefined);
-      writeJson(response, { ok: true, profile, status });
       return;
     }
     if (url.pathname === "/api/runtime") {

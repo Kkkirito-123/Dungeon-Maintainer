@@ -62,9 +62,20 @@ describe("1.0 启动与 Extension 职责分区", () => {
     assert.doesNotMatch(extension, /startGameServer\(/u);
     assert.doesNotMatch(extension, /realpath\(/u);
     assert.doesNotMatch(extension, /task-queue|readDiagnosticEvidence|buildEvidenceCard/u);
+    assert.doesNotMatch(extension, /on\("context"/u);
     assert.doesNotMatch(extension, /triggerTurn\s*:\s*true/u);
     assert.doesNotMatch(extension, /transition\(task,\s*"paused"/u);
-    assert.match(toolIndex, /registerEvidenceTool/u);
+    for (const registration of [
+      "registerInspectTool",
+      "registerEditTool",
+      "registerCheckTool",
+      "registerFinishTool",
+      "registerGameTools",
+      "registerWorkspaceTool",
+    ]) {
+      assert.match(toolIndex, new RegExp(registration, "u"));
+    }
+    assert.doesNotMatch(toolIndex, /registerEvidenceTool/u);
     assert.match(sessionPolicy, /session_before_switch/u);
     assert.match(gameRuntime, /startGameServer\(/u);
   });
@@ -77,7 +88,6 @@ describe("1.0 启动与 Extension 职责分区", () => {
       "inspection",
       "logging",
       "repair",
-      "settings",
       "shell",
       "task",
       "workspace",
@@ -92,6 +102,18 @@ describe("1.0 启动与 Extension 职责分区", () => {
           "中立层不能依赖 Pi Adapter：" + file.pathname,
         );
       }
+    }
+  });
+
+  it("Eval domain 不反向依赖执行、Profile、报告或 UI", async () => {
+    const files = await typescriptFiles(new URL("../../src/eval/domain/", import.meta.url));
+    for (const file of files) {
+      const source = await readFile(file, "utf8");
+      assert.doesNotMatch(
+        source,
+        /from\s+["']\.\.\/(?:execution|profiles|reporting|ui)\//u,
+        "Eval domain 只能依赖领域和中立模块：" + file.pathname,
+      );
     }
   });
 });

@@ -1,5 +1,5 @@
 /**
- * 任务证据与跨任务解决方案的持久化契约。
+ * 当前任务证据的持久化契约。
  *
  * 证据只保存低敏摘要、版本 Hash、原始工件路径和关系，不复制完整源码、SQL、隐藏
  * 裁判结果或模型正文。完整检查日志和复现动作继续保存在各自目录，通过 artifactRef
@@ -63,47 +63,4 @@ export interface CheckRecord {
   durationMs: number;
   logPath: string;
   savedAt: string;
-}
-
-/** 成功修复后可跨任务检索的确定性解决方案。 */
-export interface SolutionRecord {
-  schemaVersion: 1;
-  id: string;
-  projectKey: string;
-  taskId: string;
-  title: string;
-  symptom: string;
-  rootCause: string;
-  planTitle: string;
-  steps: string[];
-  verification: string;
-  relatedPaths: string[];
-  evidenceRefs: string[];
-  buggyHashes: Record<string, string>;
-  fixedHashes: Record<string, string>;
-  createdAt: string;
-}
-
-/** solution-index.jsonl 中用于本地搜索的有限目录项。 */
-export interface SolutionIndexRecord {
-  schemaVersion: 1;
-  id: string;
-  projectKey: string;
-  title: string;
-  description: string;
-  category: string;
-  searchText: string;
-  relatedPaths: string[];
-  detailRef: string;
-  createdAt: string;
-}
-
-/** 本地确定性匹配后的候选方案。 */
-export interface SolutionSearchResult {
-  id: string;
-  title: string;
-  description: string;
-  category: string;
-  relatedPaths: string[];
-  score: number;
 }

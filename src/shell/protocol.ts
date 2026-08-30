@@ -13,16 +13,6 @@ import type { TaskRecord, TaskState } from "../task/types.js";
 import { promptTokenLimit } from "../agent/token-control.js";
 import type { EvidenceNode } from "../evidence/view.js";
 
-/** Shell 可选择的 Pi 模型安全摘要。 */
-export interface ShellModelOption {
-  provider: string;
-  id: string;
-  name: string;
-  reasoning: boolean;
-  contextWindow: number | null;
-  maxOutputTokens: number | null;
-}
-
 /** Shell 请求 AppController 切换到来源工作树或可恢复任务。 */
 export interface ShellTaskSwitchRequest {
   kind: "worktree" | "task";
@@ -33,7 +23,7 @@ export interface ShellTaskSwitchRequest {
 export type ShellPhase =
   | "diagnose"
   | "reproduce"
-  | "patch"
+  | "edit"
   | "verify"
   | "approval"
   | "compacting"
@@ -48,7 +38,6 @@ export interface ShellStatus {
   phase: ShellPhase;
   modelProvider: string;
   model: string;
-  availableModels: ShellModelOption[];
   thinkingLevel: string;
   availableThinkingLevels: string[];
   autoCompactionEnabled: boolean;
@@ -70,7 +59,6 @@ export interface ShellStatus {
   sessionCacheWriteTokens: number;
   totalTokens: number;
   toolCalls: number;
-  toolBudget: number;
   viteState: "starting" | "ready" | "compiling" | "error" | "stopped";
   browserState: "starting" | "ready" | "error" | "stopped";
   bridgeState: "unknown" | "ready" | "unavailable";
@@ -146,7 +134,6 @@ export function createInitialStatus(config: ShellStatusConfig): ShellStatus {
     phase: "idle",
     modelProvider: "dungeon-maintainer",
     model: config.model,
-    availableModels: [],
     thinkingLevel: config.task.thinkingLevel,
     availableThinkingLevels: ["off"],
     autoCompactionEnabled: true,
@@ -168,7 +155,6 @@ export function createInitialStatus(config: ShellStatusConfig): ShellStatus {
     sessionCacheWriteTokens: 0,
     totalTokens: 0,
     toolCalls: 0,
-    toolBudget: 16,
     viteState: "starting",
     browserState: "starting",
     bridgeState: "unknown",

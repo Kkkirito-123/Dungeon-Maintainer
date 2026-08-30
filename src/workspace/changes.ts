@@ -1,7 +1,7 @@
 /**
  * Pi 原生编辑工具与任务记录之间的变化同步。
  *
- * Pi 的 write 会直接修改 detached worktree，不经过维护器 patch 工具。本模块
+ * 写入工具修改 detached worktree 后，本模块
  * 重新从 Git 读取真实增量，把 changedPaths 写回 task.json，并使旧补丁、审批、检查、
  * 源码证据和验证失效；随后追加一条 change 证据。它不限制 Pi 能修改哪些文件，也不把
  * 任何变化写入正式游戏仓库；正式写回仍由 `/verify` 和 `/apply` 完成。
@@ -11,6 +11,7 @@
  */
 
 import { appendEvent } from "../logging/events.js";
+import { selectChangeUpstreamIds } from "../evidence/links.js";
 import { changeEvidence } from "../evidence/projector.js";
 import type { EvidenceStore } from "../evidence/store.js";
 import type { TaskStore } from "../task/store.js";
@@ -49,7 +50,7 @@ export async function syncWorktreeChanges(
       || latestChange?.worktreeHash === worktreeHash
     )
   ) {
-    // 原生 write 后已经同步过同一 Hash，随后手动 check 产生的 PASS 仍属于当前代码。
+    // edit 后已经同步过同一 Hash，随后手动 check 产生的 PASS 仍属于当前代码。
     // verify 再次进入时若继续 invalidatePaths，会把可复用检查误标 stale 并重跑。
     // 只有完整 worktree Hash 真正变化时，才允许下方失效旧检查和验证。
     return paths;
@@ -64,11 +65,11 @@ export async function syncWorktreeChanges(
   task.reversePatchPath = null;
 
   if (evidence) {
+    // 在失效旧源码窗口之前固定诊断父节点；否则 direct write 会把自己的唯一上游先
+    // 标成 stale，再生成一个没有 source/reproduction 父节点的孤儿 change。
+    const links = selectChangeUpstreamIds(await evidence.active(), paths);
     await evidence.invalidatePaths(paths, worktreeHash);
-    const proposed = (await evidence.active("claim"))
-      .filter((record) => record.metadata.finishStatus === "proposed")
-      .at(-1);
-    await evidence.capture(changeEvidence(paths, worktreeHash, proposed ? [proposed.id] : []));
+    await evidence.capture(changeEvidence(paths, worktreeHash, links));
   }
 
   if (

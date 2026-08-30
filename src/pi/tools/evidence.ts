@@ -1,10 +1,9 @@
 /**
  * Pi `evidence` 固定证据回读工具。
  *
- * 本工具只查询当前任务 EvidenceStore 的低敏投影，不执行源码搜索、检查或写入，也不
- * 把回读旧事实作为无进展动作交给现有 LoopGuard。`list` 用于按状态和类型定位证据
- * ID；`get` 返回单节点关系和经目录白名单、realpath、二次脱敏及 4 KiB 限制处理后的
- * 工件尾部，不能读取其它任务数据。
+ * 本工具只查询当前任务 EvidenceStore 的低敏投影，不执行源码搜索、检查或写入。
+ * `list` 用于按状态和类型定位证据 ID；`get` 返回单节点关系和经目录白名单、realpath、
+ * 二次脱敏及 4 KiB 限制处理后的工件尾部，不能读取其它任务数据。
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -77,6 +76,58 @@ function nodeText(node: EvidenceNode): string {
     + "\n" + node.summary;
 }
 
+/** 供统一 inspect 工具复用的当前任务证据查询。 */
+export async function executeEvidenceQuery(
+  context: EvidenceToolContext,
+  input: EvidenceInput,
+  signal?: AbortSignal,
+) {
+  signal?.throwIfAborted();
+  if (input.action === "list") {
+    if (input.evidenceId !== undefined) {
+      throw new Error("evidence(list) 不接受 evidenceId");
+    }
+    const output = await listEvidenceNodes(context.evidence, {
+      ...(input.status === undefined ? {} : { status: input.status }),
+      ...(input.kind === undefined ? {} : { kind: input.kind }),
+      ...(input.limit === undefined ? {} : { limit: input.limit }),
+    });
+    return {
+      content: [{
+        type: "text" as const,
+        text: [
+          "[EVIDENCE_LIST revision=" + String(output.revision)
+            + " count=" + String(output.records.length) + "]",
+          ...output.records.map(nodeText),
+        ].join("\n"),
+      }],
+      details: { action: "list", ...output } as Record<string, unknown>,
+    };
+  }
+  if (input.status !== undefined || input.kind !== undefined || input.limit !== undefined) {
+    throw new Error("evidence(get) 只接受 evidenceId");
+  }
+  if (input.evidenceId === undefined) {
+    throw new Error("evidence(get) 缺少 evidenceId");
+  }
+  const detail = await getEvidenceDetail(context.evidence, input.evidenceId);
+  if (!detail) throw new Error("evidenceId 不属于当前任务");
+  const artifact = detail.artifact.available
+    ? [
+        "[ARTIFACT kind=" + detail.artifact.kind
+          + " truncated=" + String(detail.artifact.truncated) + "]",
+        detail.artifact.text,
+      ].join("\n")
+    : "[ARTIFACT unavailable reason=" + detail.artifact.reason + "]";
+  return {
+    content: [{
+      type: "text" as const,
+      text: nodeText(detail.record) + "\n" + artifact,
+    }],
+    details: { action: "get", ...detail, records: [] } as Record<string, unknown>,
+  };
+}
+
 /** 向单个 Pi 会话注册受限证据回读工具。 */
 export function registerEvidenceTool(
   pi: ExtensionAPI,
@@ -88,7 +139,7 @@ export function registerEvidenceTool(
     description: "列出当前任务证据，或按 evidence ID 回读关系和安全工件尾部。",
     promptSnippet: "用 evidence 复用当前任务已经取得的证据",
     promptGuidelines: [
-      "先用 evidence(list) 定位最近 active 证据；只有确实需要正文时才 evidence(get)。",
+      "当前上下文已有 evidence ID 时直接 evidence(get)；只有不知道 ID 或需要按类型筛选时才 list。",
       "evidence 只回读现有事实，不代替 inspect、check、复现或 finish(result) 验证。",
       "inspect 返回 ALREADY_SEEN evidence ID 时优先 get，不要重复执行相同搜索或读取。",
       "不要遍历证据节点；列表摘要足以确认根因时直接调用 finish。",
@@ -96,60 +147,13 @@ export function registerEvidenceTool(
     executionMode: "sequential",
     parameters: EvidenceParameters,
     async execute(_toolCallId, input: EvidenceInput, signal) {
-      signal?.throwIfAborted();
-      if (input.action === "list") {
-        if (input.evidenceId !== undefined) {
-          throw new Error("evidence(list) 不接受 evidenceId");
-        }
-        const output = await listEvidenceNodes(context.evidence, {
-          ...(input.status === undefined ? {} : { status: input.status }),
-          ...(input.kind === undefined ? {} : { kind: input.kind }),
-          ...(input.limit === undefined ? {} : { limit: input.limit }),
-        });
-        await appendEvent(context.store, context.task.id, "tool.evidence", {
-          action: "list",
-          count: output.records.length,
-          revision: output.revision,
-        });
-        return {
-          content: [{
-            type: "text",
-            text: [
-              "[EVIDENCE_LIST revision=" + String(output.revision)
-                + " count=" + String(output.records.length) + "]",
-              ...output.records.map(nodeText),
-            ].join("\n"),
-          }],
-          details: { action: "list", ...output },
-        };
-      }
-      if (input.status !== undefined || input.kind !== undefined || input.limit !== undefined) {
-        throw new Error("evidence(get) 只接受 evidenceId");
-      }
-      if (input.evidenceId === undefined) {
-        throw new Error("evidence(get) 缺少 evidenceId");
-      }
-      const detail = await getEvidenceDetail(context.evidence, input.evidenceId);
-      if (!detail) throw new Error("evidenceId 不属于当前任务");
+      const output = await executeEvidenceQuery(context, input, signal);
       await appendEvent(context.store, context.task.id, "tool.evidence", {
-        action: "get",
-        artifactAvailable: detail.artifact.available,
-        revision: detail.revision,
+        action: input.action,
+        count: Array.isArray(output.details.records) ? output.details.records.length : 0,
+        revision: Number(output.details.revision),
       });
-      const artifact = detail.artifact.available
-        ? [
-            "[ARTIFACT kind=" + detail.artifact.kind
-              + " truncated=" + String(detail.artifact.truncated) + "]",
-            detail.artifact.text,
-          ].join("\n")
-        : "[ARTIFACT unavailable reason=" + detail.artifact.reason + "]";
-      return {
-        content: [{
-          type: "text",
-          text: nodeText(detail.record) + "\n" + artifact,
-        }],
-        details: { action: "get", ...detail, records: [] },
-      };
+      return output;
     },
   });
 }
