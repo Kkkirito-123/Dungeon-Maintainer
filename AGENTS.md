@@ -19,7 +19,8 @@ Chromium Shell -> Pi RPC -> src/pi/extension.ts
 
 1.0 固定单 Agent、单 Pi、单活动任务、单活动 worktree、单 Vite 和单 Chromium Context。历史任务只持久化，
 切换时必须先停止旧 Pi，不能在后台继续消耗 Token。不要加入公网 Dashboard、
-Electron、自建模型循环、Harness、面向用户的任意终端、多 Agent、长期记忆、自动 commit、push、PR 或部署。
+Electron、自建模型循环、Harness、面向用户的任意终端、多 Agent、长期记忆、未经确认的 commit、push、PR、合并或部署。
+仅允许模型通过无参数 `publish` 工具，把已验证补丁按固定流程提交并创建 GitHub PR；合并仍由用户处理。
 Pi 原生 Bash 不加载；用户批准具体总方案后，当前 Agent 也只能使用受边界约束的原生 Coding 工具。
 允许且仅允许由 src/shell 提供绑定 127.0.0.1 的任务级 HTTP/SSE 界面。维护器和游戏始终是两个独立仓库。
 
@@ -34,11 +35,11 @@ src/pi/extension.ts      Pi Provider、工具、命令和生命周期装配
 src/pi/session-policy.ts Pi 会话绑定、模型/会话切换阻断
 src/pi/game-runtime.ts   单 Vite、临时 Chromium 和 GameDriver 生命周期
 src/pi/tool-policy.ts    只读诊断与本轮完整执行的活动工具集合
-src/pi/tools/            八个固定模型工具（含总方案审批与工作树切换；不加载 Pi 原生工具）
+src/pi/tools/            九个固定模型工具（含总方案审批、工作树切换与窄域 PR 发布；不加载 Pi 原生工具）
 src/pi/commands/         五个固定用户命令
 src/shell/               Chromium Shell 页面、HTTP/SSE 协议和状态栏
 src/task/                当前 schema v4 任务事实与状态机
-src/workspace/           Git、realpath、补丁、检查、apply 与 worktree
+src/workspace/           Git、realpath、补丁、检查、apply、worktree 与固定 GitHub PR 发布
 src/game/                Vite、临时 Chromium、协议客户端与语义驱动
 src/repair/              复现、刷新重放与验证
 src/logging/             低敏事件、脱敏与 500 条语义 Trace
@@ -65,9 +66,12 @@ tests/                   Node 测试；安全边界优先使用真实临时 Git 
 - `edit` 必须绑定最新 `baseHash` 和 3 文件/120 行预算；replace 要求唯一旧文本，write/create
   要求完整正文，create 固定使用 `missing` Hash。模型调用时复用当前已批准的精确写入范围。
 - 第一字节源码写入前必须存在浏览器复现检查点；写入后按刷新、恢复、重建检查点、重放的顺序执行。
-- 所有 Agent 修改只进入 detached worktree。正式仓库仅由用户 `/apply` 修改，且不自动提交。
+- 所有 Agent 修改先只进入 detached worktree；publish 从已验证补丁创建临时发布 worktree，
+  不切换或提交正式仓库。正式仓库仍仅由用户 `/apply` 修改，publish 不执行 merge。
 - 来源工作树允许脏状态；启动时复制为隔离 index 基线，后续 Diff 只包含 Agent 增量。
 - `workspace` 只能枚举同一 Git common-dir 的合法游戏 worktree；切换必须确认并创建新任务，不能原地偷换 cwd。
+- `publish` 只接受空参数，要求任务已验证（或已 apply），先展示固定中文仓库、分支、文件、PR 文案和 Diff 预览，
+  经 UI 确认后才使用 `git commit`、`git push` 和 `gh pr create`；origin 必须是 github.com，且不提供 merge、任意命令或自定义远端。
 - 不输出、记录或持久化 API Key、模型正文、SQL、答案、完整地图、正式存档、背包、身份或帧画面。
 - 删除终态 worktree 前必须验证解析后的精确目标是配置 `worktrees/` 下的单个任务子目录。
 
@@ -107,8 +111,8 @@ dungeon-maintain start --repo <游戏仓库>
 dungeon-maintain resume <task-id>
 ```
 
-Pi 不加载原生工具。维护器向模型固定注册且仅注册 8 个工具：
-`inspect/edit/check/finish/workspace/look/act/query`；用户命令固定为 `/play /diff /verify /apply /discard`。
+Pi 不加载原生工具。维护器向模型固定注册且仅注册 9 个工具：
+`inspect/edit/check/finish/workspace/look/act/query/publish`；用户命令固定为 `/play /diff /verify /apply /discard`。
 `inspect` 统一负责源码、Diff、Git 状态和 Evidence list/get；内部重放仍使用
 `look/go/use/input-sql/query` 语义 Trace，但这些内部动作不是模型工具。
 新增能力前必须先修改已批准设计，不能通过配置动态扩展。

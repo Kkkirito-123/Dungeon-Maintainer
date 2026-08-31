@@ -41,7 +41,7 @@ Dungeon Extension
   -> 重放玩家动作
   -> 运行固定检查
   -> finish(result)
-  -> 用户 /apply
+  -> 用户 /apply 或明确要求 publish
 ```
 
 没有下一次工具调用时，Pi 按原生语义 `agent_settled`。维护器不会自动追加模型回合。
@@ -61,7 +61,7 @@ src/
 │  └─ tools/               # Pi 工具参数与注册
 ├─ inspection/             # 搜索、读取和 bundle
 ├─ evidence/               # 当前任务证据、缓存与失效关系
-├─ workspace/              # Git、路径、Hash、patch、check、apply
+├─ workspace/              # Git、路径、Hash、patch、check、apply、固定 GitHub PR 发布
 ├─ repair/                 # 复现、刷新、重放和验证
 ├─ game/                   # GameDriver、浏览器和开发桥协议
 ├─ shell/                  # 本地 HTTP/SSE 与前端页面
@@ -96,13 +96,15 @@ Pi 不加载任何原生工具或 Bash。模型工具固定且仅为：
 
 ```text
 inspect  edit  check  finish  workspace
-look     act   query
+look     act   query     publish
 ```
 
 - `inspect` 统一查看源码、Git 与当前任务 Evidence。
 - `edit` 使用当前 `baseHash` 做唯一替换、整文件写入或创建，并受精确路径授权和 3 文件/120 行预算约束。
 - `workspace` 只查看或切换合法 Git worktree，不能偷换当前会话 cwd。
 - `look/act/query` 只操作玩家可见游戏面；`act` 绑定最新 revision，`query` 合并 SQL 输入和真实提交。
+- `publish` 只接受空参数；已验证任务经确认框展示固定中文 PR 预览后，在临时 worktree 执行 commit、push
+  和 `gh pr create`，不切换正式仓库，也不执行 merge。
 
 工具名是外部契约，不随内部文件拆分变化。
 
@@ -138,12 +140,14 @@ look     act   query
 
 ## 安全边界
 
-- Agent 只修改 detached worktree；正式仓库仅由用户显式 `/apply` 改变。
+- Agent 源码修改只进入 detached worktree；publish 从已验证补丁创建临时发布 worktree，不切换或提交正式仓库。
+  正式仓库仍仅由用户显式 `/apply` 改变，publish 不执行 merge。
 - 所有模型路径必须是项目相对路径，并经过 `realpath` 和符号链接检查。
 - `.git`、`.env*`、凭据、法律文件、生成目录和仓库外路径始终拒绝。
 - 第一次写入按精确文件请求批准，批准只在当前请求有效。
 - 源码变化会使旧检查和旧验证失效。
 - `/apply` 再检查来源漂移、worktree Hash、文件基线和 `git apply --check`。
+- `workspace/publish.ts` 在确认前只读，确认后仅运行固定 Git/GitHub 参数；origin 必须是 github.com。
 - 模型不获得 Bash、任意浏览器脚本、隐藏答案、完整地图或正式存档。
 
 ## 状态与持久化
