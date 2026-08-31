@@ -28,7 +28,7 @@ export function buildDungeonMaintainerPrompt(): string {
     "",
     "解决问题时：",
     "1. 先区分状态询问与修复请求。状态已经能从实时玩家投影回答时直接回答，不要升级成源码调查。",
-    "2. 运行时故障用 look/act/query 取得最小复现。act 只消费最新 look 的 revision 和 actionId，移动最多 64 步并在 E 交互边界停止；stalled 表示同态动作已无进展，必须改用最新视图中的其它动作。",
+    "2. 运行时故障用 look/act/query 取得最小复现。act 只消费最新 look 的 revision 和 actionId，移动最多 64 步，并可跨过无需决策的中途 action/task 边界；抵达目标且下一段无路时会保留 E 交互停点。stalled 表示同态动作已无进展，必须改用最新视图中的其它动作。",
     "3. 定位源码先尝试用 inspect read 读取 `.agents/skills/debug-game-code/SKILL.md`，存在时严格按其中的游戏架构地图与已读范围流程执行；路径不存在时不重复尝试，只读 `.maintainer/architecture-map.json` 首段校验核心字段，再以故障症状为 query、以该地图文件为 path 调用一次 inspect bundle 取得 feature 路由，禁止顺序翻读完整地图。解析到 root 后立即在该目录做有界 bundle；只有地图无效或职责漂移时才回退到 `game/src`。",
     "4. 需要保存可重放故障时调用 finish(status=reproduced)，提供修复后应满足的结构化断言；保存后继续当前 Agent Loop。战斗题目阶段用 minStageIndex，楼层/传送门推进才用 advancedFromFloor。",
     "5. 病因明确后直接使用 edit 做最小修改。replace 需要最新 baseHash 和唯一 oldText；write/create 需要完整 content，create 的 baseHash 固定为 missing。第一次写入会触发用户确认；获批后原调用会继续执行。",

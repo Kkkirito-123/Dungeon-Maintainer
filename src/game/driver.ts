@@ -18,6 +18,7 @@ import type { GameBrowser } from "./browser.js";
 
 const TRANSITION_POLL_INTERVAL_MS = 50;
 const TRANSITION_POLL_ATTEMPTS = 40;
+const MAX_MOVE_SEGMENTS = 8;
 
 /** 一次重放的公开验证结果。 */
 export interface ReplayResult {
@@ -124,9 +125,11 @@ export class GameDriver {
   /** 消费模型最近一次 look 返回的修订和动作。 */
   async act(revision: string, actionId: string, maxSteps: number): Promise<PlayResult> {
     await this.ensureCheckpoint();
-    const result = await this.browser.act(revision, actionId, maxSteps);
-    this.lastView = result.view;
     const movement = actionId === "objective" || actionId === "frontier";
+    const result = movement
+      ? await this.move(revision, actionId, maxSteps)
+      : await this.browser.act(revision, actionId, maxSteps);
+    this.lastView = result.view;
     this.trace.push({
       action: movement ? "go" : "use",
       arguments: movement
@@ -145,7 +148,7 @@ export class GameDriver {
   ): Promise<PlayResult> {
     await this.ensureCheckpoint();
     const view = this.lastView ?? await this.browser.look();
-    const result = await this.browser.act(view.revision, target, maxSteps);
+    const result = await this.move(view.revision, target, maxSteps);
     this.lastView = result.view;
     this.trace.push({
       action: "go",
@@ -154,6 +157,46 @@ export class GameDriver {
       summary: result.event + " · " + result.view.banner,
     });
     return result;
+  }
+
+  private async move(
+    revision: string,
+    target: "objective" | "frontier",
+    maxSteps: number,
+  ): Promise<PlayResult> {
+    let result = await this.browser.act(revision, target, maxSteps);
+    let totalSteps = result.steps;
+    for (let segment = 1; segment < MAX_MOVE_SEGMENTS; segment += 1) {
+      const movementAvailable = result.view.actions.some((action) => (
+        action.id === target && action.tool === "act"
+      ));
+      const continuableBoundary = result.event === "action" || result.event === "task";
+      if (
+        !result.ok
+        || result.view.mode !== "explore"
+        || !movementAvailable
+        || !continuableBoundary
+        || totalSteps >= maxSteps
+      ) break;
+
+      const previous = result;
+      const next = await this.browser.act(
+        result.view.revision,
+        target,
+        maxSteps - totalSteps,
+      );
+      if (
+        !next.ok
+        && next.steps === 0
+        && (next.event === "no-discovered-path" || next.event === "target-not-visible")
+      ) {
+        result = previous;
+        break;
+      }
+      result = next;
+      totalSteps += next.steps;
+    }
+    return { ...result, steps: totalSteps };
   }
 
   /** 执行玩家视图提供的稳定动作。 */

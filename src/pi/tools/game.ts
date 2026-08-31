@@ -147,7 +147,7 @@ export function registerGameTools(
   pi.registerTool({
     name: "act",
     label: "执行游戏动作",
-    description: "执行最新 look 返回的 actionId；移动最多 64 个真实步并在 E 交互处停止，其它动作只点击固定可见控件。",
+    description: "执行最新 look 返回的 actionId；移动最多 64 个真实步，可跨过无需决策的中途 action/task 边界，并保留最终 E 交互停点；其它动作只点击固定可见控件。",
     promptSnippet: "用 act 消费最新 look 的修订和动作",
     executionMode: "sequential",
     parameters: ActParameters,
