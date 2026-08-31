@@ -351,12 +351,26 @@ describe("浏览器检查点、刷新、恢复和语义重放", () => {
     assert.deepEqual(driver.trace.snapshot(), []);
   });
 
-  it("一次 objective 动作在首个交互边界停止", async () => {
+  it("一次 objective 动作跨过中途 action/task 边界并累计真实步数", async () => {
     const browser = new RecordingBrowser();
     browser.goResults.push(
-      { ...playResult("action"), steps: 6 },
-      { ...playResult("task"), steps: 2 },
+      {
+        ...playResult("action", playView({
+          revision: "00000002",
+          prompt: "E  检查中途捷径",
+          actions: [
+            { id: "objective", label: "前往目标", tool: "act" },
+            { id: "interact", label: "E  检查中途捷径", tool: "act" },
+          ],
+        })),
+        steps: 6,
+      },
+      {
+        ...playResult("task", playView({ revision: "00000003" })),
+        steps: 2,
+      },
       playResult("mode", playView({
+        revision: "00000004",
         mode: "combat",
         actions: [{ id: "terminal", label: "打开当前 SQL 战斗终端", tool: "act" }],
       })),
@@ -365,12 +379,40 @@ describe("浏览器检查点、刷新、恢复和语义重放", () => {
 
     await driver.beginReproduction();
     browser.calls.length = 0;
-    const result = await driver.go("objective", 64);
+    const result = await driver.act("00000001", "objective", 64);
+
+    assert.equal(result.event, "mode");
+    assert.equal(result.steps, 8);
+    assert.deepEqual(browser.calls, ["go", "go", "go"]);
+    assert.deepEqual(driver.trace.snapshot().map((entry) => entry.action), ["go"]);
+  });
+
+  it("objective 已抵达 E 目标且下一段无路时保留交互停点", async () => {
+    const browser = new RecordingBrowser();
+    const targetView = playView({
+      revision: "00000002",
+      prompt: "E  调查抄写员",
+    });
+    browser.goResults.push(
+      {
+        ...playResult("action", targetView),
+        steps: 6,
+      },
+      {
+        ...playResult("no-discovered-path", targetView),
+        ok: false,
+        steps: 0,
+      },
+    );
+    const driver = new GameDriver(browser as unknown as GameBrowser);
+
+    await driver.beginReproduction();
+    browser.calls.length = 0;
+    const result = await driver.act("00000001", "objective", 64);
 
     assert.equal(result.event, "action");
     assert.equal(result.steps, 6);
-    assert.deepEqual(browser.calls, ["go"]);
-    assert.deepEqual(driver.trace.snapshot().map((entry) => entry.action), ["go"]);
+    assert.deepEqual(browser.calls, ["go", "go"]);
   });
 
   it("源码刷新后先恢复并重建同一起点检查点，再按原顺序重放", async () => {
