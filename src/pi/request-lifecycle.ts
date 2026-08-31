@@ -40,6 +40,7 @@ import { assertTaskSessionBinding } from "./session-policy.js";
 const REPAIR_ACTION_PATTERN = /(?:修复|修好|解决|排查|诊断|定位|调查|纠正|改掉|处理|实现|增加|支持|fix|debug|diagnos)/iu;
 const PROBLEM_PATTERN = /(?:问题|故障|错误|异常|bug|失败|不一致|不正确|不对|掉血|没法|无法|不能|看不见|卡住|崩溃|默认答案)/iu;
 const STRONG_REPAIR_PATTERN = /(?:修复|修好|解决|改掉|fix)|(?:(?:默认\s*(?:答案|SQL|查询)|题目).{0,24}(?:错|错误|不对|不一致))/iu;
+const PUBLISH_REQUEST_PATTERN = /(?:(?:提交|创建|发起|发布|create|open|submit).{0,24}(?:PR|pull\s*request|GitHub|远端)|(?:commit|push).{0,24}(?:PR|pull\s*request|GitHub|remote))/iu;
 const GAME_FAILURE_EVIDENCE_TOOLS = new Set(["act", "query"]);
 
 interface RequestGameRuntime {
@@ -84,6 +85,19 @@ function requiresRepair(text: string): boolean {
     || (REPAIR_ACTION_PATTERN.test(request) && PROBLEM_PATTERN.test(request));
 }
 
+function requiresPublish(text: string): boolean {
+  return PUBLISH_REQUEST_PATTERN.test(normalizedRequest(text));
+}
+
+function isPublishOnlyRequest(text: string): boolean {
+  const request = normalizedRequest(text);
+  if (!requiresPublish(request)) return false;
+  // “提交这个修复的 PR”仍是发布旧结果；只有同时提出新的问题，或以修复动词
+  // 开头要求重新改代码时，才让 ready_to_apply 回到 active。
+  return !PROBLEM_PATTERN.test(request)
+    && !/^(?:请|帮我)?\s*(?:修复|修好|解决|改掉|fix)\b/iu.test(request);
+}
+
 function isContinuationRequest(text: string): boolean {
   return /^(?:继续|继续修复|继续处理|retry|resume)$/iu.test(normalizedRequest(text));
 }
@@ -110,7 +124,8 @@ export function createRequestLifecycle(
     continuation = false,
   ): Promise<void> => {
     latestNaturalRequest = normalizedRequest(text);
-    repairRequested = continuation || requiresRepair(latestNaturalRequest);
+    const publishOnly = isPublishOnlyRequest(latestNaturalRequest);
+    repairRequested = continuation || (!publishOnly && requiresRepair(latestNaturalRequest));
     await evidence.load();
     if (repairRequested && !continuation) {
       // 一个 taskId 可以承载多次用户输入，但新的修复目标不能继承上一 Bug 的
@@ -215,12 +230,14 @@ export function createRequestLifecycle(
         return { action: "continue" };
       }
       const inheritedWriteScope = hasActiveWriteScope(task);
+      const publishOnlyRequest = isPublishOnlyRequest(text);
       // 新请求先撤销上一请求的运行时授权，再执行任何可能失败的日志或证据 I/O。
       if (isExecutionApproved() || inheritedWriteScope) setExecutionApproved(false);
       if (inheritedWriteScope) await store.closeWriteScope(task);
-      if (task.state === "ready_to_apply") {
-        // ready_to_apply 只证明上一请求的 worktree 已验证；新请求必须回到 active，
-        // 并让新目标重新通过当前 Hash 门禁。
+      if (task.state === "ready_to_apply" && !publishOnlyRequest) {
+        // ready_to_apply 只证明上一请求的 worktree 已验证；新修复目标必须回到 active。
+        // 唯一例外是用户明确要求发布同一补丁：publish 仍会重新校验当前 Hash，并在
+        // commit/push/PR 前展示一次精确预览，因此不能先销毁这份验证事实。
         task.verification = null;
         await store.transition(task, "active");
       }

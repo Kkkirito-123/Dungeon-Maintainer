@@ -1,7 +1,7 @@
 /**
  * Dungeon Maintainer 固定 Pi 工具面的唯一装配入口。
  *
- * 本文件只注册固定的 `inspect/edit/check/finish/workspace/look/act/query` 工具，
+ * 本文件只注册固定的 `inspect/edit/check/finish/workspace/look/act/query/publish` 工具，
  * 不做业务执行。Extension 保持
  * 工具面稳定以复用 Prompt 缓存，并按“只读诊断 -> 用户批准总方案 -> 本轮完整执行”
  * 在执行层切换写入门禁。
@@ -20,9 +20,10 @@ import { registerFinishTool } from "./finish.js";
 import { registerGameTools } from "./game.js";
 import { registerInspectTool } from "./inspect.js";
 import { registerEditTool } from "./patch.js";
+import { registerPublishTool } from "./publish.js";
 import { registerWorkspaceTool } from "./tree.js";
 
-/** 八个固定领域工具共享的运行依赖。 */
+/** 九个固定领域工具共享的运行依赖。 */
 export interface MaintainerToolContext {
   task: TaskRecord;
   store: TaskStore;
@@ -58,4 +59,5 @@ export function registerMaintainerTools(
   registerFinishTool(pi, context);
   registerGameTools(pi, context);
   registerWorkspaceTool(pi, context);
+  registerPublishTool(pi, context);
 }

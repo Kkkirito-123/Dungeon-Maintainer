@@ -23,6 +23,7 @@ export const MAINTAINER_TOOLS = [
   "look",
   "act",
   "query",
+  "publish",
 ] as const;
 
 /** 诊断阶段逻辑上允许的只读、固定检查和游戏复现工具。 */
@@ -35,6 +36,7 @@ export const DIAGNOSIS_TOOLS = [
   "act",
   "query",
 ] as const;
+// publish 不属于诊断集合；它始终要求已验证任务和独立 UI 确认。
 
 /** 用户批准完整方案后允许的全部原生与领域工具。 */
 export const FULL_CODING_TOOLS = [

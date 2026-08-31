@@ -84,6 +84,7 @@ export function createNativeWriteCoordinator(
   ): Promise<ToolCallEventResult | undefined> => {
     if (
       event.toolName === "check"
+      || event.toolName === "publish"
       || (event.toolName === "finish" && event.input.status === "result")
     ) {
       if (pendingWriteHashes.size > 0) {

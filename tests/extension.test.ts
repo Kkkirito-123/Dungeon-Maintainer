@@ -163,6 +163,33 @@ function createEditInput(path: string, content: string) {
 }
 
 describe("Pi Extension 单循环工具、命令和会话阻断", () => {
+  it("验证完成后发布请求保留 ready_to_apply，新的修复请求才使验证失效", async () => {
+    const harness = await createExtensionHarness("publish-request");
+    try {
+      await harness.store.transition(harness.task, "active");
+      harness.task.changedPaths = ["README.md"];
+      harness.task.verification = {
+        worktreeHash: "verified",
+        checkIds: [],
+        reproductionId: null,
+        replayPassed: true,
+        verifiedAt: new Date().toISOString(),
+      };
+      await harness.store.transition(harness.task, "verifying");
+      await harness.store.transition(harness.task, "ready_to_apply");
+
+      await harness.input({ source: "rpc", text: "提交这个修复的 PR" });
+      assert.equal(harness.task.state, "ready_to_apply");
+      assert.ok(harness.task.verification);
+
+      await harness.input({ source: "rpc", text: "修复新的问题" });
+      assert.equal(harness.task.state, "active");
+      assert.equal(harness.task.verification, null);
+    } finally {
+      await harness.repository.dispose();
+    }
+  });
+
   it("证据链新节点持续推进，并能进入修复流程", async () => {
     const repository = await createTemporaryGitRepository({ "README.md": "baseline\n" });
     try {
@@ -670,7 +697,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
     }
   });
 
-  it("注册且只注册八个模型工具，并用执行门禁保护 edit", async () => {
+  it("注册且只注册九个模型工具，并用执行门禁保护 edit", async () => {
     const repository = await createTemporaryGitRepository({
       ".maintainer/project.json": JSON.stringify({
         schemaVersion: 1,
@@ -788,6 +815,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
         "act",
         "query",
         "workspace",
+        "publish",
       ]);
       assert.deepEqual([...PI_BUILTIN_TOOLS], []);
       const workspaceTool = pi.toolDefinitions.get("workspace");

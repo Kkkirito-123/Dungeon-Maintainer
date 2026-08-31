@@ -16,17 +16,18 @@ worktree 中的真实游戏。正式游戏仓库只有在用户显式执行 `/ap
 Pi RPC + Dungeon Maintainer Extension
   ├─ inspect / edit / check / finish / workspace
   ├─ look / act / query
-  ├─ detached worktree + 固定检查
+  ├─ detached worktree + 固定检查 + 窄域 GitHub PR 发布
   └─ Vite + Playwright iframe + 检查点重放
         ↓
-      用户 /apply
+      用户确认 publish
         ↓
-  正式游戏工作区（不自动提交）
+  临时发布 worktree → commit / push / GitHub PR（不自动合并）
 ```
 
 维护器与游戏保持两个独立仓库。1.0 固定为单 Agent、单 Pi、单活动 worktree、单 Vite 和单浏览器会话；
 历史任务和其他合法 worktree 可持久化并在 Shell 中切换，切换时旧 Pi 会先停止，不会后台继续调用模型。
-不提供公网 Dashboard、Electron、面向用户的任意终端、多 Agent、自动提交、推送、PR、部署或长期记忆。
+不提供公网 Dashboard、Electron、面向用户的任意终端、多 Agent、未经确认的自动提交、推送、PR、合并、部署或长期记忆。
+仅有窄域 `publish` 工具可在用户确认固定预览后提交并创建 GitHub PR。
 任意 Pi 原生工具和 Bash 均不加载；方案确认后只开放维护器自有的受限 `edit`。
 
 核心代码按单一职责分区：`src/app.ts` 是公开入口，`src/app/` 分别拥有仓库事实、Pi 进程、
@@ -40,6 +41,7 @@ Pi RPC + Dungeon Maintainer Extension
 - Node.js `>=22.19`
 - pnpm `11.9.0`
 - Git
+- GitHub CLI `gh`（使用 `publish` 时需要已登录 GitHub）
 - `rg`
 - 游戏仓库已执行 `pnpm --dir game install --frozen-lockfile`
 - Playwright Chromium 已安装
@@ -110,7 +112,7 @@ Shell 左侧是聊天输入，右侧 iframe 显示同一个 worktree 的游戏�
 `resume` 不会静默创建新 worktree 或新会话；
 任务记录、正式仓库 HEAD、worktree HEAD、Pi session-id、session-dir 或首行 cwd 任一漂移都会阻断。
 
-Pi 启动时固定使用 `--mode rpc`，不加载 Pi 原生工具，只显式加载维护器的 8 个领域工具，同时禁用外部 Extension、
+Pi 启动时固定使用 `--mode rpc`，不加载 Pi 原生工具，只显式加载维护器的 9 个领域工具，同时禁用外部 Extension、
 Skill、Prompt Template 和上下文文件。Extension 默认只激活只读诊断工具；用户在 Shell 确认“病因 +
 完整方案 + 验证方式”后，才为当前 Agent 运行临时开放 `edit`。Pi 内会在运行时真正替换会话前取消
 `/new`、`/resume`、`/import`、`/fork`、`/clone` 和 `/tree`。模型固定来自进程启动时的
@@ -119,8 +121,8 @@ Shell 与后端仅通过本机 HTTP/SSE 通信，API Key 不进入浏览器。
 
 ## Pi 内工具与命令
 
-维护器只向模型注册以下 8 个领域工具。Pi 原生工具和 Bash 均不加载；源码读取、证据、编辑、
-游戏操作和工作树切换都经过维护器自己的边界：
+维护器只向模型注册以下 9 个领域工具。Pi 原生工具和 Bash 均不加载；源码读取、证据、编辑、
+游戏操作、工作树切换和 PR 发布都经过维护器自己的边界：
 
 | 工具 | 作用 | 硬边界 |
 |---|---|---|
@@ -132,6 +134,7 @@ Shell 与后端仅通过本机 HTTP/SSE 通信，API Key 不进入浏览器。
 | `look` | 读取带 revision、目标、前置说明和稳定 action ID 的玩家可见投影 | 不返回坐标、完整地图、背包、存档、隐藏答案或 Judge |
 | `act` | 消费最新 revision 中的稳定动作，完成导航或固定可见交互 | 最多 64 个真实移动步；可跨过无需决策的中途 `action/task` 边界并保留最终 `E` 交互停点；旧修订、不可用动作和连续无进展明确失败 |
 | `query` | 写入 SQL 并提交当前可见终端 | 先写固定 textarea，再点击真实执行按钮；SQL 仅在进程内用于重放 |
+| `publish` | 用户确认后提交、推送并创建中文 GitHub PR | 只接受空参数；要求已验证/已 apply；origin 固定为 github.com；不执行 merge |
 
 用户可使用五个命令：
 
@@ -158,15 +161,18 @@ Shell 与后端仅通过本机 HTTP/SSE 通信，API Key 不进入浏览器。
 7. Agent 修改完成后默认自然结束，用户稍后用 `/verify` 运行固定检查、恢复重放和 hidden judge 断言；用户明确要求立即验证时，Agent 才调用 `finish(status=result)` 完成同一流程。
 8. 用户执行 `/apply`。维护器重新检查来源工作树仍与启动快照完全一致、HEAD、目标文件 Hash、
    worktree Hash 和 `git apply --check`，成功后只写入 Agent 增量。
+9. 用户明确要求提交 PR 时，Agent 调用 `publish({})`；确认框展示固定仓库、分支、文案、文件和 Diff，
+   确认后在临时发布 worktree 执行 commit、push 和 `gh pr create`，合并由用户在 GitHub 手动完成。
 
 ## 权限与数据边界
 
-- 所有 Agent 写入只发生在 detached worktree。
+- 所有源码 Agent 写入只发生在 detached worktree；publish 使用从已验证补丁生成的临时发布 worktree，
+  不提交或切换正式工作区。
 - 来源工作树允许已有修改；快照期间若继续变化会阻断启动，任务期间漂移会阻断 `/apply`。
 - 总方案授权绑定当前 `taskId + baseHead + 病因 + 完整步骤 + 验证方式`，只覆盖当前 Agent 运行；
   运行结束自动恢复只读诊断工具。
-- 维护器 `edit` 执行路径、`realpath`、`baseHash`、唯一匹配、精确授权和预算校验；写入只发生在
-  当前 detached worktree，正式仓库仍只有 `/apply` 能写入。
+- 维护器 `edit` 执行路径、`realpath`、`baseHash`、唯一匹配、精确授权和预算校验；正式仓库仍只有
+  `/apply` 能写入，publish 只从补丁创建发布提交并不执行 merge。
 - `.git`、`.env*`、凭据、法律文件、`node_modules`、`dist`、缓存和二进制不属于修复方案允许范围。
 - 日志不保存 API Key、模型正文、SQL、答案、完整地图、正式存档、背包、身份或浏览器帧。
 
