@@ -10,6 +10,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadConfig, requireApiKey, type MaintainerConfig } from "../config.js";
 import { EvidenceStore } from "../evidence/store.js";
 import type { GameDriver } from "../game/driver.js";
+import type { ProgressLine } from "../progress/reporter.js";
 import {
   verifyTask as runTaskVerification,
   type VerificationResult,
@@ -43,7 +44,7 @@ export interface DungeonExtensionOptions {
   /** 测试可注入不启动外部进程的同契约运行时；生产环境始终使用真实运行时。 */
   gameRuntime?: DungeonGameRuntimePort;
   /** 测试可注入确定性验证器；生产环境始终调用 repair/verification。 */
-  verifyTask?: (signal?: AbortSignal) => Promise<VerificationResult>;
+  verifyTask?: (signal?: AbortSignal, onProgress?: ProgressLine) => Promise<VerificationResult>;
   evidenceStore?: EvidenceStore;
 }
 
@@ -83,13 +84,17 @@ export function installDungeonMaintainerExtension(
   // Eval、测试注入或自定义数据目录会形成两套任务事实。
   const evidence = options.evidenceStore ?? new EvidenceStore(store.dataDir, task);
   const gameRuntime = options.gameRuntime ?? new DungeonGameRuntime(task, store);
-  const verifyCurrentTask = options.verifyTask ?? (async (signal?: AbortSignal) => {
+  const verifyCurrentTask = options.verifyTask ?? (async (
+    signal?: AbortSignal,
+    onProgress?: ProgressLine,
+  ) => {
     return await runTaskVerification(
       store,
       evidence,
       task,
       gameRuntime.currentDriver(),
       signal,
+      onProgress,
     );
   });
 

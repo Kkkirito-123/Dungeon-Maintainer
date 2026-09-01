@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { checkEvidence, claimEvidence } from "../src/evidence/projector.js";
 import { EvidenceStore } from "../src/evidence/store.js";
+import { registerApplyCommand } from "../src/pi/commands/apply.js";
 import { TaskStore } from "../src/task/store.js";
 import { syncWorktreeChanges } from "../src/workspace/changes.js";
 import {
@@ -169,7 +171,7 @@ describe("detached worktree 与显式 apply", () => {
     }
   });
 
-  it("验证前所有修改只在 worktree，验证后 apply 到正式工作区但不提交", async () => {
+  it("验证前所有修改只在 worktree，/apply 不跑完整质量门并直接写回", async () => {
     const path = "game/src/presentation/status.ts";
     const repository = await createTemporaryGitRepository({
       [path]: "export const status = 'before';\n",
@@ -237,16 +239,40 @@ describe("detached worktree 与显式 apply", () => {
       task.reversePatchPath = captured.reversePatchPath;
       task.verification = {
         worktreeHash: await hashWorktree(worktreeRoot),
-        checkIds: ["game-test", "game-architecture", "game-build"],
-        reproductionId: "reproduction-1",
+        checkIds: [],
+        reproductionId: null,
         replayPassed: true,
         verifiedAt: new Date().toISOString(),
       };
       await store.transition(task, "verifying");
       await store.transition(task, "ready_to_apply");
 
-      const appliedHashes = await applyTaskPatch(task);
-      assert.equal(appliedHashes[path], await hashFile(repository.repoRoot, path));
+      type ApplyHandler = (args: string, context: unknown) => Promise<void>;
+      let applyHandler: ApplyHandler | undefined;
+      registerApplyCommand({
+        registerCommand: (name: string, command: unknown) => {
+          assert.equal(name, "apply");
+          applyHandler = (command as { handler: ApplyHandler }).handler;
+        },
+      } as unknown as ExtensionAPI, {
+        task,
+        store,
+      });
+      assert.ok(applyHandler);
+      const notifications: string[] = [];
+      await applyHandler("", {
+        hasUI: true,
+        signal: new AbortController().signal,
+        ui: {
+          confirm: async () => true,
+          notify: (message: string) => notifications.push(message),
+          setStatus: () => undefined,
+          setWidget: () => undefined,
+        },
+      });
+      assert.equal(task.state, "applied");
+      assert.equal(task.appliedHashes[path], await hashFile(repository.repoRoot, path));
+      assert.match(notifications.at(-1) ?? "", /已应用到正式游戏工作区/u);
       assert.equal(
         await readTestFile(join(repository.repoRoot, path)),
         "export const status = 'after';\n",

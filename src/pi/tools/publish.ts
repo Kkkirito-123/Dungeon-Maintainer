@@ -20,9 +20,11 @@ import {
   publishTask,
 } from "../../workspace/publish.js";
 import {
-  requiredApplyChecks,
+  formatCheckFailure,
+  requiredPublishChecks,
   runCheck,
 } from "../../workspace/check.js";
+import { withProgress } from "../../progress/reporter.js";
 
 /** `publish` 不接受任何模型可控参数。 */
 export const PublishParameters = Type.Object({}, { additionalProperties: false });
@@ -66,69 +68,77 @@ export function registerPublishTool(
       if (!extensionContext.hasUI) {
         throw new Error("当前模式不能显示 GitHub PR 发布确认框");
       }
-      extensionContext.ui.setWorkingMessage("正在准备 GitHub PR 发布预览…");
-      try {
-        const result = await publishTask({
-          task: context.task,
-          store: context.store,
-          taskDir: context.store.taskDir(context.task.id),
-          ...(signal ? { signal } : {}),
-          confirm: async (preview) => await extensionContext.ui.confirm(
-            "确认提交 GitHub PR",
-            formatPublishPreview(preview),
-          ),
-          runChecks: async () => {
-            for (const id of requiredApplyChecks(context.task.changedPaths)) {
-              const check = await runCheck(
-                context.store,
-                context.evidence,
-                context.task,
-                id,
-                signal,
-                { preserveTaskState: true },
-              );
-              if (check.record.status !== "passed") {
-                throw new Error("发布前完整检查未通过：" + id);
+      return await withProgress(
+        extensionContext.ui,
+        "publish",
+        undefined,
+        async (progress) => {
+          const result = await publishTask({
+            task: context.task,
+            store: context.store,
+            taskDir: context.store.taskDir(context.task.id),
+            ...(signal ? { signal } : {}),
+            progress: (line) => progress.line(line),
+            confirm: async (preview) => await extensionContext.ui.confirm(
+              "确认提交 GitHub PR",
+              formatPublishPreview(preview),
+            ),
+            runChecks: async () => {
+              const checks = requiredPublishChecks(context.task.changedPaths);
+              for (const id of checks) {
+                const check = await runCheck(
+                  context.store,
+                  context.evidence,
+                  context.task,
+                  id,
+                  signal,
+                  {
+                    preserveTaskState: true,
+                    onOutput: (line) => progress.line(line),
+                  },
+                );
+                if (check.record.status !== "passed") {
+                  throw new Error("发布前完整检查未通过：" + formatCheckFailure(check));
+                }
               }
-            }
-          },
-        });
-        if (!result) {
-          extensionContext.ui.notify("已取消发布；未创建提交、推送或 PR", "info");
+            },
+          });
+          if (!result) {
+            progress.done("用户取消发布");
+            extensionContext.ui.notify("已取消发布；未创建提交、推送或 PR", "info");
+            return {
+              content: [{ type: "text", text: "用户取消了 GitHub PR 发布；正式仓库未变化。" }],
+              details: { status: "cancelled" as const },
+              terminate: true,
+            };
+          }
+          extensionContext.ui.notify(
+            "PR 已创建：" + result.prUrl + "；合并请在 GitHub 手动完成",
+            "info",
+          );
           return {
-            content: [{ type: "text", text: "用户取消了 GitHub PR 发布；正式仓库未变化。" }],
-            details: { status: "cancelled" as const },
+            content: [{
+              type: "text",
+              text: [
+                "已创建 GitHub PR：" + result.prUrl,
+                "分支：" + result.branch,
+                "提交：" + result.commitSha,
+                "合并请由用户在 GitHub 手动完成。",
+              ].join("\n"),
+            }],
+            details: {
+              status: "published" as const,
+              repository: result.repository,
+              baseBranch: result.baseBranch,
+              branch: result.branch,
+              commitSha: result.commitSha,
+              prUrl: result.prUrl,
+              changedPaths: result.changedPaths,
+            },
             terminate: true,
           };
-        }
-        extensionContext.ui.notify(
-          "PR 已创建：" + result.prUrl + "；合并请在 GitHub 手动完成",
-          "info",
-        );
-        return {
-          content: [{
-            type: "text",
-            text: [
-              "已创建 GitHub PR：" + result.prUrl,
-              "分支：" + result.branch,
-              "提交：" + result.commitSha,
-              "合并请由用户在 GitHub 手动完成。",
-            ].join("\n"),
-          }],
-          details: {
-            status: "published" as const,
-            repository: result.repository,
-            baseBranch: result.baseBranch,
-            branch: result.branch,
-            commitSha: result.commitSha,
-            prUrl: result.prUrl,
-            changedPaths: result.changedPaths,
-          },
-          terminate: true,
-        };
-      } finally {
-        extensionContext.ui.setWorkingMessage();
-      }
+        },
+      );
     },
   });
 }

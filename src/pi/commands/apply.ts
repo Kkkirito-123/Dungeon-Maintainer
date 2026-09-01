@@ -10,18 +10,16 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendEvent } from "../../logging/events.js";
-import type { EvidenceStore } from "../../evidence/store.js";
 import type { TaskStore } from "../../task/store.js";
 import type { TaskRecord } from "../../task/types.js";
 import { applyTaskPatch } from "../../workspace/apply.js";
 import { runGit } from "../../workspace/git.js";
-import { requiredApplyChecks, runCheck } from "../../workspace/check.js";
+import { withProgress } from "../../progress/reporter.js";
 
 /** `/apply` 所需的当前任务依赖。 */
 export interface ApplyCommandContext {
   task: TaskRecord;
   store: TaskStore;
-  evidence: EvidenceStore;
 }
 
 async function rollbackAfterSaveFailure(task: TaskRecord): Promise<void> {
@@ -87,53 +85,49 @@ export function registerApplyCommand(
         return;
       }
 
-      commandContext.ui.setWorkingMessage("正在运行应用前完整质量门…");
       try {
-        for (const id of requiredApplyChecks(context.task.changedPaths)) {
-          const result = await runCheck(
-            context.store,
-            context.evidence,
-            context.task,
-            id,
-            commandContext.signal,
-            { preserveTaskState: true },
-          );
-          if (result.record.status !== "passed") {
-            throw new Error("应用前完整检查未通过：" + id);
-          }
-        }
+        await withProgress(
+          commandContext.ui,
+          "apply",
+          { taskId: context.task.id, paths: context.task.changedPaths },
+          async (progress) => {
+            progress.line("校验已验证补丁并写回正式工作区");
+            commandContext.ui.notify("正在校验已验证补丁并写回正式工作区…", "info");
+
+            const previousState = context.task.state;
+            const appliedHashes = await applyTaskPatch(context.task);
+            try {
+              progress.line("补丁写回完成，保存任务状态");
+              context.task.appliedHashes = appliedHashes;
+              await context.store.transition(context.task, "applied");
+            } catch (error) {
+              progress.line("任务状态保存失败，回滚正式工作区");
+              await rollbackAfterSaveFailure(context.task);
+              context.task.state = previousState;
+              context.task.appliedHashes = {};
+              await context.store.save(context.task).catch(() => undefined);
+              throw new Error("apply 后任务持久化失败，正式仓库已安全恢复", {
+                cause: error,
+              });
+            }
+            await appendEvent(context.store, context.task.id, "command.apply", {
+              applied: true,
+              pathCount: context.task.changedPaths.length,
+            });
+            progress.line("补丁已应用到正式游戏工作区");
+            commandContext.ui.notify(
+              "补丁已应用到正式游戏工作区；未创建提交",
+              "info",
+            );
+          },
+        );
       } catch (error) {
         commandContext.ui.notify(
-          error instanceof Error ? error.message : "应用前完整检查失败",
+          error instanceof Error ? error.message : "应用补丁失败",
           "error",
         );
-        return;
-      } finally {
-        commandContext.ui.setWorkingMessage();
+        throw error;
       }
-
-      const previousState = context.task.state;
-      const appliedHashes = await applyTaskPatch(context.task);
-      try {
-        context.task.appliedHashes = appliedHashes;
-        await context.store.transition(context.task, "applied");
-      } catch (error) {
-        await rollbackAfterSaveFailure(context.task);
-        context.task.state = previousState;
-        context.task.appliedHashes = {};
-        await context.store.save(context.task).catch(() => undefined);
-        throw new Error("apply 后任务持久化失败，正式仓库已安全恢复", {
-          cause: error,
-        });
-      }
-      await appendEvent(context.store, context.task.id, "command.apply", {
-        applied: true,
-        pathCount: context.task.changedPaths.length,
-      });
-      commandContext.ui.notify(
-        "补丁已应用到正式游戏工作区；未创建提交",
-        "info",
-      );
     },
   });
 }

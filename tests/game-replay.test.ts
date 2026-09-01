@@ -23,7 +23,7 @@ import { CheckParameters } from "../src/pi/tools/check.js";
 import { TaskStore } from "../src/task/store.js";
 import {
   checkIds,
-  requiredApplyChecks,
+  requiredPublishChecks,
   requiredChecks,
 } from "../src/workspace/check.js";
 import { createTaskRecordFixture } from "./testSupport.js";
@@ -891,13 +891,14 @@ describe("浏览器检查点、刷新、恢复和语义重放", () => {
 });
 
 describe("固定检查白名单", () => {
-  it("候选阶段运行相关测试，应用前再运行完整质量门", () => {
-    assert.deepEqual(requiredChecks(["game/src/domain/session.ts"]), [
-      "game-related-test",
-    ]);
+  it("候选阶段只运行直接改动测试，发布前再运行完整质量门", () => {
+    assert.deepEqual(requiredChecks(["game/src/domain/session.ts"]), []);
     assert.deepEqual(requiredChecks(["game/tests/session.test.ts"]), ["game-related-test"]);
+    assert.deepEqual(requiredChecks(["game/scripts/check-architecture.mjs"]), [
+      "game-architecture",
+    ]);
     assert.deepEqual(requiredChecks(["README.md"]), []);
-    assert.deepEqual(requiredApplyChecks(["game/src/domain/session.ts"]), [
+    assert.deepEqual(requiredPublishChecks(["game/src/domain/session.ts"]), [
       "game-test",
       "game-architecture",
       "game-build",

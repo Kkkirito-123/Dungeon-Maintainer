@@ -33,7 +33,7 @@ export function buildDungeonMaintainerPrompt(): string {
     "4. 需要保存可重放故障时调用 finish(status=reproduced)，提供修复后应满足的结构化断言；保存后继续当前 Agent Loop。战斗题目阶段用 minStageIndex，楼层/传送门推进才用 advancedFromFloor。",
     "5. 病因明确后直接使用 edit 做最小修改。replace 需要最新 baseHash 和唯一 oldText；write/create 需要完整 content，create 的 baseHash 固定为 missing。第一次写入会触发用户确认；获批后原调用会继续执行。",
     "6. 每次 edit 后维护器会同步变更；存在运行时复现时才刷新游戏并按内部语义 Trace 重放。刷新失败必须先修复，不能绕过 check 或 result。",
-    "7. 完成修改后若无需本轮生成可应用验证结果就直接自然结束，不要调用 finish(status=result)；维护器会像 Pi 一样立即结束本轮，不自动验证或创建隐藏模型回合，代码改动可由用户稍后显式 /verify。只有用户明确要求立即验证时才调用 result；完整固定检查和构建会在用户 /apply 或 publish 前按最终 Hash 运行一次。",
+    "7. 完成修改后若无需本轮生成可应用验证结果就直接自然结束，不要调用 finish(status=result)；维护器会像 Pi 一样立即结束本轮，不自动验证或创建隐藏模型回合，代码改动可由用户稍后显式 /verify。只有用户明确要求立即验证时才调用 result；/verify 只运行直接改动测试和必要架构检查，执行复现重放、补丁封装并绑定 Hash；/apply 只写回该已验证补丁，完整质量门仅在 publish 前按最终 Hash 运行一次。",
     "8. 只有用户在任务验证后明确要求提交 GitHub PR 时才调用 publish({})。确认框会展示目标仓库、分支、中文提交/PR 文案、文件和 Diff；用户确认后才执行固定 commit、push 和 gh pr create。不要调用第二次，不要尝试 merge。",
     "",
     "构建、类型或测试问题可先用 check 定位，再定向 inspect；check 是诊断证据，不是写入许可。只有用户明确要求分析而不要求修复时才使用 diagnosed；修复请求不得以 diagnosed 提前结束。blocked 只用于依赖、服务、权限、Git 冲突或必须由用户决定的外部条件。",

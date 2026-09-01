@@ -30,6 +30,7 @@ import {
 import { renderShellPage } from "./page.js";
 import {
   createInitialStatus,
+  MAINTAINER_PROGRESS_KEY,
   statusFromTask,
   type ShellApprovalRequest,
   type ShellActivityState,
@@ -65,6 +66,7 @@ export interface ShellHandle {
   token: string;
   close(): Promise<void>;
   publish(event: ShellEvent): void;
+  settleCommand(): void;
   updateTask(task: TaskRecord): void;
   updateTurnUsage(usage: unknown): void;
   updateSessionStats(stats: unknown): void;
@@ -85,6 +87,20 @@ export interface ShellServerOptions extends ShellStatusConfig {
 }
 
 const MAX_EVENTS = 500;
+const MAX_PROGRESS_LINES = 80;
+const MAX_PROGRESS_LINE_LENGTH = 500;
+const ANSI_ESCAPE = new RegExp(
+  String.fromCharCode(27) + "\\[[0-?]*[ -/]*[@-~]",
+  "gu",
+);
+
+function cleanProgressLine(value: string): string {
+  return sanitizeText(value)
+    .replace(ANSI_ESCAPE, "")
+    .replace(/\p{Cc}/gu, " ")
+    .trim()
+    .slice(0, MAX_PROGRESS_LINE_LENGTH);
+}
 
 /** 创建可供 start/resume 使用的本地 Shell。 */
 export async function startShellServer(options: ShellServerOptions): Promise<ShellHandle> {
@@ -103,6 +119,8 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
   let abortRequested = false;
   let abortInFlight = false;
   let pendingTerminalError: string | null = null;
+  let progressText: string | null = null;
+  let progressLines: string[] = [];
   let activityStartedAt: number | null = null;
   let activityText = "";
   let activityState: ShellActivityState = "done";
@@ -124,6 +142,11 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
   });
 
   const publish = (event: ShellEvent): void => {
+    if (event.type === "progress") {
+      for (let index = events.length - 1; index >= 0; index -= 1) {
+        if (events[index]?.event.type === "progress") events.splice(index, 1);
+      }
+    }
     sequence += 1;
     events.push({ id: sequence, event });
     while (events.length > MAX_EVENTS) events.shift();
@@ -132,6 +155,15 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
       client.lastEventId = sequence;
       client.response.write(payload);
     }
+  };
+
+  const publishProgress = (): void => {
+    publish({
+      type: "progress",
+      key: MAINTAINER_PROGRESS_KEY,
+      text: progressText,
+      lines: [...progressLines],
+    });
   };
 
   const publishState = (): void => {
@@ -252,9 +284,24 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
   };
 
   const updateTask = (nextTask: TaskRecord): void => {
+    const changedTask = nextTask.id !== task.id;
     task = nextTask;
+    if (changedTask) {
+      progressText = null;
+      progressLines = [];
+      publishProgress();
+    }
     status = statusFromTask(status, nextTask);
     publishState();
+  };
+
+  const settleCommand = (): void => {
+    if (!promptInFlight || activeRequestKind !== "command") return;
+    finishRequest(
+      pendingTerminalError ? "error" : "done",
+      pendingTerminalError ?? "固定命令执行完成",
+      pendingTerminalError !== null,
+    );
   };
 
   const syncEvidence = async (): Promise<void> => {
@@ -486,13 +533,38 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
       const method = stringValue(event.method);
       const id = stringValue(event.id);
       if (!method || !id) return;
+      if (method === "setStatus") {
+        if (stringValue(event.statusKey) !== MAINTAINER_PROGRESS_KEY) return;
+        const statusText = stringValue(event.statusText);
+        progressText = statusText === null ? null : cleanProgressLine(statusText);
+        publishProgress();
+        return;
+      }
+      if (method === "setWidget") {
+        if (stringValue(event.widgetKey) !== MAINTAINER_PROGRESS_KEY) return;
+        progressLines = Array.isArray(event.widgetLines)
+          ? event.widgetLines
+            .filter((line): line is string => typeof line === "string")
+            .slice(0, MAX_PROGRESS_LINES)
+            .map(cleanProgressLine)
+            .filter(Boolean)
+          : [];
+        publishProgress();
+        return;
+      }
       if (method === "notify") {
         const message = stringValue(event.message);
         if (message) {
           const level = event.notifyType === "error"
             ? "error"
             : event.notifyType === "warning" ? "warning" : "info";
-          publish({ type: "notice", level, text: sanitizeText(message) });
+          const safeMessage = sanitizeText(message);
+          if (level === "error" && promptInFlight) {
+            pendingTerminalError ??= safeMessage;
+            publishActivity("working", "检查报告错误，正在等待本轮安全结束…");
+          } else {
+            publish({ type: "notice", level, text: safeMessage });
+          }
         }
         return;
       }
@@ -535,7 +607,10 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
       return;
     }
     if (event.type === "extension_error") {
-      pendingTerminalError = "Pi Extension 执行失败，本轮没有安全完成。请重试；若持续发生，请检查维护器日志。";
+      const detail = stringValue(event.error);
+      pendingTerminalError ??= detail
+        ? sanitizeText(detail).replace(/\s+/gu, " ").slice(0, 2_000)
+        : "Pi Extension 执行失败，本轮没有安全完成。请重试；若持续发生，请检查维护器日志。";
       if (promptInFlight) {
         publishActivity("working", "Pi Extension 报告错误，正在等待本轮安全结束…");
       } else {
@@ -631,7 +706,7 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
       return;
     }
     if (event.type === "agent_end") {
-      if (promptInFlight && activeRequestKind === "input") {
+      if (promptInFlight) {
         publishActivity(
           event.willRetry === true ? "waiting" : "working",
           event.willRetry === true
@@ -643,7 +718,7 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
     }
     if (event.type === "agent_settled") {
       status = { ...status, phase: "idle" };
-      if (promptInFlight && activeRequestKind === "input") {
+      if (promptInFlight && (activeRequestKind === "input" || activeRequestKind === "command")) {
         if (abortRequested) {
           finishRequest("done", "本轮已停止，可以继续输入", false);
         } else if (pendingTerminalError) {
@@ -903,17 +978,16 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
       publishState();
       publish({ type: "chat.user", text });
       publishActivity("waiting", "正在执行 " + command + "…", true);
-      try {
-        await options.sendPiCommand({ id: randomUUID(), type: "prompt", message: command });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Pi RPC 请求失败";
-        finishRequest("error", "命令发送失败：" + sanitizeText(message));
-        throw error;
-      }
-      if (abortRequested) finishRequest("done", "本轮已停止，可以继续输入", false);
-      else if (pendingTerminalError) finishRequest("error", pendingTerminalError);
-      else finishRequest("done", command + " 已完成", false);
-      writeJson(response, { ok: true });
+      void options.sendPiCommand({ id: randomUUID(), type: "prompt", message: command })
+        .catch((error: unknown) => {
+          if (!promptInFlight || activeRequestKind !== "command") return;
+          const message = pendingTerminalError
+            ?? ("命令发送失败：" + sanitizeText(
+              error instanceof Error ? error.message : "Pi RPC 请求失败",
+            ));
+          finishRequest("error", message);
+        });
+      writeJson(response, { ok: true, accepted: true });
       return;
     }
     if (url.pathname === "/api/ui-response") {
@@ -1064,6 +1138,7 @@ export async function startShellServer(options: ShellServerOptions): Promise<She
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },
     publish,
+    settleCommand,
     updateTask,
     updateTurnUsage,
     updateSessionStats,

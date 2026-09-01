@@ -119,7 +119,7 @@ Dungeon Maintainer Extension
 3. 首次 `edit` 前，Shell 展示精确文件范围；需要完整方案时同时展示病因、步骤和验证方式。
 4. 写入后等待 Vite 更新，刷新页面、恢复检查点，并重放相同语义动作。
 5. `/verify` 只运行直接改动测试和必要架构检查，再恢复重放并封装补丁。
-6. `/apply` 在写回前按变更范围运行完整质量门，检查来源漂移、目标 Hash 和 `git apply --check`，成功后只写入 Agent 增量。
+6. `/apply` 只检查已验证 worktree Hash、来源漂移、目标 Hash 和 `git apply --check`，成功后直接写入 Agent 增量；完整质量门只在 `publish` 前运行。
 7. 用户明确要求发布时，`publish` 从已验证补丁创建临时发布 worktree，经确认后创建 PR；合并始终留给用户。
 
 ## 🚀 快速开始

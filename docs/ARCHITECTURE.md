@@ -39,9 +39,9 @@ Dungeon Extension
   -> 修改 detached worktree
   -> 刷新游戏并恢复检查点
   -> 重放玩家动作
-  -> 运行固定检查
+  -> 运行直接改动测试和必要架构检查
   -> finish(result)
-  -> 用户 /apply 或明确要求 publish
+  -> 用户 /apply 直接写回，或明确要求 publish（完整质量门）
 ```
 
 没有下一次工具调用时，Pi 按原生语义 `agent_settled`。维护器不会自动追加模型回合。
@@ -200,6 +200,11 @@ Eval 内部为 Agent 与 Pi Baseline 复用当前 Key 与 Base URL，默认使�
 读完这条主线，再按问题进入 inspection、evidence、repair 或 game，不需要先理解整个仓库。
 
 ## 验证门禁
+
+`/verify` 是轻量候选验证：仅运行直接修改的 `game/tests/**/*.ts` 和必要的架构检查，随后重放活动复现、
+封装补丁并绑定 worktree Hash；不会因 `game/src/` 变更扩散到相关测试或完整构建。`/apply` 只校验该已验证快照、
+来源漂移、目标 Hash 和补丁可应用性后直接写回。`publish` 对 `game/src/` 或 `game/tests/` 变更仍运行
+`game-test`、`game-architecture` 和 `game-build` 完整质量门；架构检查脚本变更仍运行 `game-architecture`。
 
 ```powershell
 pnpm lint

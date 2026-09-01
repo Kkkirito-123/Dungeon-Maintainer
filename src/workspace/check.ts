@@ -74,24 +74,29 @@ const CHECKS: Readonly<Record<CheckId, CheckSpec>> = {
   },
 };
 
+export type CheckOutput = (line: string) => void;
+const ANSI_ESCAPE = new RegExp(
+  String.fromCharCode(27) + "\\[[0-?]*[ -/]*[@-~]",
+  "gu",
+);
+
 /**
- * 根据变更路径返回 finish ready 前必须通过的检查。
+ * 根据变更路径返回候选验证前必须通过的轻量检查。
  *
  * @param paths 任务记录的精确变更路径。
  * @returns 去重后的固定检查 ID。
  */
 export function requiredChecks(paths: readonly string[]): CheckId[] {
   const checks: CheckId[] = [];
-  if (paths.some((path) => (
-    (path.startsWith("game/src/") || path.startsWith("game/tests/"))
-    && path.endsWith(".ts")
-  ))) checks.push("game-related-test");
+  if (paths.some((path) => path.startsWith("game/tests/") && path.endsWith(".ts"))) {
+    checks.push("game-related-test");
+  }
   if (paths.includes("game/scripts/check-architecture.mjs")) checks.push("game-architecture");
   return checks;
 }
 
-/** `/apply` 写回正式仓库前必须通过的完整质量门。 */
-export function requiredApplyChecks(paths: readonly string[]): CheckId[] {
+/** `publish` 创建 PR 前必须通过的完整质量门。 */
+export function requiredPublishChecks(paths: readonly string[]): CheckId[] {
   if (paths.some((path) => path.startsWith("game/src/") || path.startsWith("game/tests/"))) {
     return ["game-test", "game-architecture", "game-build"];
   }
@@ -101,7 +106,10 @@ export function requiredApplyChecks(paths: readonly string[]): CheckId[] {
 
 function safeEnvironment(): NodeJS.ProcessEnv {
   return Object.fromEntries(Object.entries(process.env).filter(
-    ([name]) => !/(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)/iu.test(name),
+    ([name]) => (
+      /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/u.test(name)
+      || !/(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)/iu.test(name)
+    ),
   ));
 }
 
@@ -151,6 +159,7 @@ async function runFixedCommand(
   spec: CheckSpec,
   cwd: string,
   signal?: AbortSignal,
+  onOutput?: CheckOutput,
 ): Promise<{ code: number | null; output: string; durationMs: number }> {
   const started = performance.now();
   return await new Promise((resolve, reject) => {
@@ -162,8 +171,20 @@ async function runFixedCommand(
       windowsHide: true,
     });
     const chunks: Buffer[] = [];
+    let pending = "";
+    const emit = (line: string): void => {
+      const safe = redactText(line)
+        .replace(ANSI_ESCAPE, "")
+        .trim();
+      if (safe) onOutput?.(safe.slice(0, 500));
+    };
     const collect = (chunk: Buffer): void => {
       chunks.push(chunk);
+      if (!onOutput) return;
+      pending += chunk.toString("utf8");
+      const lines = pending.split(/\r\n?|\n/u);
+      pending = lines.pop() ?? "";
+      for (const line of lines) emit(line);
     };
     child.stdout.on("data", collect);
     child.stderr.on("data", collect);
@@ -174,6 +195,7 @@ async function runFixedCommand(
     child.once("error", reject);
     child.once("close", (code) => {
       signal?.removeEventListener("abort", abort);
+      if (pending) emit(pending);
       resolve({
         code,
         output: Buffer.concat(chunks).toString("utf8"),
@@ -183,17 +205,18 @@ async function runFixedCommand(
   });
 }
 
-async function runRelatedGameTests(
+async function runChangedGameTests(
   task: TaskRecord,
   signal?: AbortSignal,
+  onOutput?: CheckOutput,
 ): Promise<{ code: number | null; output: string; durationMs: number }> {
-  const related = task.changedPaths.filter((path) => (
-    (path.startsWith("game/src/") || path.startsWith("game/tests/"))
+  const tests = task.changedPaths.filter((path) => (
+    path.startsWith("game/tests/")
     && path.endsWith(".ts")
     && !path.split("/").includes("..")
   )).map((path) => path.slice("game/".length));
-  if (related.length === 0) {
-    return { code: 0, output: "没有需要运行相关测试的 TypeScript 变更。", durationMs: 0 };
+  if (tests.length === 0) {
+    return { code: 0, output: "没有直接修改的游戏测试文件。", durationMs: 0 };
   }
   return await runFixedCommand({
     id: "game-related-test",
@@ -203,20 +226,35 @@ async function runRelatedGameTests(
       "game",
       "exec",
       "vitest",
-      "related",
-      ...related,
-      "--run",
+      "run",
+      ...tests,
       "--passWithNoTests",
       "--no-file-parallelism",
     ],
-  }, task.worktreeRoot, signal);
+  }, task.worktreeRoot, signal, onOutput);
 }
 
 /** 固定检查执行结果及模型可见尾迹。 */
 export interface CheckExecutionResult {
   record: CheckRecord;
   cached: boolean;
+  exitCode: number | null;
   tail: string;
+}
+
+/** 把检查失败压缩成可直接定位的提示；完整日志仍保留在进度面板和 checks 文件。 */
+export function formatCheckFailure(result: CheckExecutionResult): string {
+  const outcome = result.exitCode === null
+    ? "状态=" + result.record.status
+    : "退出码=" + String(result.exitCode);
+  const tail = result.tail
+    .split(/\r?\n/u)
+    .filter(Boolean)
+    .slice(-3)
+    .join(" | ");
+  return result.record.id + " 未通过（" + outcome
+    + "，耗时=" + (result.record.durationMs / 1_000).toFixed(1) + " 秒）"
+    + (tail ? "；日志尾部：" + tail.slice(0, 600) : "");
 }
 
 /**
@@ -235,7 +273,7 @@ export async function runCheck(
   task: TaskRecord,
   id: CheckId,
   signal?: AbortSignal,
-  options: { preserveTaskState?: boolean } = {},
+  options: { preserveTaskState?: boolean; onOutput?: CheckOutput } = {},
 ): Promise<CheckExecutionResult> {
   signal?.throwIfAborted();
   const worktreeHash = await hashWorktree(task.worktreeRoot);
@@ -251,9 +289,11 @@ export async function runCheck(
       status: cached.status,
       cached: true,
     });
+    options.onOutput?.("检查 " + id + "：命中缓存（" + (cached.durationMs / 1_000).toFixed(1) + " 秒）");
     return {
       record: cached,
       cached: true,
+      exitCode: cached.status === "passed" ? 0 : null,
       tail: log.split(/\r?\n/u).slice(-80).join("\n"),
     };
   }
@@ -269,9 +309,10 @@ export async function runCheck(
     durationMs: number;
   };
   try {
+    options.onOutput?.("检查 " + id + "：开始");
     command = id === "game-related-test"
-      ? await runRelatedGameTests(task, signal)
-      : await runFixedCommand(CHECKS[id], task.worktreeRoot, signal);
+      ? await runChangedGameTests(task, signal, options.onOutput)
+      : await runFixedCommand(CHECKS[id], task.worktreeRoot, signal, options.onOutput);
     status = command.code === 0 ? "passed" : "failed";
   } catch (error) {
     command = {
@@ -281,6 +322,10 @@ export async function runCheck(
       durationMs: 0,
     };
   }
+  options.onOutput?.(
+    "检查 " + id + "：退出码 " + (command.code === null ? "blocked" : String(command.code))
+    + "，耗时 " + (command.durationMs / 1_000).toFixed(1) + " 秒",
+  );
   signal?.throwIfAborted();
   const logPath = join(
     checksDir,
@@ -306,6 +351,7 @@ export async function runCheck(
   return {
     record,
     cached: false,
+    exitCode: command.code,
     tail: safeLog.split(/\r?\n/u).slice(-80).join("\n"),
   };
 }

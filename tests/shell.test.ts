@@ -97,7 +97,12 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
         assert.match(page, /else if \(data\.type === 'chat\.tool'\) showTool\(data\)/u);
         assert.match(page, /id="activity" role="status" aria-live="polite"/u);
         assert.match(page, /else if \(data\.type === 'activity'\) showActivity\(data\)/u);
-        assert.match(page, /input\.disabled = false/u);
+        assert.match(page, /id="progress-panel"/u);
+        assert.match(page, /id="progress-log"/u);
+        assert.match(page, /data\.type === 'progress' && data\.key === 'maintainer-progress'/u);
+        assert.match(page, /progressLog\.textContent = Array\.isArray\(data\.lines\)/u);
+        assert.match(page, /progressLog\.scrollTop = progressLog\.scrollHeight/u);
+        assert.match(page, /input\.disabled = busy && commandInFlight/u);
         assert.match(page, /id="abort-button"/u);
         assert.match(page, /\/api\/steer/u);
         assert.match(page, /\/api\/abort/u);
@@ -115,6 +120,52 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
         assert.match(page, /value: currentApproval\.message/u);
         assert.match(page, /Shell 事件渲染失败/u);
         assert.doesNotMatch(page, /shell-secret/u);
+
+        shell.handlePiEvent({
+          type: "extension_ui_request",
+          id: "progress-status",
+          method: "setStatus",
+          statusKey: "maintainer-progress",
+          statusText: "检查 1/2",
+        });
+        shell.handlePiEvent({
+          type: "extension_ui_request",
+          id: "progress-widget",
+          method: "setWidget",
+          widgetKey: "maintainer-progress",
+          widgetLines: ["game-test passed", "game-build running"],
+          widgetPlacement: "aboveEditor",
+        });
+        shell.handlePiEvent({
+          type: "extension_ui_request",
+          id: "progress-clear",
+          method: "setStatus",
+          statusKey: "maintainer-progress",
+        });
+        shell.handlePiEvent({
+          type: "extension_ui_request",
+          id: "unknown-progress",
+          method: "setWidget",
+          widgetKey: "other-progress",
+          widgetLines: ["must-not-render"],
+        });
+        shell.publish({ type: "notice", level: "info", text: "progress-cache-marker" });
+        const progressEvents = (await readSseUntil(shell.url, "progress-cache-marker"))
+          .split(/\r?\n/u)
+          .filter((line) => line.startsWith("data: "))
+          .map((line) => JSON.parse(line.slice(6)) as {
+            type?: string;
+            key?: string;
+            text?: string | null;
+            lines?: string[];
+          })
+          .filter((event) => event.type === "progress");
+        assert.deepEqual(progressEvents, [{
+          type: "progress",
+          key: "maintainer-progress",
+          text: null,
+          lines: ["game-test passed", "game-build running"],
+        }]);
 
         shell.handlePiEvent({
           type: "message_end",
@@ -302,6 +353,13 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
           body: JSON.stringify({ text: "/play" }),
         });
         assert.equal(playResponse.status, 200);
+        const inputDuringCommand = await fetch(shell.url.replace("/?", "/api/input?"), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text: "命令未 settled，不能抢跑" }),
+        });
+        assert.equal(inputDuringCommand.status, 409);
+        shell.handlePiEvent({ type: "agent_settled" });
         const afterCommandState = await (
           await fetch(shell.url.replace("/?", "/api/state?"))
         ).json() as {
@@ -369,6 +427,88 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
           }),
         });
         assert.equal(runtimeResponse.status, 200);
+      } finally {
+        await shell.close();
+      }
+    } finally {
+      await repository.dispose();
+    }
+  });
+
+  it("命令在 settled 前保持锁定，in-flight error 在 settled 后结束", async () => {
+    const repository = await createTemporaryGitRepository({ "README.md": "test\n" });
+    try {
+      const store = new TaskStore(join(repository.temporaryRoot, "data"));
+      const task = await store.create({
+        id: "shell-command-settled",
+        objective: INITIAL_TASK_OBJECTIVE,
+        repoRoot: repository.repoRoot,
+        baseHead: repository.baseHead,
+        worktreeRoot: repository.repoRoot,
+        piSessionDir: join(store.taskDir("shell-command-settled"), "pi"),
+      });
+      const shell = await startShellServer({
+        task,
+        model: "model-a",
+        contextWindow: 64_000,
+        store,
+        sendPiCommand: async () => ({ ok: true }),
+        onClose: async () => undefined,
+      });
+      try {
+        const commandResponse = await fetch(shell.url.replace("/?", "/api/command?"), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text: "/verify" }),
+        });
+        assert.equal(commandResponse.status, 200);
+        assert.deepEqual(await commandResponse.json(), { ok: true, accepted: true });
+
+        const busyBeforeSettled = await fetch(shell.url.replace("/?", "/api/input?"), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text: "不能抢跑" }),
+        });
+        assert.equal(busyBeforeSettled.status, 409);
+        shell.handlePiEvent({
+          type: "extension_ui_request",
+          id: "verify-error",
+          method: "notify",
+          notifyType: "error",
+          message: "直接测试失败",
+        });
+        const stillBusy = await fetch(shell.url.replace("/?", "/api/input?"), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text: "错误通知后仍不能抢跑" }),
+        });
+        assert.equal(stillBusy.status, 409);
+        shell.handlePiEvent({ type: "agent_settled" });
+        const settledEvents = await readSseUntil(shell.url, "直接测试失败");
+        assert.match(settledEvents, /"state":"error"/u);
+
+        const secondCommand = await fetch(shell.url.replace("/?", "/api/command?"), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text: "/verify" }),
+        });
+        assert.equal(secondCommand.status, 200);
+        shell.handlePiEvent({
+          type: "extension_error",
+          error: "检查 game-test 失败：退出码 1",
+        });
+        shell.handlePiEvent({ type: "agent_settled" });
+        const detailedEvents = await readSseUntil(shell.url, "检查 game-test 失败");
+        assert.match(detailedEvents, /检查 game-test 失败：退出码 1/u);
+        assert.match(detailedEvents, /"state":"error"/u);
+
+        const unlocked = await fetch(shell.url.replace("/?", "/api/input?"), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text: "settled 后继续" }),
+        });
+        assert.equal(unlocked.status, 200);
+        shell.handlePiEvent({ type: "agent_settled" });
       } finally {
         await shell.close();
       }
@@ -905,6 +1045,7 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
           value: editorText,
         });
 
+        shell.handlePiEvent({ type: "agent_settled" });
         const unlockedResponse = await fetch(shell.url.replace("/?", "/api/input?"), {
           method: "POST",
           headers: { "content-type": "application/json" },

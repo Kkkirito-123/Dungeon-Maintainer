@@ -70,6 +70,9 @@ export interface ShellStatus {
 /** 左侧聊天区固定显示的当前动作状态。 */
 export type ShellActivityState = "waiting" | "working" | "approval" | "done" | "error";
 
+/** 维护器进度栏唯一允许的 UI key。 */
+export const MAINTAINER_PROGRESS_KEY = "maintainer-progress";
+
 /** 浏览器可以收到的事件类型。 */
 export type ShellEvent =
   | { type: "state"; status: ShellStatus; gameUrl: string | null }
@@ -77,6 +80,12 @@ export type ShellEvent =
   | { type: "chat.text"; text: string; done: boolean }
   | { type: "chat.tool"; name: string; phase: "start" | "end"; error: boolean }
   | { type: "activity"; state: ShellActivityState; text: string; elapsedSeconds: number }
+  | {
+    type: "progress";
+    key: typeof MAINTAINER_PROGRESS_KEY;
+    text: string | null;
+    lines: string[];
+  }
   | { type: "notice"; level: "info" | "warning" | "error"; text: string }
   | { type: "approval"; request: ShellApprovalRequest }
   | { type: "game"; state: "starting" | "ready" | "error" | "stopped"; gameUrl: string | null }

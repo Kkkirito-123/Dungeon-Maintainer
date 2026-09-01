@@ -1,6 +1,9 @@
 /** Pi `inspect` 工具的参数契约、动作分发、注册和遥测。 */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { EvidenceStore } from "../../evidence/store.js";
 import { inspectBundle } from "../../inspection/bundle.js";
@@ -23,6 +26,7 @@ import { appendEvent } from "../../logging/events.js";
 import type { TaskStore } from "../../task/store.js";
 import type { TaskRecord } from "../../task/types.js";
 import { hashWorktree, readRepo, worktreeDiff } from "../../workspace/git.js";
+import { withProgress } from "../../progress/reporter.js";
 import { executeEvidenceQuery, type EvidenceInput } from "./evidence.js";
 
 /** `inspect` 的严格参数契约。 */
@@ -183,50 +187,65 @@ export function registerInspectTool(
     ],
     executionMode: "sequential",
     parameters: InspectParameters,
-    async execute(_toolCallId, input, signal) {
-      try {
-        if (input.action === "evidence_list" || input.action === "evidence_get") {
-          const evidenceInput: EvidenceInput = {
-            action: input.action === "evidence_list" ? "list" : "get",
-            ...(input.status === undefined ? {} : { status: input.status }),
-            ...(input.kind === undefined ? {} : { kind: input.kind }),
-            ...(input.limit === undefined ? {} : { limit: input.limit }),
-            ...(input.evidenceId === undefined ? {} : { evidenceId: input.evidenceId }),
-          };
-          const evidenceOutput = await executeEvidenceQuery(context, evidenceInput, signal);
-          await appendEvent(context.store, context.task.id, "tool.inspect", {
-            action: input.action,
-            outcome: "execution",
-            evidenceRevision: Number(evidenceOutput.details.revision),
-          });
-          return {
-            ...evidenceOutput,
-            details: { ...evidenceOutput.details },
-          };
-        }
-        const output = await inspectTask(context, input as InspectInput, signal);
-        await appendEvent(context.store, context.task.id, "tool.inspect", {
-          action: input.action,
-          outcome: output.details.cacheKind === "exact" ? "receipt" : "execution",
-          cacheKind: output.details.cacheKind,
-          bundleWindows: output.details.bundleWindows ?? 0,
-          candidateFiles: output.details.candidateFiles ?? 0,
-          selectedFiles: output.details.selectedFiles ?? 0,
-        });
-        return {
-          content: [{ type: "text", text: output.text }],
-          details: { ...output.details },
-        };
-      } catch (error) {
-        await appendEvent(context.store, context.task.id, "tool.inspect", {
-          action: input.action,
-          outcome: "failure",
-          bundleWindows: 0,
-          candidateFiles: 0,
-          selectedFiles: 0,
-        });
-        throw error;
-      }
+    async execute(
+      _toolCallId,
+      input,
+      signal,
+      _onUpdate,
+      extensionContext: ExtensionContext,
+    ) {
+      return await withProgress(
+        extensionContext.ui,
+        "inspect",
+        input,
+        async (progress) => {
+          progress.line("处理 inspect：" + input.action);
+          try {
+            if (input.action === "evidence_list" || input.action === "evidence_get") {
+              const evidenceInput: EvidenceInput = {
+                action: input.action === "evidence_list" ? "list" : "get",
+                ...(input.status === undefined ? {} : { status: input.status }),
+                ...(input.kind === undefined ? {} : { kind: input.kind }),
+                ...(input.limit === undefined ? {} : { limit: input.limit }),
+                ...(input.evidenceId === undefined ? {} : { evidenceId: input.evidenceId }),
+              };
+              const evidenceOutput = await executeEvidenceQuery(context, evidenceInput, signal);
+              await appendEvent(context.store, context.task.id, "tool.inspect", {
+                action: input.action,
+                outcome: "execution",
+                evidenceRevision: Number(evidenceOutput.details.revision),
+              });
+              return {
+                ...evidenceOutput,
+                details: { ...evidenceOutput.details },
+              };
+            }
+
+            const output = await inspectTask(context, input as InspectInput, signal);
+            await appendEvent(context.store, context.task.id, "tool.inspect", {
+              action: input.action,
+              outcome: output.details.cacheKind === "exact" ? "receipt" : "execution",
+              cacheKind: output.details.cacheKind,
+              bundleWindows: output.details.bundleWindows ?? 0,
+              candidateFiles: output.details.candidateFiles ?? 0,
+              selectedFiles: output.details.selectedFiles ?? 0,
+            });
+            return {
+              content: [{ type: "text", text: output.text }],
+              details: { ...output.details },
+            };
+          } catch (error) {
+            await appendEvent(context.store, context.task.id, "tool.inspect", {
+              action: input.action,
+              outcome: "failure",
+              bundleWindows: 0,
+              candidateFiles: 0,
+              selectedFiles: 0,
+            });
+            throw error;
+          }
+        },
+      );
     },
   });
 }

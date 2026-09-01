@@ -8,13 +8,17 @@
  * 不会改动正式仓库或用户浏览器 Profile。
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { GameDriver } from "../../game/driver.js";
 import type { PlayResult, PlayTerminalView, PlayView } from "../../game/protocol.js";
 import { appendEvent } from "../../logging/events.js";
 import type { TaskStore } from "../../task/store.js";
 import type { TaskRecord } from "../../task/types.js";
+import { withProgress } from "../../progress/reporter.js";
 
 const EmptyParameters = Type.Object({}, { additionalProperties: false });
 const ActParameters = Type.Object({
@@ -134,13 +138,28 @@ export function registerGameTools(
     promptSnippet: "用 look 读取右侧真实游戏的玩家投影",
     executionMode: "sequential",
     parameters: EmptyParameters,
-    async execute() {
-      const view = await context.requireDriver().look();
-      await appendEvent(context.store, context.task.id, "game.look", {
-        floor: view.floor,
-        mode: view.mode,
-      });
-      return { content: [{ type: "text", text: serializeGameToolResult(view) }], details: view };
+    async execute(
+      _toolCallId,
+      _input,
+      _signal,
+      _onUpdate,
+      extensionContext: ExtensionContext,
+    ) {
+      return await withProgress(
+        extensionContext.ui,
+        "look",
+        undefined,
+        async (progress) => {
+          progress.line("读取玩家可见游戏状态");
+          const view = await context.requireDriver().look();
+          await appendEvent(context.store, context.task.id, "game.look", {
+            floor: view.floor,
+            mode: view.mode,
+          });
+          progress.line("已读取楼层 " + String(view.floor) + "，模式 " + view.mode);
+          return { content: [{ type: "text", text: serializeGameToolResult(view) }], details: view };
+        },
+      );
     },
   });
 
@@ -151,21 +170,40 @@ export function registerGameTools(
     promptSnippet: "用 act 消费最新 look 的修订和动作",
     executionMode: "sequential",
     parameters: ActParameters,
-    async execute(_toolCallId, input, signal) {
-      signal?.throwIfAborted();
-      const result = await context.requireDriver().act(
-        input.revision,
-        input.actionId,
-        input.maxSteps,
+    async execute(
+      _toolCallId,
+      input,
+      signal,
+      _onUpdate,
+      extensionContext: ExtensionContext,
+    ) {
+      return await withProgress(
+        extensionContext.ui,
+        "act",
+        input,
+        async (progress) => {
+          progress.line("执行游戏动作：" + input.actionId);
+          signal?.throwIfAborted();
+          const result = await context.requireDriver().act(
+            input.revision,
+            input.actionId,
+            input.maxSteps,
+          );
+          await appendEvent(context.store, context.task.id, "game.act", {
+            actionId: input.actionId,
+            maxSteps: input.maxSteps,
+            steps: result.steps,
+            ok: result.ok,
+            event: result.event,
+          });
+          if (result.ok) {
+            progress.line("动作完成，共 " + String(result.steps) + " 步");
+          } else {
+            progress.fail(new Error("动作未完成：" + result.event));
+          }
+          return { content: [{ type: "text", text: serializeGameToolResult(result) }], details: result };
+        },
       );
-      await appendEvent(context.store, context.task.id, "game.act", {
-        actionId: input.actionId,
-        maxSteps: input.maxSteps,
-        steps: result.steps,
-        ok: result.ok,
-        event: result.event,
-      });
-      return { content: [{ type: "text", text: serializeGameToolResult(result) }], details: result };
     },
   });
 
@@ -176,15 +214,34 @@ export function registerGameTools(
     promptSnippet: "用 query 一次完成可见 SQL 输入和真实提交",
     executionMode: "sequential",
     parameters: QueryParameters,
-    async execute(_toolCallId, input, signal) {
-      signal?.throwIfAborted();
-      const result = await context.requireDriver().query(input.sql, input.revision);
-      await appendEvent(context.store, context.task.id, "game.query", {
-        inputLength: input.sql.length,
-        ok: result.ok,
-        event: result.event,
-      });
-      return { content: [{ type: "text", text: serializeGameToolResult(result) }], details: result };
+    async execute(
+      _toolCallId,
+      input,
+      signal,
+      _onUpdate,
+      extensionContext: ExtensionContext,
+    ) {
+      return await withProgress(
+        extensionContext.ui,
+        "query",
+        input,
+        async (progress) => {
+          progress.line("提交可见 SQL 查询");
+          signal?.throwIfAborted();
+          const result = await context.requireDriver().query(input.sql, input.revision);
+          await appendEvent(context.store, context.task.id, "game.query", {
+            inputLength: input.sql.length,
+            ok: result.ok,
+            event: result.event,
+          });
+          if (result.ok) {
+            progress.line("查询完成：" + result.event);
+          } else {
+            progress.fail(new Error("查询失败：" + result.event));
+          }
+          return { content: [{ type: "text", text: serializeGameToolResult(result) }], details: result };
+        },
+      );
     },
   });
 }

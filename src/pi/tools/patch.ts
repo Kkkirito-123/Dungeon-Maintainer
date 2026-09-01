@@ -30,6 +30,7 @@ import {
 import { assertWritePathAllowed } from "../../workspace/write-scope.js";
 import { hashWorktree } from "../../workspace/git.js";
 import { resolveProjectPath } from "../../workspace/policy.js";
+import { withProgress } from "../../progress/reporter.js";
 
 const PatchEditParameters = Type.Object({
   mode: Type.Union([
@@ -111,112 +112,122 @@ export function registerEditTool(
     executionMode: "sequential",
     parameters: PatchParameters,
     async execute(_toolCallId, input: EditInput, signal, _onUpdate, extensionContext) {
-      if (!context.isExecutionApproved()) {
-        throw new Error("完整修复方案尚未获用户确认，不能修改代码。");
-      }
-      const reproduction = await readActiveReproduction(
-        context.store,
-        context.evidence,
-        context.task,
-      );
-      let driver = context.currentDriver();
-      if (reproduction && !driver) {
-        throw new Error("活动复现的浏览器会话不可用；先执行 /play 恢复场景");
-      }
-      // 回调会在 workspace 层内部执行；用显式状态盒保留结果，避免把异步回调赋值
-      // 误判成当前作用域中永远不会发生的控制流，同时不把刷新职责泄漏到安全层。
-      const replayState: { current: ReplayResult | null } = { current: null };
-      const scopedInput = {
-        edits: await Promise.all(input.edits.map(async (edit) => {
-          const path = assertWritePathAllowed(context.task, edit.path);
-          if (edit.mode === "replace") {
-            if (edit.content !== undefined || edit.oldText === undefined || edit.newText === undefined) {
-              throw new Error("replace 只接受 oldText 和 newText");
-            }
-            return { path, baseHash: edit.baseHash, oldText: edit.oldText, newText: edit.newText };
+      return await withProgress(
+        extensionContext.ui,
+        "edit",
+        input,
+        async (progress) => {
+          progress.line("检查写入范围和基线");
+          if (!context.isExecutionApproved()) {
+            throw new Error("完整修复方案尚未获用户确认，不能修改代码。");
           }
-          if (edit.oldText !== undefined || edit.newText !== undefined || edit.content === undefined) {
-            throw new Error(`${edit.mode} 只接受 content`);
-          }
-          if (edit.mode === "create") {
-            if (edit.baseHash !== "missing") throw new Error("create 必须使用 missing baseHash");
-            return { path, baseHash: edit.baseHash, oldText: "", newText: edit.content };
-          }
-          if (edit.baseHash === "missing") throw new Error("write 不能用于尚未创建的文件");
-          const target = await resolveProjectPath(context.task.worktreeRoot, path, "write");
-          const oldText = await readFile(target.absolute, "utf8");
-          return { path, baseHash: edit.baseHash, oldText, newText: edit.content };
-        })),
-      };
-      const result = await applyPrecisePatch({
-        task: context.task,
-        store: context.store,
-        evidence: context.evidence,
-        confirmCore: async (paths, changedLines) => {
-          // 总方案确认已经授权当前 Agent 运行完成其中的代码修改。patch 在诊断阶段
-          // 不可见，因此这里无需为同一方案重复打断用户；未获总授权的非标准调用
-          // 仍回退到原有精确核心路径确认。
-          if (context.isExecutionApproved()) return true;
-          return await confirmCorePatch(
-            extensionContext,
+          const reproduction = await readActiveReproduction(
+            context.store,
+            context.evidence,
             context.task,
-            paths,
-            changedLines,
           );
-        },
-        beforePatch: async () => {
-          // 已有复现时必须保留最初检查点，绝不能在症状发生后重新覆盖起点。
-          await driver?.ensureReproductionCheckpoint();
-        },
-        afterPatch: async () => {
-          if (reproduction) {
-            driver ??= await context.ensureGame();
-            const replayHash = await hashWorktree(context.task.worktreeRoot);
-            replayState.current = await replayReproduction(
-              context.store,
-              context.task,
-              driver,
-              reproduction,
-              replayHash,
-            );
-            if (!replayState.current.passed) {
-              throw new Error(
-                "新代码刷新后的复现重放失败："
-                + (replayState.current.failure ?? "未知游戏错误"),
-              );
-            }
+          let driver = context.currentDriver();
+          if (reproduction && !driver) {
+            throw new Error("活动复现的浏览器会话不可用；先执行 /play 恢复场景");
           }
+          progress.line(reproduction ? "保留复现检查点" : "准备补丁");
+          // workspace 回调不返回值，用状态盒把重放结果带回工具响应。
+          const replayState: { current: ReplayResult | null } = { current: null };
+          const scopedInput = {
+            edits: await Promise.all(input.edits.map(async (edit) => {
+              const path = assertWritePathAllowed(context.task, edit.path);
+              if (edit.mode === "replace") {
+                if (edit.content !== undefined || edit.oldText === undefined || edit.newText === undefined) {
+                  throw new Error("replace 只接受 oldText 和 newText");
+                }
+                return { path, baseHash: edit.baseHash, oldText: edit.oldText, newText: edit.newText };
+              }
+              if (edit.oldText !== undefined || edit.newText !== undefined || edit.content === undefined) {
+                throw new Error(`${edit.mode} 只接受 content`);
+              }
+              if (edit.mode === "create") {
+                if (edit.baseHash !== "missing") throw new Error("create 必须使用 missing baseHash");
+                return { path, baseHash: edit.baseHash, oldText: "", newText: edit.content };
+              }
+              if (edit.baseHash === "missing") throw new Error("write 不能用于尚未创建的文件");
+              const target = await resolveProjectPath(context.task.worktreeRoot, path, "write");
+              const oldText = await readFile(target.absolute, "utf8");
+              return { path, baseHash: edit.baseHash, oldText, newText: edit.content };
+            })),
+          };
+          progress.line("写入 detached worktree");
+          const result = await applyPrecisePatch({
+            task: context.task,
+            store: context.store,
+            evidence: context.evidence,
+            confirmCore: async (paths, changedLines) => {
+              // 已批准的方案直接复用授权；其它调用仍走一次性核心确认。
+              if (context.isExecutionApproved()) return true;
+              return await confirmCorePatch(
+                extensionContext,
+                context.task,
+                paths,
+                changedLines,
+              );
+            },
+            beforePatch: async () => {
+              // 已有复现时必须保留最初检查点，绝不能在症状发生后重新覆盖起点。
+              await driver?.ensureReproductionCheckpoint();
+            },
+            afterPatch: async () => {
+              if (reproduction) {
+                progress.line("刷新并重放复现");
+                driver ??= await context.ensureGame();
+                const replayHash = await hashWorktree(context.task.worktreeRoot);
+                replayState.current = await replayReproduction(
+                  context.store,
+                  context.task,
+                  driver,
+                  reproduction,
+                  replayHash,
+                );
+                if (!replayState.current.passed) {
+                  throw new Error(
+                    "新代码刷新后的复现重放失败："
+                    + (replayState.current.failure ?? "未知游戏错误"),
+                  );
+                }
+                progress.line("复现重放通过");
+              }
+            }
+          }, scopedInput, signal);
+          const replay = replayState.current;
+          const details: PatchToolDetails = {
+            ...result,
+            replay: replay ? {
+              passed: replay.passed,
+              actionCount: replay.actionCount,
+              failure: replay.failure,
+            } : null,
+          };
+          await appendEvent(context.store, context.task.id, "game.refresh", {
+            replayed: replay !== null,
+            passed: replay?.passed ?? true,
+            actionCount: replay?.actionCount ?? 0,
+          });
+          progress.line("补丁完成：" + result.paths.join(", "));
+          return {
+            content: [{
+              type: "text",
+              text: [
+                "已在 detached worktree 修改：" + result.paths.join(", "),
+                "正式游戏仓库尚未变化。",
+                replay
+                  ? "右侧游戏已刷新并重放 "
+                    + String(replay.actionCount)
+                    + " 个语义动作。"
+                  : "右侧游戏已加载最新 worktree。",
+              ].join("\n"),
+            }],
+            details,
+          };
         },
-      }, scopedInput, signal);
-      const replay = replayState.current;
-      const details: PatchToolDetails = {
-        ...result,
-        replay: replay ? {
-          passed: replay.passed,
-          actionCount: replay.actionCount,
-          failure: replay.failure,
-        } : null,
-      };
-      await appendEvent(context.store, context.task.id, "game.refresh", {
-        replayed: replay !== null,
-        passed: replay?.passed ?? true,
-        actionCount: replay?.actionCount ?? 0,
-      });
-      return {
-        content: [{
-          type: "text",
-          text: [
-            "已在 detached worktree 修改：" + result.paths.join(", "),
-            "正式游戏仓库尚未变化。",
-            replay
-              ? "右侧游戏已刷新并重放 "
-                + String(replay.actionCount)
-                + " 个语义动作。"
-              : "右侧游戏已加载最新 worktree。",
-          ].join("\n"),
-        }],
-        details,
-      };
+      );
     },
   });
 }

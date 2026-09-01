@@ -18,6 +18,7 @@ import {
   listRepositoryWorktrees,
   type RepositoryWorktreeSummary,
 } from "../../workspace/catalog.js";
+import { withProgress } from "../../progress/reporter.js";
 
 /** `tree` 工具的严格参数。 */
 export const TreeParameters = Type.Object({
@@ -80,51 +81,62 @@ export function registerWorkspaceTool(pi: ExtensionAPI, context: TreeToolContext
     executionMode: "sequential",
     parameters: TreeParameters,
     async execute(_toolCallId, input: TreeInput, signal, _onUpdate, extensionContext: ExtensionContext) {
-      signal?.throwIfAborted();
-      const candidates = await listRepositoryWorktrees(context.task, context.store);
-      if (input.action === "list") {
-        await appendEvent(context.store, context.task.id, "tool.tree_list", {
-          count: candidates.length,
-        });
-        return {
-          content: [{
-            type: "text",
-            text: candidates.length > 0
-              ? candidates.map((candidate) => [
-                "TREE " + candidate.id,
-                "branch=" + candidate.branch,
-                "dirtyFiles=" + String(candidate.dirtyFiles),
-                "current=" + String(candidate.current),
-              ].join(" ")).join("\n")
-              : "没有可切换的 SQL Dungeon 本地工作树",
-          }],
-          details: candidates.map((candidate) => ({
-            id: candidate.id,
-            branch: candidate.branch,
-            dirtyFiles: candidate.dirtyFiles,
-            current: candidate.current,
-          })),
-        };
-      }
-      if (!input.treeId) throw new Error("switch 必须提供 list 返回的 treeId");
-      const target = candidates.find((candidate) => candidate.id === input.treeId);
-      if (!target) throw new Error("treeId 不属于当前可切换工作树列表");
-      if (target.current) throw new Error("目标已经是当前来源工作树");
-      const confirmed = await extensionContext.ui.confirm(
-        "切换 SQL Dungeon 工作树",
-        "将结束当前运行时并创建新任务。目标分支：" + target.branch
-        + "；本地修改文件：" + String(target.dirtyFiles),
+      return await withProgress(
+        extensionContext.ui,
+        "workspace",
+        input,
+        async (progress) => {
+          signal?.throwIfAborted();
+          progress.line("枚举可用工作树");
+          const candidates = await listRepositoryWorktrees(context.task, context.store);
+          if (input.action === "list") {
+            await appendEvent(context.store, context.task.id, "tool.tree_list", {
+              count: candidates.length,
+            });
+            progress.line("找到 " + String(candidates.length) + " 个工作树");
+            return {
+              content: [{
+                type: "text",
+                text: candidates.length > 0
+                  ? candidates.map((candidate) => [
+                    "TREE " + candidate.id,
+                    "branch=" + candidate.branch,
+                    "dirtyFiles=" + String(candidate.dirtyFiles),
+                    "current=" + String(candidate.current),
+                  ].join(" ")).join("\n")
+                  : "没有可切换的 SQL Dungeon 本地工作树",
+              }],
+              details: candidates.map((candidate) => ({
+                id: candidate.id,
+                branch: candidate.branch,
+                dirtyFiles: candidate.dirtyFiles,
+                current: candidate.current,
+              })),
+            };
+          }
+          if (!input.treeId) throw new Error("switch 必须提供 list 返回的 treeId");
+          const target = candidates.find((candidate) => candidate.id === input.treeId);
+          if (!target) throw new Error("treeId 不属于当前可切换工作树列表");
+          if (target.current) throw new Error("目标已经是当前来源工作树");
+          progress.line("等待确认切换到 " + target.branch);
+          const confirmed = await extensionContext.ui.confirm(
+            "切换 SQL Dungeon 工作树",
+            "将结束当前运行时并创建新任务。目标分支：" + target.branch
+            + "；本地修改文件：" + String(target.dirtyFiles),
+          );
+          if (!confirmed) throw new Error("用户取消切换工作树");
+          await appendEvent(context.store, context.task.id, "tool.tree_switch", {
+            treeId: target.id,
+            dirtyFiles: target.dirtyFiles,
+          });
+          progress.line("请求 AppController 切换工作树");
+          await requestControllerSwitch(target);
+          return {
+            content: [{ type: "text", text: "已确认切换；AppController 将先停止当前 Pi，再启动目标任务和右侧游戏。" }],
+            details: { treeId: target.id, branch: target.branch },
+          };
+        },
       );
-      if (!confirmed) throw new Error("用户取消切换工作树");
-      await appendEvent(context.store, context.task.id, "tool.tree_switch", {
-        treeId: target.id,
-        dirtyFiles: target.dirtyFiles,
-      });
-      await requestControllerSwitch(target);
-      return {
-        content: [{ type: "text", text: "已确认切换；AppController 将先停止当前 Pi，再启动目标任务和右侧游戏。" }],
-        details: { treeId: target.id, branch: target.branch },
-      };
     },
   });
 }
