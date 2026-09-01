@@ -11,6 +11,7 @@ import { appendEvent } from "../../logging/events.js";
 import type { TaskStore } from "../../task/store.js";
 import type { TaskRecord } from "../../task/types.js";
 import { readTaskDiff } from "../../workspace/apply.js";
+import { withProgress } from "../../progress/reporter.js";
 
 /** `/diff` 所需的当前任务依赖。 */
 export interface DiffCommandContext {
@@ -35,16 +36,25 @@ export function registerDiffCommand(
         commandContext.ui.notify("/diff 不接受参数", "warning");
         return;
       }
-      const diff = await readTaskDiff(context.task);
-      await appendEvent(context.store, context.task.id, "command.diff", {
-        bytes: Buffer.byteLength(diff, "utf8"),
-      });
-      if (!diff) {
-        commandContext.ui.notify("当前 worktree 没有代码变化", "info");
-        return;
-      }
-      // Pi 的 editor 是现成的大文本查看面；返回正文被有意忽略，不能借此修改文件。
-      await commandContext.ui.editor("当前 worktree Diff（关闭即可）", diff);
+      await withProgress(
+        commandContext.ui,
+        "diff",
+        undefined,
+        async (progress) => {
+          progress.line("读取 detached worktree Diff");
+          const diff = await readTaskDiff(context.task);
+          await appendEvent(context.store, context.task.id, "command.diff", {
+            bytes: Buffer.byteLength(diff, "utf8"),
+          });
+          if (!diff) {
+            commandContext.ui.notify("当前 worktree 没有代码变化", "info");
+            return;
+          }
+          progress.line("打开 Diff 查看器");
+          // Pi 的 editor 是现成的大文本查看面；返回正文被有意忽略，不能借此修改文件。
+          await commandContext.ui.editor("当前 worktree Diff（关闭即可）", diff);
+        },
+      );
     },
   });
 }

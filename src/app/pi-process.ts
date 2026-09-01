@@ -154,7 +154,20 @@ export class AppController {
       readEvidenceSnapshot: async () => (
         await buildEvidenceSnapshot(new EvidenceStore(this.config.dataDir, this.activeTask))
       ),
-      sendPiCommand: async (command: AgentRpcCommand) => await this.send(command),
+      sendPiCommand: async (command: AgentRpcCommand) => {
+        const result = await this.send(command);
+        // 扩展命令在 Pi 内部等待 handler 完成后才返回 response；普通 prompt 仍等待 agent_settled。
+        if (
+          command.type === "prompt"
+          && typeof command.message === "string"
+          && command.message.trim().startsWith("/")
+        ) {
+          this.shell?.settleCommand();
+          const updated = await this.store.read(this.activeTask.id);
+          if (updated.state === "discarded") void this.close(0);
+        }
+        return result;
+      },
       onSwitchTask: async (request) => await this.switchTask(request),
       onClose: async () => await this.close(0),
     });

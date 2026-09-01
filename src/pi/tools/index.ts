@@ -15,6 +15,7 @@ import type { EvidenceStore } from "../../evidence/store.js";
 import type { TaskStore } from "../../task/store.js";
 import type { TaskRecord } from "../../task/types.js";
 import type { VerificationResult } from "../../repair/verification.js";
+import type { ProgressLine } from "../../progress/reporter.js";
 import { registerCheckTool } from "./check.js";
 import { registerFinishTool } from "./finish.js";
 import { registerGameTools } from "./game.js";
@@ -39,8 +40,8 @@ export interface MaintainerToolContext {
   isExecutionApproved(): boolean;
   /** 当前自然语言请求是否明确要求落地修复。 */
   repairRequested(): boolean;
-  /** 对当前 worktree 自动执行固定检查、重放和隐藏断言。 */
-  verifyTask(signal?: AbortSignal): Promise<VerificationResult>;
+  /** 对当前 worktree 运行直接改动检查、重放和隐藏断言。 */
+  verifyTask(signal?: AbortSignal, onProgress?: ProgressLine): Promise<VerificationResult>;
 }
 
 /**

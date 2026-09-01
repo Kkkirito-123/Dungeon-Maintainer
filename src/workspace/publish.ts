@@ -16,6 +16,7 @@ import { appendEvent } from "../logging/events.js";
 import { redactText } from "../logging/redact.js";
 import type { TaskStore } from "../task/store.js";
 import type { TaskRecord } from "../task/types.js";
+import type { ProgressLine } from "../progress/reporter.js";
 import {
   hashBytes,
   hashFile,
@@ -70,6 +71,8 @@ export interface PublishTaskOptions {
   runGh?: (cwd: string, args: readonly string[]) => Promise<string>;
   /** 测试替换固定 Git 调用；生产环境始终使用 workspace/git.ts。 */
   runGit?: (cwd: string, args: readonly string[]) => Promise<string>;
+  /** 仅用于实时 UI；不会写入任务或事件记录。 */
+  progress?: ProgressLine;
 }
 
 function oneLine(value: string, limit: number): string {
@@ -360,9 +363,13 @@ export async function publishTask(
 ): Promise<PublishResult | null> {
   const { task, taskDir, signal } = options;
   const git = options.runGit ?? runGit;
+  const progress = options.progress;
+  progress?.("生成发布预览");
   const preview = await createPublishPreview(task, taskDir);
+  progress?.("等待确认：" + String(preview.changedPaths.length) + " 个变更文件");
   const approved = await options.confirm(preview);
   if (!approved) {
+    progress?.("用户取消发布");
     await appendEvent(options.store, task.id, "publish.cancelled", {
       pathCount: preview.changedPaths.length,
     }).catch(() => undefined);
@@ -373,12 +380,18 @@ export async function publishTask(
   let worktreeCreated = false;
   try {
     signal?.throwIfAborted();
+    progress?.("确认后重新校验任务快照");
     const confirmedPreview = await createPublishPreview(task, taskDir);
     if (previewKey(confirmedPreview) !== previewKey(preview)) {
       throw new Error("确认后任务内容发生变化，请重新打开发布预览");
     }
-    if (options.runChecks) await options.runChecks();
+    if (options.runChecks) {
+      progress?.("运行发布前完整质量门");
+      await options.runChecks();
+      progress?.("完整质量门通过");
+    }
     signal?.throwIfAborted();
+    progress?.("再次校验质量门后的任务快照");
     const checkedPreview = await createPublishPreview(task, taskDir);
     if (previewKey(checkedPreview) !== previewKey(preview)) {
       throw new Error("质量检查后任务内容发生变化，请重新打开发布预览");
@@ -387,6 +400,7 @@ export async function publishTask(
       branch: preview.branch,
       pathCount: preview.changedPaths.length,
     }).catch(() => undefined);
+    progress?.("检查远端发布分支");
     await assertRemoteBranchAbsent(task, preview.branch, git);
 
     publishRoot = join(taskDir, PUBLISH_WORKTREE_NAME);
@@ -394,15 +408,18 @@ export async function publishTask(
       throw new Error("上一次发布留下了临时 worktree，请先人工清理：" + publishRoot);
     }
     await mkdir(taskDir, { recursive: true });
+    progress?.("创建临时发布 worktree");
     await git(task.repoRoot, ["worktree", "add", "--detach", publishRoot, task.baseHead]);
     worktreeCreated = true;
     const patchPath = join(taskDir, "patch.diff");
+    progress?.("应用并校验补丁");
     await git(publishRoot, ["apply", "--binary", "--check", "--", patchPath]);
     await git(publishRoot, ["apply", "--binary", "--", patchPath]);
     const appliedPaths = await worktreeChangedPaths(publishRoot);
     if (!samePaths(appliedPaths, preview.changedPaths)) {
       throw new Error("发布补丁包含未预览的文件变化");
     }
+    progress?.("创建发布分支并暂存变更");
     await git(publishRoot, ["switch", "-c", preview.branch]);
     await git(publishRoot, ["add", "--", ...preview.changedPaths]);
     const staged = parseNames(await runGitRaw(
@@ -412,10 +429,13 @@ export async function publishTask(
     if (!samePaths(staged, preview.changedPaths)) {
       throw new Error("暂存区包含未预览的文件变化");
     }
+    progress?.("提交发布分支");
     await git(publishRoot, ["commit", "-m", preview.commitTitle]);
     const commitSha = await git(publishRoot, ["rev-parse", "HEAD"]);
+    progress?.("推送发布分支");
     await git(publishRoot, ["push", "--set-upstream", "origin", preview.branch]);
     const gh = options.runGh ?? runGitHubCli;
+    progress?.("创建 GitHub PR");
     const ghOutput = await gh(publishRoot, [
       "pr",
       "create",
@@ -438,14 +458,17 @@ export async function publishTask(
       prUrl,
       pathCount: preview.changedPaths.length,
     }).catch(() => undefined);
+    progress?.("PR 创建成功：" + prUrl);
     return { ...preview, commitSha, prUrl };
   } catch (error) {
+    progress?.("发布失败：" + safeFailure(error));
     await appendEvent(options.store, task.id, "publish.failed", {
       reason: safeFailure(error),
     }).catch(() => undefined);
     throw new Error("发布 PR 失败：" + safeFailure(error), { cause: error });
   } finally {
     if (publishRoot && (worktreeCreated || await pathExists(publishRoot))) {
+      progress?.("清理临时发布 worktree");
       await git(task.repoRoot, ["worktree", "remove", "--force", publishRoot])
         .catch(async (error: unknown) => {
           await appendEvent(options.store, task.id, "publish.cleanup_failed", {

@@ -119,7 +119,7 @@ A standard repair follows this loop:
 3. Before the first `edit`, the Shell shows the exact file scope. When a complete plan is needed, it also shows the cause, steps, and verification method.
 4. After a write, the maintainer waits for Vite, refreshes the page, restores the checkpoint, and replays the same semantic actions.
 5. `/verify` runs only directly changed tests and required architecture checks, then restores the reproduction and seals the patch.
-6. Before writing back, `/apply` runs the full quality gates selected by the change scope and checks source drift, target Hashes, and `git apply --check`. It writes only the agent delta.
+6. `/apply` checks the verified worktree Hash, source drift, target Hashes, and `git apply --check`, then writes only the agent delta. Full quality gates run only before `publish`.
 7. When the user explicitly requests publication, `publish` creates a temporary publish worktree from the verified patch and opens a PR after confirmation. The user always controls merging.
 
 ## 🚀 Quick Start

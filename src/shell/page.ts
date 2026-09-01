@@ -35,7 +35,7 @@ export function renderShellPage(): string {
     #abort-button:disabled { cursor: wait; opacity: .58; }
     main { min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-columns: minmax(320px, 42%) 6px minmax(420px, 1fr); }
     section { min-width: 0; min-height: 0; }
-    #chat-panel { overflow: hidden; display: grid; grid-template-rows: minmax(0, 1fr) auto auto 52px; background: #111827; }
+    #chat-panel { overflow: hidden; display: grid; grid-template-rows: minmax(0, 1fr) auto auto auto 52px; background: #111827; }
     #messages { min-height: 0; overflow: auto; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
     .message { white-space: pre-wrap; overflow-wrap: anywhere; border-radius: 7px; padding: 9px 11px; line-height: 1.45; max-width: 96%; }
     .message.user { align-self: flex-end; background: #1d4ed8; }
@@ -48,6 +48,10 @@ export function renderShellPage(): string {
     .evidence-group { margin-top: 5px; color: #94a3b8; font-size: 11px; }
     .evidence-row { padding: 4px 0; border-top: 1px solid #1e293b; white-space: pre-wrap; overflow-wrap: anywhere; color: #cbd5e1; font-size: 11px; }
     .evidence-row.stale, .evidence-row.superseded { color: #64748b; }
+    #progress-panel { margin: 0 10px 6px; border: 1px solid #334155; border-radius: 5px; background: #0b1220; max-height: 24vh; overflow: hidden; }
+    #progress-panel summary { cursor: pointer; padding: 6px 8px; color: #93c5fd; font-size: 12px; }
+    #progress-status { margin-left: 8px; color: #cbd5e1; }
+    #progress-log { max-height: 18vh; overflow: auto; margin: 0; padding: 0 8px 7px; color: #cbd5e1; font: 11px/1.4 Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
     #activity { min-height: 38px; display: flex; align-items: center; gap: 9px; padding: 8px 12px; border-top: 1px solid #263247; background: #0b1220; color: #bfdbfe; font-size: 12px; }
     #activity[hidden] { display: none; }
     #activity.error { color: #fca5a5; background: #1f151c; }
@@ -112,11 +116,12 @@ export function renderShellPage(): string {
       <section id="chat-panel" aria-label="Pi CLI 聊天">
         <div id="messages" aria-live="polite"></div>
         <details id="evidence-panel" open><summary>证据链</summary><div id="evidence-list"><div class="evidence-group">等待证据…</div></div></details>
+        <details id="progress-panel"><summary>执行进度<span id="progress-status"></span></summary><pre id="progress-log"></pre></details>
         <div id="activity" role="status" aria-live="polite" aria-atomic="true" hidden><span class="activity-dot" aria-hidden="true"></span><span id="activity-text"></span><span id="activity-time"></span></div>
         <form id="input-form"><input id="input" autocomplete="off" placeholder="描述问题，或输入 /play、/verify…"><button type="submit">发送</button></form>
       </section>
       <div id="splitter" role="separator" aria-label="调整聊天和游戏宽度" aria-valuemin="25" aria-valuemax="70" aria-valuenow="42" tabindex="0"></div>
-      <section id="game-panel" aria-label="游戏实机"><div id="game-state">等待游戏开发桥…</div><div id="game-empty">正在等待 worktree 中的游戏启动</div><iframe id="game-frame" title="SQL Dungeon 游戏实机" allow="autoplay" hidden></iframe></section>
+      <section id="game-panel" aria-label="游戏实机"><div id="game-state">游戏准备中…</div><div id="game-empty">正在启动隔离工作区中的游戏</div><iframe id="game-frame" title="SQL Dungeon 游戏实机" allow="autoplay" hidden></iframe></section>
     </main>
     <footer id="status-bar"><div id="status-primary" class="status-row" aria-label="任务状态第一排"></div><div id="status-secondary" class="status-row" aria-label="运行状态第二排"></div></footer>
   </div>
@@ -130,6 +135,9 @@ export function renderShellPage(): string {
       const endpoint = (path) => path + '?taskId=' + encodeURIComponent(taskId) + '&token=' + encodeURIComponent(token);
       const messages = document.getElementById('messages');
       const evidenceList = document.getElementById('evidence-list');
+      const progressPanel = document.getElementById('progress-panel');
+      const progressStatus = document.getElementById('progress-status');
+      const progressLog = document.getElementById('progress-log');
       const input = document.getElementById('input');
       const form = document.getElementById('input-form');
       const sendButton = form.querySelector('button[type="submit"]');
@@ -152,6 +160,7 @@ export function renderShellPage(): string {
       let activityHideTimer = null;
       let currentStatus = null;
       let requestBusy = false;
+      let commandInFlight = false;
       let abortRequested = false;
       const toolGroups = new Map();
 
@@ -390,12 +399,17 @@ export function renderShellPage(): string {
         activityTime.textContent = event.elapsedSeconds > 0 ? String(event.elapsedSeconds) + 's' : '';
         const busy = event.state === 'waiting' || event.state === 'working' || event.state === 'approval';
         requestBusy = busy;
-        if (!busy) abortRequested = false;
-        input.disabled = false;
-        sendButton.disabled = abortRequested;
+        if (!busy) {
+          abortRequested = false;
+          commandInFlight = false;
+        }
+        input.disabled = busy && commandInFlight;
+        sendButton.disabled = abortRequested || (busy && commandInFlight);
         abortButton.hidden = !busy;
         abortButton.disabled = !busy || abortRequested;
-        input.placeholder = busy ? '追加文字要求，或点击“停止本轮”…' : '描述问题，或输入 /play、/verify…';
+        input.placeholder = !busy
+          ? '描述问题，或输入 /play、/verify…'
+          : commandInFlight ? '固定命令执行中，请等待完成…' : '追加文字要求，或点击“停止本轮”…';
         input.setAttribute('aria-busy', String(busy));
         if (event.state === 'done') {
           activityHideTimer = setTimeout(() => { activity.hidden = true; input.focus(); }, 1_500);
@@ -511,6 +525,7 @@ export function renderShellPage(): string {
         const path = requestBusy
           ? '/api/steer'
           : text.startsWith('/') ? '/api/command' : '/api/input';
+        commandInFlight = path === '/api/command';
         // 本地先锁定输入并显示固定反馈，不等待 POST 往返或模型首个 Token；服务端
         // activity 随后接管权威阶段和 elapsed 更新。
         showActivity({
@@ -519,6 +534,7 @@ export function renderShellPage(): string {
           elapsedSeconds: 0
         });
         void send(path, { text }).catch((error) => {
+          if (!busyAtSubmit && path === '/api/command') commandInFlight = false;
           const stillBusy = busyAtSubmit || error.status === 409;
           showActivity({ state: stillBusy ? 'waiting' : 'error', text: error.message, elapsedSeconds: 0 });
           showNotice(stillBusy ? 'warning' : 'error', error.message);
@@ -565,6 +581,12 @@ export function renderShellPage(): string {
         }
         else if (data.type === 'chat.tool') showTool(data);
         else if (data.type === 'evidence.snapshot') renderEvidence(data);
+        else if (data.type === 'progress' && data.key === 'maintainer-progress') {
+          progressStatus.textContent = data.text || '';
+          progressLog.textContent = Array.isArray(data.lines) ? data.lines.join('\\n') : '';
+          progressLog.scrollTop = progressLog.scrollHeight;
+          progressPanel.open = Boolean(data.text);
+        }
         else if (data.type === 'activity') showActivity(data);
         else if (data.type === 'notice') showNotice(data.level, data.text);
         else if (data.type === 'approval') showApproval(data.request);

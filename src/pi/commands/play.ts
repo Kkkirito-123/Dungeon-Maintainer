@@ -14,6 +14,7 @@ import { appendEvent } from "../../logging/events.js";
 import { readActiveReproduction } from "../../repair/reproduction.js";
 import type { TaskStore } from "../../task/store.js";
 import type { TaskRecord } from "../../task/types.js";
+import { withProgress } from "../../progress/reporter.js";
 
 /** `/play` 所需的任务和浏览器访问器。 */
 export interface PlayCommandContext {
@@ -40,38 +41,53 @@ export function registerPlayCommand(
         commandContext.ui.notify("/play 不接受参数", "warning");
         return;
       }
-      const driver = await context.ensureGame();
-      const reproduction = await readActiveReproduction(
-        context.store,
-        context.evidence,
-        context.task,
+      await withProgress(
+        commandContext.ui,
+        "play",
+        undefined,
+        async (progress) => {
+          progress.line("启动并聚焦游戏");
+          const driver = await context.ensureGame();
+          const reproduction = await readActiveReproduction(
+            context.store,
+            context.evidence,
+            context.task,
+          );
+          if (reproduction) {
+            progress.line("恢复检查点并重放复现");
+            await driver.focus();
+            // 同一浏览器会话中保留最初检查点；恢复任务时浏览器是新的，才以相同
+            // 初始页面补建检查点。绝不能在症状状态覆盖原复现起点。
+            await driver.ensureReproductionCheckpoint();
+            const replay = await driver.reloadAndReplay(reproduction.actions);
+            if (!replay.passed) {
+              progress.fail(new Error("复现重放失败：" + (replay.failure ?? "未知错误")));
+            } else {
+              progress.line("复现重放通过，共 " + String(replay.actionCount) + " 个动作");
+            }
+            await appendEvent(context.store, context.task.id, "command.play", {
+              reproductionId: reproduction.id,
+              passed: replay.passed,
+              actionCount: replay.actionCount,
+            });
+            commandContext.ui.notify(
+              replay.passed
+                ? "游戏已聚焦并重放 " + String(replay.actionCount) + " 个动作"
+                : "复现重放失败：" + (replay.failure ?? "未知错误"),
+              replay.passed ? "info" : "error",
+            );
+            return;
+          }
+          progress.line("建立新的复现起点");
+          await driver.focusAndRestart();
+          await appendEvent(context.store, context.task.id, "command.play", {
+            reproductionId: null,
+            passed: true,
+            actionCount: 0,
+          });
+          commandContext.ui.notify("游戏已聚焦，并建立新的复现起点", "info");
+        },
       );
-      if (reproduction) {
-        await driver.focus();
-        // 同一浏览器会话中保留最初检查点；恢复任务时浏览器是新的，才以相同
-        // 初始页面补建检查点。绝不能在症状状态覆盖原复现起点。
-        await driver.ensureReproductionCheckpoint();
-        const replay = await driver.reloadAndReplay(reproduction.actions);
-        await appendEvent(context.store, context.task.id, "command.play", {
-          reproductionId: reproduction.id,
-          passed: replay.passed,
-          actionCount: replay.actionCount,
-        });
-        commandContext.ui.notify(
-          replay.passed
-            ? "游戏已聚焦并重放 " + String(replay.actionCount) + " 个动作"
-            : "复现重放失败：" + (replay.failure ?? "未知错误"),
-          replay.passed ? "info" : "error",
-        );
-        return;
-      }
-      await driver.focusAndRestart();
-      await appendEvent(context.store, context.task.id, "command.play", {
-        reproductionId: null,
-        passed: true,
-        actionCount: 0,
-      });
-      commandContext.ui.notify("游戏已聚焦，并建立新的复现起点", "info");
     },
   });
 }

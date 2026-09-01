@@ -273,7 +273,7 @@ export function verificationEvidence(
     actionKey: null,
     fingerprint: digest(record),
     status: "active",
-    summary: "固定验证通过；检查 " + record.checkIds.join(", "),
+    summary: "轻量验证通过；检查 " + record.checkIds.join(", "),
     artifactRef: null,
     path: null,
     startLine: null,
