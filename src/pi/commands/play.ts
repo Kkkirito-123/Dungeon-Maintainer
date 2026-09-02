@@ -16,7 +16,12 @@ import type { TaskStore } from "../../task/store.js";
 import type { TaskRecord } from "../../task/types.js";
 import { withProgress } from "../../progress/reporter.js";
 
-/** `/play` 所需的任务和浏览器访问器。 */
+/**
+ * `/play` 所需的任务、Evidence 和浏览器访问器。
+ *
+ * `ensureGame` 必须复用当前任务唯一的 GameRuntime；EvidenceStore 只用于读取该任务的活动
+ * 复现，不能从其它任务加载 Trace 或正式存档。
+ */
 export interface PlayCommandContext {
   task: TaskRecord;
   store: TaskStore;
@@ -29,6 +34,9 @@ export interface PlayCommandContext {
  *
  * @param pi 当前 Extension API。
  * @param context 当前任务与单浏览器生命周期。
+ * @returns 无返回值；处理器聚焦临时浏览器，并重放活动复现或建立新的复现起点。
+ * @throws 注册冲突时同步抛错；执行时传播浏览器启动、检查点恢复、桥协议和重放错误。
+ * @remarks 命令不接收导航或脚本参数，不修改源码、验证记录或正式游戏数据。
  */
 export function registerPlayCommand(
   pi: ExtensionAPI,
@@ -79,6 +87,8 @@ export function registerPlayCommand(
             return;
           }
           progress.line("建立新的复现起点");
+          // 没有活动复现时才重启并建立起点；已有复现必须保留原检查点，否则会把症状
+          // 发生后的页面状态误当成后续修复的重放基线。
           await driver.focusAndRestart();
           await appendEvent(context.store, context.task.id, "command.play", {
             reproductionId: null,

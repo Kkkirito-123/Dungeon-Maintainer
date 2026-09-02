@@ -30,25 +30,39 @@ import { ToolSafetyGate } from "./tool-safety-gate.js";
 import { registerMaintainerTools } from "./tools/index.js";
 
 interface DungeonGameRuntimePort {
+  /** 返回已经启动的驱动；尚未启动时不产生副作用。 */
   currentDriver(): GameDriver | null;
+  /** 返回已经启动的驱动；缺失时抛错，避免工具悄悄创建第二套运行时。 */
   requireDriver(): GameDriver;
+  /** 按需启动并返回当前任务唯一的游戏驱动。 */
   ensure(): Promise<GameDriver>;
+  /** 关闭当前任务持有的 Vite、Chromium Context 和驱动。 */
   close(): Promise<void>;
 }
 
 /** Extension 安装所需的已验证任务事实。 */
 export interface DungeonExtensionOptions {
+  /** Provider、模型和本地数据目录配置。 */
   config: MaintainerConfig;
+  /** 当前任务状态的唯一持久化入口。 */
   store: TaskStore;
+  /** 已由父进程绑定到 taskId、session 和 detached worktree 的任务记录。 */
   task: TaskRecord;
   /** 测试可注入不启动外部进程的同契约运行时；生产环境始终使用真实运行时。 */
   gameRuntime?: DungeonGameRuntimePort;
   /** 测试可注入确定性验证器；生产环境始终调用 repair/verification。 */
   verifyTask?: (signal?: AbortSignal, onProgress?: ProgressLine) => Promise<VerificationResult>;
+  /** 测试或 Eval 可注入与同一数据目录绑定的证据存储；生产环境按 task 创建。 */
   evidenceStore?: EvidenceStore;
 }
 
-/** 注册 `.env` 指定的唯一 OpenAI-compatible 模型。 */
+/**
+ * 注册 `.env` 指定的唯一 OpenAI-compatible 模型。
+ *
+ * @param pi 当前 Extension API。
+ * @param config 已完成 URL、模型和 Token 上限校验的维护器配置。
+ * @remarks API Key 以环境变量引用注册，不把密钥正文放入模型定义或会话记录。
+ */
 function registerProviders(
   pi: ExtensionAPI,
   config: MaintainerConfig,
@@ -73,7 +87,16 @@ function registerProviders(
 /**
  * 把固定任务安装到当前 Pi Extension API。
  *
- * 注册阶段不启动外部进程；游戏由 request lifecycle 在 session_start 时惰性启动。
+ * 调用关系为：Pi 触发 hook -> 请求生命周期处理目标与收权 -> 写入协调器校验 edit ->
+ * 九个固定工具访问同一份 task/store/gameRuntime。Extension 只连接这些能力，不在 hook
+ * 中实现第二套模型调度。
+ *
+ * @param pi 当前唯一 Pi 进程提供的 Extension API。
+ * @param options 已验证任务及其唯一运行依赖；测试替身也必须遵守相同边界。
+ * @returns 注册完成后无返回值；长期资源由 session_start 按需启动。
+ * @throws Provider、工具或 hook 同步注册失败时抛错。
+ * @remarks 注册阶段不启动外部进程；游戏由 request lifecycle 在 session_start 时惰性
+ * 启动。后续 session_start 若发现任务绑定漂移，会由对应 hook 抛错并阻止会话继续。
  */
 export function installDungeonMaintainerExtension(
   pi: ExtensionAPI,
@@ -98,6 +121,8 @@ export function installDungeonMaintainerExtension(
     );
   });
 
+  // 这是当前 Extension 进程内的快速门禁，不是授权权威。精确 allowedPaths 仍由
+  // TaskStore.writeScope 持久化，且 session_start、自然语言新请求和 agent_settled 都会收权。
   let executionApproved = false;
   const setExecutionApproved = (approved: boolean): void => {
     executionApproved = approved;
@@ -125,6 +150,7 @@ export function installDungeonMaintainerExtension(
     setExecutionApproved,
     clearWriteAttributions: () => nativeWrite.clearRequestAttributions(),
   });
+  // 所有工具共享同一组闭包，避免任一工具自行创建 TaskStore 或 GameDriver 后形成状态分叉。
   const sharedContext = {
     task,
     store,
@@ -179,7 +205,13 @@ export function installDungeonMaintainerExtension(
 /** 公开会话绑定断言，供安全测试和需要审计 Pi 上下文的调用方使用。 */
 export { assertTaskSessionBinding };
 
-/** Pi `-e` 参数加载的默认 Extension Factory。 */
+/**
+ * Pi `-e` 参数加载的默认 Extension Factory。
+ *
+ * @param pi Pi CLI 为当前进程创建的 Extension API。
+ * @returns 读取并验证任务后完成同步注册；游戏仍等待 session_start 才启动。
+ * @throws 缺少 API Key、taskId，或任务记录不存在/损坏时阻止 Pi 会话启动。
+ */
 export default async function dungeonMaintainerExtension(
   pi: ExtensionAPI,
 ): Promise<void> {

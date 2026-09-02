@@ -1,9 +1,13 @@
 /**
- * Pi `evidence` 固定证据回读工具。
+ * 当前任务 Evidence 的受限查询适配层。
  *
- * 本工具只查询当前任务 EvidenceStore 的低敏投影，不执行源码搜索、检查或写入。
+ * 正式九工具协议通过 `inspect(evidence_list/evidence_get)` 复用本文件的执行器，不会额外
+ * 注册第十个模型工具；独立注册函数只为需要相同契约的内部调用保留。本层只查询当前任务
+ * EvidenceStore 的低敏投影，不执行源码搜索、检查或写入。
  * `list` 用于按状态和类型定位证据 ID；`get` 返回单节点关系和经目录白名单、realpath、
- * 二次脱敏及 4 KiB 限制处理后的工件尾部，不能读取其它任务数据。
+ * 二次脱敏及 4 KiB 限制处理后的工件尾部，不能读取其它任务数据。输入是模型提供的
+ * 查询条件，输出是可展示文本和结构化详情；唯一副作用是追加不含工件正文的审计事件。
+ * Evidence 目录缺失、ID 越界或取消会显式失败，调用方可重新 list 后定向读取。
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -50,9 +54,15 @@ export const EvidenceParameters = Type.Object({
   evidenceId: Type.Optional(Type.String({ pattern: "^[a-f0-9]{16}$" })),
 }, { additionalProperties: false });
 
+/** `EvidenceParameters` 对应的已校验 TypeScript 输入；执行前仍会校验 action 专属字段。 */
 export type EvidenceInput = Static<typeof EvidenceParameters>;
 
-/** 注册证据工具所需的当前任务依赖。 */
+/**
+ * 证据查询所需的当前任务依赖。
+ *
+ * `task` 提供唯一任务身份，`store` 只记录低敏调用事件，`evidence` 只允许访问该任务的
+ * 证据目录。三者必须由同一个 Extension 生命周期创建。
+ */
 export interface EvidenceToolContext {
   task: TaskRecord;
   store: TaskStore;
@@ -76,7 +86,16 @@ function nodeText(node: EvidenceNode): string {
     + "\n" + node.summary;
 }
 
-/** 供统一 inspect 工具复用的当前任务证据查询。 */
+/**
+ * 查询当前任务的证据列表或单条安全详情。
+ *
+ * @param context 与当前 taskId 绑定的 EvidenceStore 及任务依赖。
+ * @param input 已通过根对象 Schema 校验的 list/get 请求。
+ * @param signal 可选取消信号；开始访问存储前立即检查。
+ * @returns Pi 工具响应形状；正文是低敏投影，details 供 inspect 复用和事件统计。
+ * @throws action 专属字段组合无效、证据 ID 不属于当前任务、工件读取失败或请求已取消时抛错。
+ * @remarks 本函数不创建或更新 Evidence 节点，也不会读取白名单以外的工件路径。
+ */
 export async function executeEvidenceQuery(
   context: EvidenceToolContext,
   input: EvidenceInput,
@@ -128,7 +147,16 @@ export async function executeEvidenceQuery(
   };
 }
 
-/** 向单个 Pi 会话注册受限证据回读工具。 */
+/**
+ * 向单个 Pi 会话独立注册受限证据回读工具。
+ *
+ * @param pi 当前 Extension API。
+ * @param context 与单个 taskId 绑定的只读证据依赖。
+ * @returns 无返回值；注册后执行结果由 `executeEvidenceQuery` 生成。
+ * @throws 工具名冲突时同步抛错；查询错误和取消在具体工具调用中向 Pi 返回失败。
+ * @remarks 正式 Maintainer 装配不会调用本函数，而由 `inspect` 直接复用执行器；成功查询后
+ * 只记录 action、数量和 revision，不把证据正文复制进事件日志。
+ */
 export function registerEvidenceTool(
   pi: ExtensionAPI,
   context: EvidenceToolContext,
@@ -148,6 +176,8 @@ export function registerEvidenceTool(
     parameters: EvidenceParameters,
     async execute(_toolCallId, input: EvidenceInput, signal) {
       const output = await executeEvidenceQuery(context, input, signal);
+      // 事件只保留可聚合的标量。证据摘要和工件正文已经受各自存储边界管理，不能在
+      // events.jsonl 中再次持久化，以免日志绕过脱敏和 4 KiB 读取限制。
       await appendEvent(context.store, context.task.id, "tool.evidence", {
         action: input.action,
         count: Array.isArray(output.details.records) ? output.details.records.length : 0,

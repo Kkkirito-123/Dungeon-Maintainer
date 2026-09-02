@@ -4,7 +4,10 @@
  * 本文件只把用户明确要求的“提交 PR”连接到 workspace/publish；模型不能传命令、路径、
  * 分支、远端或合并选项。执行层先生成固定中文预览并等待确认，再运行发布前质量门、
  * commit、push 和 gh pr create。取消、验证失败或网络失败都不会触碰正式工作区，
- * 合并始终由用户在 GitHub 手动完成。
+ * 合并始终由用户在 GitHub 手动完成。输入固定为空对象，输出仅包含仓库、分支、提交和
+ * PR 地址等发布事实；凭据、命令输出和远端响应正文不会写入模型结果或事件日志。
+ * 临时发布 worktree 由 workspace 层尽力清理；如果 push 成功后创建 PR 失败，远端分支
+ * 可能保留，执行层会明确报错并阻止同名分支被静默覆盖，需检查远端后再处理。
  */
 
 import type {
@@ -26,10 +29,20 @@ import {
 } from "../../workspace/check.js";
 import { withProgress } from "../../progress/reporter.js";
 
-/** `publish` 不接受任何模型可控参数。 */
+/**
+ * `publish` 的空参数契约。
+ *
+ * 仓库、远端、分支、提交信息和 PR 文案全部由已验证任务确定，模型不能借参数改变目标、
+ * 注入 Git 选项或请求 merge。
+ */
 export const PublishParameters = Type.Object({}, { additionalProperties: false });
 
-/** 发布工具的单任务依赖。 */
+/**
+ * 发布工具所需的单任务依赖。
+ *
+ * `task` 必须持有当前 worktreeHash 对应的验证记录；`store` 和 `evidence` 分别保存任务事实
+ * 与发布前检查结果，不得指向其它任务。
+ */
 export interface PublishToolContext {
   task: TaskRecord;
   store: TaskStore;
@@ -41,6 +54,10 @@ export interface PublishToolContext {
  *
  * @param pi 当前 Pi Extension API。
  * @param context 与 taskId、正式仓库和 detached worktree 绑定的事实存储。
+ * @returns 无返回值；注册后的工具只接受空对象，并始终要求可见 UI 二次确认。
+ * @throws 工具名冲突时同步抛错；执行时传播验证漂移、检查失败、非 GitHub origin、Git、
+ * 网络和 GitHub CLI 错误。用户取消会返回 cancelled 结果，不作为异常。
+ * @remarks 发布在临时 worktree 中 commit/push/create PR，不切换或提交正式工作区，也不 merge。
  */
 export function registerPublishTool(
   pi: ExtensionAPI,
@@ -84,6 +101,8 @@ export function registerPublishTool(
               formatPublishPreview(preview),
             ),
             runChecks: async () => {
+              // 发布会产生远端副作用，因此不能只信此前的轻量候选验证；这里按 changedPaths
+              // 重新计算固定质量门，且模型没有机会替换或跳过任一命令。
               const checks = requiredPublishChecks(context.task.changedPaths);
               for (const id of checks) {
                 const check = await runCheck(

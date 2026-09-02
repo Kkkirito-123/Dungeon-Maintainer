@@ -1,4 +1,13 @@
-/** Pi `inspect` 工具的参数契约、动作分发、注册和遥测。 */
+/**
+ * Pi `inspect` 受限只读工具。
+ *
+ * 本文件把 Git 状态、项目文件枚举、源码搜索/读取、Diff 和当前任务 Evidence 汇入一个
+ * 固定工具面；具体路径规范化、realpath 防逃逸、输出裁剪和证据缓存分别由 inspection、
+ * workspace 与 evidence 模块负责。本层不执行检查、不修改文件，也不读取正式仓库外数据。
+ * 输入来自严格 TypeBox 契约，输出包含面向模型的有限文本和可审计详情；成功或失败只追加
+ * 低敏统计事件。Hash 漂移、非法路径、证据不存在和取消均显式失败，调用方应基于最新状态
+ * 重新定向检查，而不能复用过期的 baseHash。
+ */
 
 import type {
   ExtensionAPI,
@@ -29,7 +38,13 @@ import { hashWorktree, readRepo, worktreeDiff } from "../../workspace/git.js";
 import { withProgress } from "../../progress/reporter.js";
 import { executeEvidenceQuery, type EvidenceInput } from "./evidence.js";
 
-/** `inspect` 的严格参数契约。 */
+/**
+ * `inspect` 的模型参数契约。
+ *
+ * 所有动作共用根对象是为了保持工具 Schema 稳定；执行分支会继续要求 action 对应字段。
+ * `path` 始终是项目相对路径，读取行数、批量范围和 Evidence 数量均设置硬上限，避免一次
+ * 调用把完整仓库或任务账本送入模型上下文。
+ */
 export const InspectParameters = Type.Object({
   action: Type.Union([
     Type.Literal("status"),
@@ -76,14 +91,28 @@ export const InspectParameters = Type.Object({
   evidenceId: Type.Optional(Type.String({ pattern: "^[a-f0-9]{16}$" })),
 }, { additionalProperties: false });
 
-/** 注册工具所需的单任务依赖。 */
+/**
+ * `inspect` 所需的单任务依赖。
+ *
+ * `task.worktreeRoot` 是所有源码操作的唯一根目录；`store` 仅记录低敏事件，`evidence`
+ * 保存带 Hash 的读取事实。三者必须属于同一个 taskId。
+ */
 export interface InspectToolContext {
   task: TaskRecord;
   store: TaskStore;
   evidence: EvidenceStore;
 }
 
-/** 执行一次受限只读检查。 */
+/**
+ * 执行一次受限源码或 Git 检查。
+ *
+ * @param context 与当前 detached worktree 绑定的任务、事件和 Evidence 依赖。
+ * @param input 已按 action 收窄的检查请求。
+ * @param signal 可选取消信号；耗时读取和搜索会继续向下传递。
+ * @returns 有限文本以及包含 baseHash、worktreeHash、缓存命中和搜索范围的结构化详情。
+ * @throws 缺少 action 必填字段、路径越界、工作树读取失败或请求取消时抛错。
+ * @remarks 结果可写入当前任务 Evidence，但不会改动源码、任务状态或正式仓库。
+ */
 export async function inspectTask(
   context: InspectToolContext,
   input: InspectInput,
@@ -106,6 +135,8 @@ export async function inspectTask(
     return await inspectReadMany(inspectionContext, input, signal);
   }
 
+  // read/read_many 在下层按文件 baseHash 缓存；其它动作先绑定完整 worktreeHash，确保
+  // 搜索回执和 Git 视图不会在任意文件变化后被当作当前事实复用。
   const worktreeHash = await hashWorktree(inspectionContext.root);
   const scopePlan = input.action === "search" || input.action === "bundle"
     ? planSearchScope(input)
@@ -165,7 +196,15 @@ export async function inspectTask(
   });
 }
 
-/** 向单个 Pi 会话注册 `inspect`。 */
+/**
+ * 向单个 Pi 会话注册统一的 `inspect` 工具。
+ *
+ * @param pi 当前 Extension API。
+ * @param context 与当前 taskId、detached worktree 绑定的只读依赖。
+ * @returns 无返回值；注册后所有动作按顺序执行并通过 Shell 报告进度。
+ * @throws 工具名冲突时同步抛错；读取、路径、Evidence 和取消错误在调用阶段继续抛出。
+ * @remarks 工具没有源码写权限；遥测只保存动作、缓存类型和数量，不记录源码或 Evidence 正文。
+ */
 export function registerInspectTool(
   pi: ExtensionAPI,
   context: InspectToolContext,
@@ -202,6 +241,7 @@ export function registerInspectTool(
           progress.line("处理 inspect：" + input.action);
           try {
             if (input.action === "evidence_list" || input.action === "evidence_get") {
+              // Evidence 仍复用专属执行器，避免 inspect 复制一套 ID 所有权和工件脱敏规则。
               const evidenceInput: EvidenceInput = {
                 action: input.action === "evidence_list" ? "list" : "get",
                 ...(input.status === undefined ? {} : { status: input.status }),

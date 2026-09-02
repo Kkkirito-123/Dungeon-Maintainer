@@ -20,16 +20,26 @@ import {
 } from "../../workspace/catalog.js";
 import { withProgress } from "../../progress/reporter.js";
 
-/** `tree` 工具的严格参数。 */
+/**
+ * `workspace` 的模型参数契约。
+ *
+ * `switch` 只接受前一次 `list` 返回的 12 位临时 treeId，不接收路径、分支名或仓库地址，
+ * 防止模型把任意目录变成新任务来源。
+ */
 export const TreeParameters = Type.Object({
   action: Type.Union([Type.Literal("list"), Type.Literal("switch")]),
   treeId: Type.Optional(Type.String({ minLength: 12, maxLength: 12 })),
 }, { additionalProperties: false });
 
-/** `tree` 参数的 TypeScript 投影。 */
+/** `TreeParameters` 对应的已校验 TypeScript 输入；switch 分支仍要求存在 `treeId`。 */
 export type TreeInput = Static<typeof TreeParameters>;
 
-/** `tree` 工具所需的固定任务依赖。 */
+/**
+ * `workspace` 所需的当前任务依赖。
+ *
+ * TaskStore 用于限定同一 Git common-dir 的合法候选并记录低敏切换事件；工具不持有新的
+ * 任务对象，实际创建和 Pi 生命周期切换由 AppController 完成。
+ */
 export interface TreeToolContext {
   task: TaskRecord;
   store: TaskStore;
@@ -41,6 +51,7 @@ async function requestControllerSwitch(tree: RepositoryWorktreeSummary): Promise
   const shell = new URL(shellUrl);
   const endpoint = new URL("/api/tasks/switch", shell);
   endpoint.search = shell.search;
+  // 只回调当前 Shell URL 并复用其中随机令牌；tree 的绝对路径不进入请求正文或模型输出。
   const response = await fetch(endpoint, {
     method: "POST",
     headers: {
@@ -67,6 +78,9 @@ async function requestControllerSwitch(tree: RepositoryWorktreeSummary): Promise
  *
  * @param pi 当前固定 Pi Extension API。
  * @param context 当前任务和任务存储；候选只能来自同一 Git common-dir 的注册 worktree。
+ * @returns 无返回值；注册后 list 只读，switch 经 UI 确认后请求 AppController 创建新任务。
+ * @throws 工具名冲突时同步抛错；执行时可能因非法 treeId、无 UI、Shell 拒绝或超时而失败。
+ * @remarks 当前会话的 cwd、分支和任务记录不会原地改变，旧 Pi 必须先停止后才能启动新任务。
  */
 export function registerWorkspaceTool(pi: ExtensionAPI, context: TreeToolContext): void {
   pi.registerTool({
@@ -125,6 +139,8 @@ export function registerWorkspaceTool(pi: ExtensionAPI, context: TreeToolContext
             + "；本地修改文件：" + String(target.dirtyFiles),
           );
           if (!confirmed) throw new Error("用户取消切换工作树");
+          // 这里只记录不含路径的候选 ID 和脏文件数量；AppController 会再次按当下目录事实
+          // 解析目标，不能把模型或旧 list 响应里的路径当成权威。
           await appendEvent(context.store, context.task.id, "tool.tree_switch", {
             treeId: target.id,
             dirtyFiles: target.dirtyFiles,

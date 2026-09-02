@@ -7,6 +7,10 @@
  *
  * API Key 只在子进程环境变量中传递，永远不会进入参数、task.json 或日志。Pi 会话首行
  * 的 id/cwd 和文件名必须与任务一致；发现漂移时安全阻断，保留原任务供用户诊断。
+ *
+ * 运行时数据流：Shell 命令 -> AppController.send -> PiRpcProcess -> Pi Agent Loop；
+ * Pi 事件 -> AppController.handlePiEvent -> Shell。任务切换始终先停止旧 Pi，再更新活动
+ * Task，最后启动新 Pi，因此同一时刻不会存在两个可调用模型的进程。
  */
 
 import { access, mkdir, open, readdir } from "node:fs/promises";
@@ -71,9 +75,9 @@ export function buildPiArguments(
     // 维护器只加载自己显式传入的 Extension，且 cwd 固定为隔离 worktree；自动批准
     // 这个受控目录可以跳过 Pi 首次启动的交互式信任提示，避免可见终端停在启动阶段。
     "--approve",
-    // 启动层显式加载受支持的原生读写工具和维护器工具，避免用户全局设置缩减能力；
-    // 任意 bash 不加载，Extension 通过执行层门禁控制诊断阶段的写入权限，同时保持
-    // 固定工具面以复用 Prompt 缓存。
+    // 启动层显式固定九个维护器工具，避免用户全局设置改变能力边界；Pi 原生工具和
+    // 任意 bash 均不加载。Extension 保持工具名稳定以复用 Prompt 缓存，实际 edit
+    // 权限仍由执行层按本轮批准范围判断。
     "--tools",
     FULL_CODING_TOOLS.join(","),
     "--no-extensions",
@@ -115,19 +119,33 @@ export async function runPiProcess(
  *
  * 切换任务时先停止旧 Pi，再启动新 Pi；旧任务只保留在磁盘，不会在后台继续调用模型。
  * Shell 的授权令牌和浏览器窗口保持不变，活动 taskId、worktree 和右侧游戏由状态事件更新。
+ * 构造实例不会启动进程；调用 `run()` 后会创建本地 Shell、启动 Pi，并只通过受限 RPC
+ * 命令影响当前任务。启动失败或任务事实漂移时保留任务与 worktree，供后续诊断或恢复。
  */
 export class AppController {
+  /** 当前数据目录唯一的任务持久化入口。 */
   private readonly store: TaskStore;
+  /** Shell 当前展示且唯一允许驱动 Pi 的任务。 */
   private activeTask: TaskRecord;
+  /** 当前唯一 Pi 子进程；任务切换期间短暂为 null。 */
   private rpc: PiRpcProcess | null = null;
+  /** 整个 AppController 生命周期复用的 Chromium Shell。 */
   private shell: ShellHandle | null = null;
+  /** 防止两个切换请求交错执行。 */
   private switching = false;
+  /** 保证关闭流程和 completion 只生效一次。 */
   private closed = false;
+  /**
+   * Pi 实例代次。旧进程的延迟事件必须同时匹配实例引用和代次，才能影响当前 Shell。
+   */
   private generation = 0;
+  /** 完成整个控制器生命周期的唯一出口，由 close 或当前 Pi 自然退出调用。 */
   private resolveCompletion: (code: number) => void = () => undefined;
+  /** `run()` 持续等待的生命周期 Promise，不会因单次 Agent 回合结束而完成。 */
   private readonly completion = new Promise<number>((resolveCompletion) => {
     this.resolveCompletion = resolveCompletion;
   });
+  /** 本次 Shell 生命周期访问过的任务，仅用于退出时检查终态 worktree 清理。 */
   private readonly visitedTaskIds = new Set<string>();
 
   /**
@@ -143,7 +161,13 @@ export class AppController {
     this.visitedTaskIds.add(initialTask.id);
   }
 
-  /** 启动固定 Shell 与首个 Pi，并等待用户关闭或当前 Pi 自然退出。 */
+  /**
+   * 启动固定 Shell 与首个 Pi，并等待用户关闭或当前 Pi 自然退出。
+   *
+   * @returns 用户关闭 Shell 或 Pi 自然退出时的进程码。
+   * @throws Shell 创建失败时抛错；Pi 启动失败会显示在 Shell 中并保留界面供诊断。
+   * @remarks finally 总会停止当前 Pi、关闭 Shell，并只清理已进入终态的 worktree。
+   */
   async run(): Promise<number> {
     this.shell = await startShellServer({
       task: this.activeTask,
@@ -195,6 +219,8 @@ export class AppController {
   private environment(task: TaskRecord): NodeJS.ProcessEnv {
     if (!this.shell) throw new Error("统一 Shell 尚未启动");
     const apiKey = requireApiKey(this.config);
+    // 任务身份和 worktree 只通过父进程注入，Extension 不从 cwd 或全局配置猜测归属。
+    // API Key 也只存在于子进程环境，不能进入可见 CLI 参数和 Shell 事件。
     const environment: NodeJS.ProcessEnv = {
       ...process.env,
       MAINTAINER_API_KEY: apiKey,
@@ -216,6 +242,7 @@ export class AppController {
     const rpc = this.rpc;
     if (!rpc) throw new Error("Pi RPC 尚未启动");
     if (command.type === "extension_ui_response") {
+      // Extension 确认框是 Pi 主动发起、Shell 反向应答的协议，不会再产生 response。
       rpc.respond(command);
       return { ok: true };
     }
@@ -227,6 +254,7 @@ export class AppController {
     generation: number,
     event: unknown,
   ): void {
+    // stop 后仍可能到达旧进程缓冲区中的事件；实例和代次双重匹配可阻止它污染新任务。
     if (this.rpc !== rpc || generation !== this.generation || !this.shell) return;
     this.shell.handlePiEvent(event);
     if (event && typeof event === "object" && !Array.isArray(event)) {
@@ -267,6 +295,7 @@ export class AppController {
   private async startActivePi(): Promise<void> {
     if (!this.shell) throw new Error("统一 Shell 尚未启动");
     if (this.rpc) throw new Error("已有活动 Pi 进程");
+    // 先分配新代次，再把回调闭包绑定到该代次；后续任务切换可以识别迟到事件。
     const generation = ++this.generation;
     const rpc = new PiRpcProcess(
       resolvePiCliPath(),
@@ -286,6 +315,7 @@ export class AppController {
       throw error;
     }
     void rpc.waitForExit().then((code) => {
+      // 被任务切换主动停止的旧进程不应关闭整个应用；只有当前代次自然退出才结束 Shell。
       if (
         this.rpc !== rpc
         || generation !== this.generation
@@ -300,6 +330,7 @@ export class AppController {
 
   private async stopActivePi(): Promise<void> {
     const rpc = this.rpc;
+    // 先从控制器解绑，再等待关闭，确保关闭期间到达的事件不会再更新当前 Shell。
     this.rpc = null;
     if (rpc) await rpc.stop();
   }
@@ -319,6 +350,8 @@ export class AppController {
     }
     await verifyRuntimeDependencies(state.root);
     await verifyTaskWorktree(task);
+    // 只有从未产生修复事实的任务可以处于“首次会话尚未落盘”窗口；其余任务必须找到
+    // 唯一且 cwd 匹配的 Pi session，禁止以新会话冒充恢复。
     const untouched = (task.state === "created" || task.state === "active")
       && task.changedPaths.length === 0
       && task.patchLines === 0
@@ -346,6 +379,7 @@ export class AppController {
     await verifyRuntimeDependencies(state.root);
     const taskId = createTaskId();
     const worktreesDir = join(this.config.dataDir, "worktrees");
+    // 用户选择的是来源 worktree；Agent 实际进入的仍是新建 detached 快照。
     const snapshot = await createTaskWorktreeSnapshot(
       taskId,
       state.root,
@@ -391,9 +425,11 @@ export class AppController {
     const nextTask = request.kind === "task"
       ? await this.validateRecoverableTask(request.id)
       : await this.createTaskForWorktree(request.id);
+    // 先完成目标校验/创建，再停止旧 Pi。目标准备失败时，当前聊天不会被无谓中断。
     await this.store.save(previousTask);
     this.switching = true;
     try {
+      // 此顺序是单 Agent 保证：旧 Pi 完全退出后才改变活动任务并启动新 Pi。
       await this.stopActivePi();
       await cleanupFinishedWorktree(this.store, previousTask.id).catch(() => undefined);
       this.activeTask = nextTask;
@@ -403,6 +439,7 @@ export class AppController {
       await this.startActivePi();
       return nextTask;
     } catch (error) {
+      // 新任务启动失败时恢复上一任务和 Shell 投影；旧 Pi 已退出则尽力重启原会话。
       this.activeTask = previousTask;
       this.shell?.updateTask(previousTask);
       if (!this.rpc) await this.startActivePi().catch(() => undefined);

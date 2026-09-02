@@ -5,9 +5,10 @@
  * patch；真正的路径、realpath、baseHash、唯一匹配、隐私和预算校验均由安全层执行。
  * 有活动复现时，写入前保留复现起点，写入后用新代码恢复检查点并重放同一语义动作。
  * 静态问题无需为了取得写入资格而先制造失败检查。拒绝审批不会写入字节；刷新失败会保留
- * worktree 变化和事件证据，但正式仓库仍不受影响。模型只能在总方案已经获批后看到
- * 本工具，因此核心路径不会再弹出第二个确认框；workspace 层仍保留精确摘要与一次性
- * 消费记录，供非模型调用和安全测试使用。
+ * worktree 变化和事件证据，但正式仓库仍不受影响。为稳定 Prompt 缓存，模型始终能看到
+ * 本工具的契约，但只有总方案或首次精确写入获批、目标路径进入当前 writeScope 后才能
+ * 执行；workspace 层还会校验精确摘要与一次性审批消费记录，不能依赖工具可见性代替
+ * 真正权限检查。
  */
 
 import type {
@@ -45,14 +46,25 @@ const PatchEditParameters = Type.Object({
   content: Type.Optional(Type.String({ maxLength: 64 * 1024 })),
 }, { additionalProperties: false });
 
-/** `patch` 的严格参数契约。 */
+/**
+ * `edit` 的模型参数契约。
+ *
+ * 单次最多三个文件；每项都必须携带最近只读检查得到的 `baseHash`。`replace` 依赖唯一旧
+ * 文本，`write/create` 要求完整正文，创建文件固定使用 `missing`，执行层还会检查累计
+ * 120 行预算、64 KiB 上限、路径范围、凭据和审批绑定。
+ */
 export const PatchParameters = Type.Object({
   edits: Type.Array(PatchEditParameters, { minItems: 1, maxItems: 3 }),
 }, { additionalProperties: false });
 
 type EditInput = Static<typeof PatchParameters>;
 
-/** 补丁写入及立即重放的有限结果。 */
+/**
+ * `edit` 对模型公开的有限执行结果。
+ *
+ * 基础字段来自精确补丁事务；`replay` 只描述活动复现是否在新代码上重放成功，不包含
+ * SQL、完整 Trace、地图或浏览器帧。写入成功但重放失败时，调用方可据此继续修复。
+ */
 export interface PatchToolDetails extends PrecisePatchResult {
   replay: {
     passed: boolean;
@@ -61,7 +73,12 @@ export interface PatchToolDetails extends PrecisePatchResult {
   } | null;
 }
 
-/** 注册工具所需的单任务与浏览器依赖。 */
+/**
+ * `edit` 所需的单任务、Evidence 和浏览器依赖。
+ *
+ * 任务、存储、Evidence 及 GameDriver 必须绑定同一 detached worktree；
+ * `isExecutionApproved` 只表示当前自然语言请求已获授权，具体文件仍由持久 writeScope 复核。
+ */
 export interface PatchToolContext {
   task: TaskRecord;
   store: TaskStore;
@@ -94,6 +111,10 @@ async function confirmCorePatch(
  *
  * @param pi 当前 Extension API。
  * @param context 与一个 taskId/worktree 绑定的执行依赖。
+ * @returns 无返回值；注册后每次 `edit` 都经当前授权、路径、Hash 和补丁事务校验。
+ * @throws 工具名冲突时同步抛错；执行时可能因未授权、路径越界、Hash 漂移、审批失效、
+ * 补丁预算、浏览器恢复或重放失败而抛错。
+ * @remarks 源码只写入 detached worktree；正式仓库仍需用户显式执行 `/apply`。
  */
 export function registerEditTool(
   pi: ExtensionAPI,
@@ -133,6 +154,8 @@ export function registerEditTool(
           progress.line(reproduction ? "保留复现检查点" : "准备补丁");
           // workspace 回调不返回值，用状态盒把重放结果带回工具响应。
           const replayState: { current: ReplayResult | null } = { current: null };
+          // 先把所有模型路径收窄到已批准的真实文件，再读取 write 模式的旧正文。这样即使
+          // 后续 baseHash 失败，也不会让一次未授权读取成为旁路。
           const scopedInput = {
             edits: await Promise.all(input.edits.map(async (edit) => {
               const path = assertWritePathAllowed(context.task, edit.path);
@@ -179,6 +202,8 @@ export function registerEditTool(
                 progress.line("刷新并重放复现");
                 driver ??= await context.ensureGame();
                 const replayHash = await hashWorktree(context.task.worktreeRoot);
+                // 顺序固定为：源码写入 -> 刷新页面 -> 恢复原检查点 -> 重建临时检查点 ->
+                // 重放语义动作。replayReproduction 绑定新 worktreeHash，旧页面结果不能冒充新代码证据。
                 replayState.current = await replayReproduction(
                   context.store,
                   context.task,

@@ -13,7 +13,12 @@ import type { TaskRecord } from "../../task/types.js";
 import { readTaskDiff } from "../../workspace/apply.js";
 import { withProgress } from "../../progress/reporter.js";
 
-/** `/diff` 所需的当前任务依赖。 */
+/**
+ * `/diff` 所需的当前任务依赖。
+ *
+ * `task` 确定唯一 detached worktree 或已封装 patch，`store` 只用于写入不含 Diff 正文的
+ * 审计事件；命令不能接受其它路径作为读取目标。
+ */
 export interface DiffCommandContext {
   task: TaskRecord;
   store: TaskStore;
@@ -24,6 +29,9 @@ export interface DiffCommandContext {
  *
  * @param pi 当前 Extension API。
  * @param context 当前任务与事件存储。
+ * @returns 无返回值；命令处理器只展示当前任务 Diff，不改变任务或文件。
+ * @throws 注册冲突时同步抛错；执行时传播任务补丁或 worktree 读取失败。
+ * @remarks 事件仅记录 UTF-8 字节数，源码 Diff 不写入 events.jsonl。
  */
 export function registerDiffCommand(
   pi: ExtensionAPI,

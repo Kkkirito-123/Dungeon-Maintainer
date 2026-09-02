@@ -18,7 +18,12 @@ import { registerDiscardCommand } from "./discard.js";
 import { registerPlayCommand } from "./play.js";
 import { registerVerifyCommand } from "./verify.js";
 
-/** 五个固定用户命令共享的单任务依赖。 */
+/**
+ * 五个固定用户命令共享的单任务依赖。
+ *
+ * 调用方必须传入同一 Extension 生命周期内的 TaskRecord、TaskStore、EvidenceStore 和
+ * GameDriver 访问器。命令不能自行恢复其它 taskId，也不能创建第二个浏览器或任务状态副本。
+ */
 export interface MaintainerCommandContext {
   task: TaskRecord;
   store: TaskStore;
@@ -33,6 +38,9 @@ export interface MaintainerCommandContext {
  *
  * @param pi 当前 Pi Extension API。
  * @param context 与 taskId、worktree 和浏览器会话固定绑定的依赖。
+ * @returns 无返回值；成功后仅暴露产品协议规定的五条斜杠命令。
+ * @throws 任一子命令注册失败时同步抛错并中止 Extension 加载，避免出现部分可用的任务界面。
+ * @remarks 本函数只装配命令，不启动游戏、不读写仓库，也不改变任务状态。
  */
 export function registerMaintainerCommands(
   pi: ExtensionAPI,

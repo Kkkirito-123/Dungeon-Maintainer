@@ -16,7 +16,12 @@ import type { TaskStore } from "../../task/store.js";
 import type { TaskRecord } from "../../task/types.js";
 import { withProgress } from "../../progress/reporter.js";
 
-/** `/verify` 所需的任务和可选浏览器依赖。 */
+/**
+ * `/verify` 所需的任务、Evidence 与可选浏览器依赖。
+ *
+ * 当前 GameDriver 为空时只能验证不依赖活动复现的修改；任务、存储和 Evidence 必须绑定
+ * 同一 detached worktree，验证结果才可安全关联完整 worktree Hash。
+ */
 export interface VerifyCommandContext {
   task: TaskRecord;
   store: TaskStore;
@@ -29,6 +34,10 @@ export interface VerifyCommandContext {
  *
  * @param pi 当前 Extension API。
  * @param context 当前任务、存储和单浏览器访问器。
+ * @returns 无返回值；处理器通过后保存补丁与验证记录，并把任务迁移到 `ready_to_apply`。
+ * @throws 注册冲突时同步抛错；执行时传播检查、Hash、浏览器恢复、重放和补丁封装错误。
+ * @remarks 验证只读取 detached worktree 并写任务证据，不修改正式仓库；源码再次变化会使
+ * 绑定旧完整 Hash 的结果失效。
  */
 export function registerVerifyCommand(
   pi: ExtensionAPI,
@@ -47,6 +56,8 @@ export function registerVerifyCommand(
           "verify",
           undefined,
           async (progress) => {
+            // 权威验证器按固定顺序运行直接检查、刷新/恢复、重建检查点、语义重放和补丁封装，
+            // 最终记录完整 worktree Hash；命令层不根据模型正文推断 PASS。
             const result = await verifyTask(
               context.store,
               context.evidence,

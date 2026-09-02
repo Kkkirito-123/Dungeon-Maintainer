@@ -3,7 +3,7 @@
  *
  * 本文件保存低敏中文结论，并在 `reproduced` 状态下把当前 500 条以内的语义 Trace
  * 截取为可重放用例。`proposed` 会先展示病因、完整方案、验证和风险；用户确认后只为
- * 当前 Agent 运行开放 Pi 原生 Coding 工具。它不相信模型声称测试通过；`result` 会自动
+ * 当前 Agent 运行开放受限 `edit`。它不相信模型声称测试通过；`result` 会自动
  * 调用 repair verification，只运行直接改动测试和必要架构检查，再执行刷新重放与隐藏断言，
  * 全部通过才进入 ready_to_apply。完整质量门仅由 publish 执行。
  * `/verify` 仅作为用户显式重试入口，正式仓库仍只能由 `/apply` 修改。
@@ -104,7 +104,13 @@ const ExecutionPlanParameters = Type.Object({
 const UNRESOLVED_PLAN_PATTERN =
   /(?:仍需(?:确认|检查|读取|定位|查找|补充)|需(?:要)?(?:先|进一步)(?:确认|检查|读取|定位|查找|补充)|必须先(?:确认|检查|读取|定位|查找)|尚未(?:确认|检查|读取|定位|查明)|未及(?:读取|检查|定位)|不确定|无法确认|有待(?:确认|检查|读取|定位|查明))/iu;
 
-/** `finish` 的严格结论契约。 */
+/**
+ * `finish` 的模型结论契约。
+ *
+ * 五种 status 共用一个根对象以保持工具 Schema 稳定，执行层再校验 reproduction 与 plan
+ * 的合法组合。所有自由文本都有长度上限并在持久化前做控制字符过滤和脱敏；结构化断言
+ * 描述修复后期望，不能把当前故障值当作成功标准。
+ */
 export const FinishParameters = Type.Object({
   status: Type.Union([
     Type.Literal("reproduced"),
@@ -127,7 +133,12 @@ export const FinishParameters = Type.Object({
   plan: Type.Optional(ExecutionPlanParameters),
 }, { additionalProperties: false });
 
-/** 注册结论工具所需的单任务和 Trace 依赖。 */
+/**
+ * `finish` 所需的任务、Evidence、浏览器 Trace 和授权依赖。
+ *
+ * 所有依赖必须来自当前 taskId 的同一 Extension 生命周期。授权闭包控制本轮运行时能力，
+ * TaskStore 同时持久化精确 allowedPaths；`result` 使用注入的权威验证器而不是模型声明。
+ */
 export interface FinishToolContext {
   task: TaskRecord;
   store: TaskStore;
@@ -210,6 +221,11 @@ async function proposedEvidenceWarnings(
  *
  * @param pi 当前 Extension API。
  * @param context 当前任务、存储和可选浏览器 Trace。
+ * @returns 无返回值；注册后 status 会按任务状态机保存结论、复现、方案授权或验证结果。
+ * @throws 工具名冲突时同步抛错；执行时可能因终态任务、字段组合、路径、审批、Trace 或
+ * 真实验证失败而抛错。
+ * @remarks `finish` 不写正式仓库；只有获批的 `proposed` 会开启本轮受限 edit，`result`
+ * 验证通过后才使任务进入 `ready_to_apply`。
  */
 export function registerFinishTool(
   pi: ExtensionAPI,
@@ -382,6 +398,8 @@ export function registerFinishTool(
               "是否执行完整修复方案",
               approvalMessage,
             );
+            // 摘要绑定 taskId、baseHead 与用户看到的完整确认正文。持久 writeScope 后续还会
+            // 逐路径复核，因此同意旧方案不能被复用于新基线或未展示文件。
             const digest = createHash("sha256")
               .update(context.task.id + ":" + context.task.baseHead + ":" + approvalMessage)
               .digest("hex");
@@ -405,6 +423,8 @@ export function registerFinishTool(
               verification = await context.verifyTask(signal, (line) => progress.line(line));
               progress.line("候选验证通过");
             } catch (error) {
+              // 验证失败保留本轮授权，允许 Agent 基于同一已批准方案继续修复；新的自然语言
+              // 请求或 agent_settled 仍会统一收权，不能跨请求沿用。
               await appendEvent(context.store, context.task.id, "tool.finish", {
                 status: "result",
                 verificationPassed: false,

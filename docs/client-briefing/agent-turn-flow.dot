@@ -1,0 +1,162 @@
+digraph AgentTurnFlow {
+  graph [
+    rankdir=TB,
+    bgcolor="#FCFCFA",
+    pad=0.35,
+    nodesep=0.35,
+    ranksep=0.48,
+    splines=polyline,
+    fontname="PingFang SC",
+    fontsize=20,
+    label="SQL Dungeon Maintainer：一次真实修复轮次",
+    labelloc=t
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fillcolor="#FFFFFF",
+    color="#64748B",
+    penwidth=1.3,
+    fontname="PingFang SC",
+    fontsize=11,
+    margin="0.16,0.10"
+  ];
+  edge [
+    color="#64748B",
+    penwidth=1.2,
+    arrowsize=0.75,
+    fontname="PingFang SC",
+    fontsize=10
+  ];
+
+  subgraph cluster_agent_turn {
+    label="一次自然语言轮次：只有一个原生 Pi Agent Loop";
+    color="#94A3B8";
+    style="rounded,dashed";
+    margin=18;
+
+    user_request [
+      label="1. 用户提出修复请求\n缺少钥匙，无法进入下一层\n要求修复并立即验证",
+      fillcolor="#E8F0FE",
+      color="#3B6EA8"
+    ];
+    shell_rpc [
+      label="2. Chromium Shell\n通过 RPC 发送 prompt\n同一时刻只运行一个请求",
+      fillcolor="#F1F5F9"
+    ];
+    request_boundary [
+      label="3. Extension 建立本轮边界\n记录目标 · 撤销旧授权\n新目标不继承旧验证",
+      fillcolor="#FFF4D6",
+      color="#B7791F"
+    ];
+    pi_loop [
+      label="4. 原生 Pi 调用模型\n模型选择固定领域工具\n工具结果返回后继续同一 Loop",
+      fillcolor="#E8F0FE",
+      color="#3B6EA8"
+    ];
+    look [
+      label="5. look 读取玩家投影\nfloor · room · target · prerequisites\nactions · revision",
+      fillcolor="#E9F7EF",
+      color="#2E7D5B"
+    ];
+    target_known [
+      label="前置条件位置\n是否已公开且可达？",
+      shape=diamond,
+      style="filled",
+      fillcolor="#FFF4D6",
+      color="#B7791F"
+    ];
+    frontier [
+      label="act(frontier)\n前往下一处探索边界\n到达后重新 look",
+      fillcolor="#F4F0FA",
+      color="#7656A3"
+    ];
+    objective [
+      label="act(objective) / use\n沿已发现路径前往钥匙或门\n执行真实移动与交互",
+      fillcolor="#E9F7EF",
+      color="#2E7D5B"
+    ];
+    reproduction [
+      label="6. finish(reproduced)\n保存预期/实际、结构化断言\n截取当前语义 Trace",
+      fillcolor="#F1F5F9"
+    ];
+    inspect [
+      label="7. inspect / check\n定位相关源码并取得 baseHash\n只运行固定诊断",
+      fillcolor="#E8F0FE",
+      color="#3B6EA8"
+    ];
+    approval [
+      label="8. 用户是否批准\n当前精确写入范围？",
+      shape=diamond,
+      style="filled",
+      fillcolor="#FFF4D6",
+      color="#B7791F"
+    ];
+    rejected [
+      label="拒绝\n不写入第一字节\nworktree 保持原状",
+      fillcolor="#FDECEC",
+      color="#B94A48"
+    ];
+    edit [
+      label="9. edit 写入 detached worktree\n校验 realpath · writeScope · baseHash\n唯一旧文本 · 3 文件/120 行预算",
+      fillcolor="#FFF4D6",
+      color="#B7791F"
+    ];
+    replay [
+      label="10. 加载新代码并恢复重放\n刷新 -> 恢复检查点 -> 重建检查点\n按原顺序执行相同语义动作",
+      fillcolor="#F4F0FA",
+      color="#7656A3"
+    ];
+    verification [
+      label="11. finish(result)\n直接改动检查 + 重放 + 断言\n是否全部通过？",
+      shape=diamond,
+      style="filled",
+      fillcolor="#FFF4D6",
+      color="#B7791F"
+    ];
+    ready [
+      label="12. ready_to_apply\n验证记录绑定完整 worktree Hash\npatch.diff 已封装",
+      fillcolor="#E9F7EF",
+      color="#2E7D5B"
+    ];
+    settled [
+      label="13. agent_settled\n结束本轮 · 自动关闭 writeScope\n不创建隐藏模型回合",
+      fillcolor="#F1F5F9",
+      color="#475569"
+    ];
+
+    user_request -> shell_rpc -> request_boundary -> pi_loop -> look -> target_known;
+    target_known -> objective [label="是"];
+    target_known -> frontier [label="否"];
+    frontier -> look [label="新区域"];
+    objective -> reproduction -> inspect -> approval;
+    approval -> rejected [label="拒绝", color="#B94A48"];
+    approval -> edit [label="批准", color="#2E7D5B"];
+    edit -> replay -> verification;
+    verification -> inspect [label="失败：继续定位/修复", color="#B94A48"];
+    verification -> ready [label="通过", color="#2E7D5B"];
+    rejected -> settled;
+    ready -> settled;
+  }
+
+  apply [
+    label="轮次外：用户执行 /apply\n重新检查 HEAD、Hash 与 git apply --check\n确认后才写入正式工作区",
+    fillcolor="#E9F7EF",
+    color="#2E7D5B",
+    penwidth=1.6
+  ];
+  formal_repo [
+    label="正式游戏工作区收到已验证补丁\n不自动 commit / push / merge / deploy",
+    fillcolor="#FFFFFF",
+    color="#2E7D5B",
+    penwidth=1.6
+  ];
+
+  settled -> apply [
+    label="用户独立确认",
+    style=dashed,
+    color="#2E7D5B"
+  ];
+  apply -> formal_repo [color="#2E7D5B"];
+}

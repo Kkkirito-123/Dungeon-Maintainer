@@ -4,6 +4,11 @@
  * 本模块持有当前自然语言目标和“是否要求修复”这一请求级状态，负责会话恢复、请求
  * 切换、Prompt 追加、Agent 收敛和进程关闭。它不执行代码写入或刷新；请求结束时只
  * 通过注入的回调撤销授权并清理由写入协调器持有的临时归因。
+ *
+ * 主要时序：session_start 恢复安全状态 -> input 建立目标 -> before_agent_start 追加规则
+ * -> tool_result 保存低敏证据 -> agent_end 记录运行事实 -> agent_settled 撤销本轮写权限。
+ * `agent_end` 与 `agent_settled` 不能合并：前者表示一次执行结束，后者才表示 Pi 的工具与
+ * follow-up 队列均已清空。
  */
 
 import type {
@@ -49,28 +54,44 @@ interface RequestGameRuntime {
 }
 
 export interface RequestLifecycleOptions {
+  /** 当前唯一 Pi 进程的 Extension API。 */
   pi: ExtensionAPI;
+  /** 与 Pi session-id 和 cwd 固定绑定的任务记录。 */
   task: TaskRecord;
+  /** 任务状态的唯一持久化入口。 */
   store: TaskStore;
+  /** 当前任务的低敏证据账本。 */
   evidence: EvidenceStore;
+  /** 当前任务唯一的游戏运行时，只在会话生命周期内存活。 */
   gameRuntime: RequestGameRuntime;
+  /** 读取当前 Extension 进程是否持有本轮执行授权。 */
   isExecutionApproved: () => boolean;
+  /** 开启或撤销进程内快速门禁；精确文件范围仍由 TaskStore 持久化。 */
   setExecutionApproved: (approved: boolean) => void;
+  /** 清除 write tool_call 与写前 worktree Hash 的临时关联。 */
   clearWriteAttributions: () => void;
 }
 
 /** 与一个 Pi session 绑定的请求和会话处理函数。 */
 export interface RequestLifecycle {
+  /** 返回当前自然语言请求是否要求形成代码修复。 */
   repairRequested(): boolean;
+  /** 校验 session/task/worktree 绑定，恢复持久化状态并启动游戏运行时。 */
   onSessionStart(event: SessionStartEvent, context: ExtensionContext): Promise<void>;
+  /** 在每个模型回合前固定工具面，并把维护器规则追加到 Pi 基础 Prompt。 */
   onBeforeAgentStart(
     event: BeforeAgentStartEvent,
     context: ExtensionContext,
   ): BeforeAgentStartEventResult;
+  /** 接收新请求或 steer，更新当前目标，并在新请求开始前撤销旧授权。 */
   onInput(event: InputEvent): Promise<InputEventResult>;
+  /** 记录一次 Pi 执行结束；此时 follow-up 队列可能尚未清空。 */
   onAgentEnd(event: AgentEndEvent): Promise<void>;
+  /** 在 Pi 完全收敛后撤销当前请求的全部临时写权限。 */
   onAgentSettled(event: AgentSettledEvent): Promise<void>;
+  /** 从玩家可见工具结果提取低敏游戏证据，不保存完整状态或 SQL。 */
   onToolResult(event: ToolResultEvent): Promise<void>;
+  /** 关闭游戏运行时并记录会话关闭原因，不改变正式仓库。 */
   onSessionShutdown(event: SessionShutdownEvent): Promise<void>;
 }
 
@@ -102,7 +123,14 @@ function isContinuationRequest(text: string): boolean {
   return /^(?:继续|继续修复|继续处理|retry|resume)$/iu.test(normalizedRequest(text));
 }
 
-/** 创建单任务请求生命周期；返回值由 Extension 入口显式注册到 Pi hooks。 */
+/**
+ * 创建单任务请求生命周期。
+ *
+ * @param options 与同一 taskId 绑定的 Pi、TaskStore、Evidence 和游戏运行时。
+ * @returns 一组由 Extension 入口显式注册到 Pi hooks 的处理函数。
+ * @throws hook 执行期间发现会话漂移、终态任务恢复或持久化失败时抛错并停止相应流程。
+ * @remarks 返回对象只持有当前进程内的请求状态；任务、授权范围和证据仍由各自模块持久化。
+ */
 export function createRequestLifecycle(
   options: RequestLifecycleOptions,
 ): RequestLifecycle {
@@ -116,6 +144,8 @@ export function createRequestLifecycle(
     setExecutionApproved,
     clearWriteAttributions,
   } = options;
+  // 这两个变量只描述当前 Pi 请求，不是跨任务记忆。可恢复目标由 task.objective 提供，
+  // 新请求进入时会重新分类，避免把上一目标的写入意图带到下一轮。
   let latestNaturalRequest = "";
   let repairRequested = false;
 
@@ -123,6 +153,7 @@ export function createRequestLifecycle(
     text: string,
     continuation = false,
   ): Promise<void> => {
+    // 发布现有补丁不等于提出新修复；区分二者才能保留 ready_to_apply 的验证事实。
     latestNaturalRequest = normalizedRequest(text);
     const publishOnly = isPublishOnlyRequest(latestNaturalRequest);
     repairRequested = continuation || (!publishOnly && requiresRepair(latestNaturalRequest));
@@ -229,6 +260,8 @@ export function createRequestLifecycle(
         repairRequested = repairRequested || requiresRepair(text);
         return { action: "continue" };
       }
+      // 到这里一定是新的自然语言请求，而不是当前回合中的 steer/follow-up。
+      // 因此必须先清理上一请求授权，再决定是否沿用原目标和证据。
       const inheritedWriteScope = hasActiveWriteScope(task);
       const publishOnlyRequest = isPublishOnlyRequest(text);
       // 新请求先撤销上一请求的运行时授权，再执行任何可能失败的日志或证据 I/O。

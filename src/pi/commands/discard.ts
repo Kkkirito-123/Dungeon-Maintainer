@@ -14,7 +14,12 @@ import type { TaskRecord } from "../../task/types.js";
 import { snapshotWorktreePatch } from "../../workspace/apply.js";
 import { withProgress } from "../../progress/reporter.js";
 
-/** `/discard` 所需的任务和资源清理依赖。 */
+/**
+ * `/discard` 所需的任务、存储与资源清理依赖。
+ *
+ * `closeGame` 必须只关闭当前任务的 Vite 和临时 Chromium；真正删除 worktree 的动作留给
+ * Pi 退出后的父进程，避免在子进程仍占用 cwd 时清理失败。
+ */
 export interface DiscardCommandContext {
   task: TaskRecord;
   store: TaskStore;
@@ -26,6 +31,9 @@ export interface DiscardCommandContext {
  *
  * @param pi 当前 Extension API。
  * @param context 当前任务、存储和幂等资源关闭函数。
+ * @returns 无返回值；确认后保存最终补丁、迁移到 `discarded`、关闭游戏并请求 Pi 退出。
+ * @throws 注册冲突时同步抛错；执行时传播 Diff 快照、状态持久化或资源关闭错误。
+ * @remarks 已 applied 的任务不可放弃；命令不直接删除 worktree，也不改动正式仓库。
  */
 export function registerDiscardCommand(
   pi: ExtensionAPI,
@@ -67,6 +75,8 @@ export function registerDiscardCommand(
             return;
           }
           progress.line("保存最终 Diff 并更新任务状态");
+          // 必须先保存最终 Diff，再写 discarded 状态并退出。若顺序相反，父进程可能在
+          // 证据落盘前删除 worktree，导致最后的 Agent 增量无法审计或恢复。
           const patchPath = await snapshotWorktreePatch(
             context.task,
             context.store.taskDir(context.task.id),
@@ -78,6 +88,7 @@ export function registerDiscardCommand(
             pathCount: context.task.changedPaths.length,
           });
           progress.line("关闭游戏并退出维护器");
+          // 这里只释放会占用 worktree 的运行时资源；递归删除由已回到安全 cwd 的父进程完成。
           await context.closeGame();
           commandContext.ui.notify(
             "任务已放弃；证据已保留，正在退出并清理 worktree",

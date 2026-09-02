@@ -16,12 +16,23 @@ import { applyTaskPatch } from "../../workspace/apply.js";
 import { runGit } from "../../workspace/git.js";
 import { withProgress } from "../../progress/reporter.js";
 
-/** `/apply` 所需的当前任务依赖。 */
+/**
+ * `/apply` 所需的当前任务依赖。
+ *
+ * `task` 必须是当前 Pi 会话绑定的 `ready_to_apply` 记录，`store` 必须指向保存该任务的
+ * 数据目录；混用其它实例会破坏补丁写回和状态迁移的原子关系。
+ */
 export interface ApplyCommandContext {
   task: TaskRecord;
   store: TaskStore;
 }
 
+/**
+ * 在补丁已落入正式工作区、但任务状态未能持久化时执行补偿回滚。
+ *
+ * 反向应用前再次 `--check`，是为了保护 apply 与保存失败之间极短时间窗内可能出现的
+ * 用户编辑；如果检查不再成立则宁可暴露错误，也不能覆盖新的正式仓库内容。
+ */
 async function rollbackAfterSaveFailure(task: TaskRecord): Promise<void> {
   if (!task.patchPath) return;
   // apply 已通过正向 --check 后才可能到这里；反向仍先 --check，防止覆盖用户在极短
@@ -46,6 +57,10 @@ async function rollbackAfterSaveFailure(task: TaskRecord): Promise<void> {
  *
  * @param pi 当前 Extension API。
  * @param context 当前任务与事实存储。
+ * @returns 无返回值；命令处理器成功后将补丁写入正式工作区并把任务迁移到 `applied`。
+ * @throws 注册冲突时同步抛错；执行时可能因任务未验证、用户取消、来源漂移、Hash 冲突、
+ * `git apply --check`、写入或任务持久化失败而退出。
+ * @remarks 只有用户确认后的处理器会触碰正式仓库，且绝不执行 commit、push、PR 或部署。
  */
 export function registerApplyCommand(
   pi: ExtensionAPI,
@@ -94,6 +109,8 @@ export function registerApplyCommand(
             progress.line("校验已验证补丁并写回正式工作区");
             commandContext.ui.notify("正在校验已验证补丁并写回正式工作区…", "info");
 
+            // UI 预览只表达用户意图，不替代执行时事实校验。applyTaskPatch 会在第一字节
+            // 写入前重新检查 HEAD、洁净度、验证 Hash、逐文件 baseHash 和 git apply --check。
             const previousState = context.task.state;
             const appliedHashes = await applyTaskPatch(context.task);
             try {
@@ -105,6 +122,8 @@ export function registerApplyCommand(
               await rollbackAfterSaveFailure(context.task);
               context.task.state = previousState;
               context.task.appliedHashes = {};
+              // 反向补丁已优先恢复正式仓库；这里尽力恢复内存对应的持久状态。即使二次
+              // 保存仍失败，也不能用该失败掩盖原始事务错误。
               await context.store.save(context.task).catch(() => undefined);
               throw new Error("apply 后任务持久化失败，正式仓库已安全恢复", {
                 cause: error,

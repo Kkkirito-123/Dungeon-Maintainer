@@ -5,7 +5,9 @@
  * 鼠标坐标或按键轨迹；query 只向当前固定 textarea 写入文本并点击真实提交控件。
  * GameDriver 负责建立复现起点和 500 条环形 Trace，本层再把动作类型与有限状态写入
  * events.jsonl。浏览器不可用、桥版本不符或动作失败都会作为明确工具结果返回，
- * 不会改动正式仓库或用户浏览器 Profile。
+ * 不会改动正式仓库或用户浏览器 Profile。输入来自最近 `look` 的 revision 和稳定动作，
+ * 输出只保留玩家投影并限制文本大小；SQL、完整地图、存档、身份和帧画面不会进入日志。
+ * 失败后模型应重新 `look` 获取新 revision，不能猜测已过期动作继续执行。
  */
 
 import type {
@@ -42,7 +44,12 @@ function modelText(value: string, limit = MODEL_TEXT_LIMIT): string {
     : value.slice(0, limit) + "…[内容已截断]";
 }
 
-/** 注册游戏工具所需的单任务浏览器依赖。 */
+/**
+ * 三个游戏工具共享的单任务浏览器依赖。
+ *
+ * `requireDriver` 必须返回当前任务唯一的临时 GameDriver；浏览器不存在时直接失败，由
+ * `/play` 或 GameRuntime 显式恢复，工具自身不会连接用户浏览器 Profile。
+ */
 export interface GameToolContext {
   task: TaskRecord;
   store: TaskStore;
@@ -113,7 +120,13 @@ function modelPayload(value: PlayView | PlayResult): unknown {
   return viewForModel(value);
 }
 
-/** 把终端证据放在截断预算前部，避免长任务说明挤掉当前 SQL 与失败状态。 */
+/**
+ * 把玩家可见游戏结果序列化为有限模型正文。
+ *
+ * @param value GameDriver 返回的当前视图或动作结果。
+ * @returns 不超过约 4 KiB 的 JSON 文本；终端状态位于前部，超限部分带明确截断标记。
+ * @remarks 只投影协议允许的玩家字段，不包含管理员答案、完整地图、存档或浏览器帧。
+ */
 export function serializeGameToolResult(value: PlayView | PlayResult): string {
   const serialized = JSON.stringify(modelPayload(value));
   return serialized.length <= 4 * 1024
@@ -126,6 +139,9 @@ export function serializeGameToolResult(value: PlayView | PlayResult): string {
  *
  * @param pi 当前 Extension API。
  * @param context 与当前 headed Chromium 绑定的依赖。
+ * @returns 无返回值；成功后注册 `look`、`act`、`query` 三个顺序执行工具。
+ * @throws 工具名冲突时同步抛错；运行时传播浏览器缺失、revision 过期、桥协议和取消错误。
+ * @remarks 工具只操作临时游戏 Context；事件日志只保存动作类型、长度和结果标量。
  */
 export function registerGameTools(
   pi: ExtensionAPI,
@@ -184,6 +200,7 @@ export function registerGameTools(
         async (progress) => {
           progress.line("执行游戏动作：" + input.actionId);
           signal?.throwIfAborted();
+          // revision 将动作绑定到最近一次玩家视图，避免页面已经变化时仍点击旧目标。
           const result = await context.requireDriver().act(
             input.revision,
             input.actionId,
@@ -229,6 +246,7 @@ export function registerGameTools(
           progress.line("提交可见 SQL 查询");
           signal?.throwIfAborted();
           const result = await context.requireDriver().query(input.sql, input.revision);
+          // SQL 只进入临时浏览器的真实输入框；审计事件仅记录长度，不能持久化题目答案。
           await appendEvent(context.store, context.task.id, "game.query", {
             inputLength: input.sql.length,
             ok: result.ok,
