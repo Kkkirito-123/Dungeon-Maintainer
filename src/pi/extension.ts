@@ -2,8 +2,8 @@
  * Dungeon Maintainer 的唯一 Pi Extension 装配入口。
  *
  * 本文件只创建单任务依赖，注册 Provider、固定工具与命令，并按 Pi 事件流连接安全策略、
- * 请求生命周期和写入协调器。具体请求状态在 `request-lifecycle.ts`，edit 的写后结果
- * 分类在 `native-write.ts`，游戏进程在 `game-runtime.ts`。
+ * 请求生命周期。具体请求状态在 `request-lifecycle.ts`，edit 自己完成授权、写入、
+ * 刷新和结果分类，游戏进程在 `game-runtime.ts`。
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -19,14 +19,12 @@ import { TaskStore } from "../task/store.js";
 import type { TaskRecord } from "../task/types.js";
 import { registerMaintainerCommands } from "./commands/index.js";
 import { DungeonGameRuntime } from "./game-runtime.js";
-import { createNativeWriteCoordinator } from "./native-write.js";
 import { createRequestLifecycle } from "./request-lifecycle.js";
 import {
   assertTaskSessionBinding,
   registerSessionPolicyHooks,
 } from "./session-policy.js";
 import { FULL_CODING_TOOLS } from "./tool-policy.js";
-import { ToolSafetyGate } from "./tool-safety-gate.js";
 import { registerMaintainerTools } from "./tools/index.js";
 
 interface DungeonGameRuntimePort {
@@ -104,17 +102,7 @@ export function installDungeonMaintainerExtension(
     // 工具集合保持稳定以复用 Prompt 缓存；真正的写权限由运行时授权与路径门禁决定。
     pi.setActiveTools([...FULL_CODING_TOOLS]);
   };
-  const safetyGate = new ToolSafetyGate({
-    task,
-    store,
-    isExecutionApproved: () => executionApproved,
-    approveExecution: () => setExecutionApproved(true),
-  });
-  const nativeWrite = createNativeWriteCoordinator({
-    task,
-    store,
-    safetyGate,
-  });
+  let refreshFailure: string | null = null;
   const requests = createRequestLifecycle({
     pi,
     task,
@@ -123,7 +111,6 @@ export function installDungeonMaintainerExtension(
     gameRuntime,
     isExecutionApproved: () => executionApproved,
     setExecutionApproved,
-    clearWriteAttributions: () => nativeWrite.clearRequestAttributions(),
   });
   const sharedContext = {
     task,
@@ -136,6 +123,14 @@ export function installDungeonMaintainerExtension(
     approveExecution: () => setExecutionApproved(true),
     completeExecution: () => setExecutionApproved(false),
     isExecutionApproved: () => executionApproved,
+    setRefreshFailure: (failure: string | null) => {
+      refreshFailure = failure;
+    },
+    assertVerificationReady: () => {
+      if (refreshFailure) {
+        throw new Error("代码刷新门禁未通过：" + refreshFailure + " 请继续修复后重试。");
+      }
+    },
     repairRequested: () => requests.repairRequested(),
     verifyTask: verifyCurrentTask,
   };
@@ -155,16 +150,12 @@ export function installDungeonMaintainerExtension(
   pi.on("input", async (event) => {
     return await requests.onInput(event);
   });
-  pi.on("tool_call", async (event, context) => {
-    return await nativeWrite.onToolCall(event, context);
-  });
-  pi.on("tool_result", async (event, context) => {
+  // 保留 Pi 事件契约；edit 的授权与结果归因已经收进工具本身。
+  pi.on("tool_call", () => undefined);
+  pi.on("tool_result", async (event) => {
     await requests.onToolResult(event);
-    return await nativeWrite.onToolResult(event, context);
   });
-  pi.on("turn_end", async (_event, context) => {
-    await nativeWrite.onTurnEnd(context);
-  });
+  pi.on("turn_end", () => undefined);
   pi.on("agent_end", async (event) => {
     await requests.onAgentEnd(event);
   });

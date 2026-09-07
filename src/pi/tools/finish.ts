@@ -16,7 +16,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import { claimEvidence } from "../../evidence/projector.js";
 import { readDiagnosticEvidence } from "../../evidence/diagnostic.js";
 import type { EvidenceStore } from "../../evidence/store.js";
@@ -28,7 +28,11 @@ import type { VerificationResult } from "../../repair/verification.js";
 import type { TaskStore } from "../../task/store.js";
 import type { TaskRecord } from "../../task/types.js";
 import { validateWriteScopePaths } from "../../workspace/write-scope.js";
-import { withProgress, type ProgressLine } from "../../progress/reporter.js";
+import {
+  withProgress,
+  type ProgressLine,
+  type ProgressReporter,
+} from "../../progress/reporter.js";
 
 const ReproductionAssertionsParameters = Type.Object({
   floor: Type.Optional(Type.Integer({ minimum: 1, maximum: 8 })),
@@ -127,6 +131,8 @@ export const FinishParameters = Type.Object({
   plan: Type.Optional(ExecutionPlanParameters),
 }, { additionalProperties: false });
 
+type FinishInput = Static<typeof FinishParameters>;
+
 /** 注册结论工具所需的单任务和 Trace 依赖。 */
 export interface FinishToolContext {
   task: TaskRecord;
@@ -137,6 +143,7 @@ export interface FinishToolContext {
   completeExecution(): void;
   isExecutionApproved(): boolean;
   repairRequested(): boolean;
+  assertVerificationReady?(): void;
   verifyTask(signal?: AbortSignal, onProgress?: ProgressLine): Promise<VerificationResult>;
 }
 
@@ -205,6 +212,211 @@ async function proposedEvidenceWarnings(
   return warnings;
 }
 
+interface FinishOutcome {
+  reproductionId: string | null;
+  executionApproved: boolean | null;
+  verification: VerificationResult | null;
+  planSummary: string;
+  evidenceWarnings: string[];
+}
+
+function validateFinishInput(
+  context: FinishToolContext,
+  input: FinishInput,
+): { summary: string; risk: string } {
+  if (context.task.state === "applied" || context.task.state === "discarded") {
+    throw new Error("终态任务不能继续提交诊断或复现结论");
+  }
+  const summary = plain(input.summary, 1_200);
+  const risk = plain(input.risk, 600);
+  if (input.status === "diagnosed" && context.repairRequested()) {
+    throw new Error(
+      "当前用户请求要求修复，diagnosed 不是终态；请继续提交 proposed，或在客观无法继续时提交 blocked。",
+    );
+  }
+  if (input.status === "proposed" && !input.plan) {
+    throw new Error("proposed 必须给出一次性完整方案和验证方法");
+  }
+  if (input.status !== "proposed" && input.plan) {
+    throw new Error("只有 proposed 状态可以携带执行方案");
+  }
+  return { summary, risk };
+}
+
+async function handleReproduction(
+  context: FinishToolContext,
+  input: FinishInput,
+  progress: ProgressReporter,
+): Promise<string | null> {
+  if (input.status !== "reproduced") {
+    if (
+      input.reproduction
+      && (input.status !== "proposed" || !(await context.evidence.latest("reproduction")))
+    ) {
+      throw new Error("只有 reproduced 状态可以新建 reproduction；proposed 只能重复携带当前已保存的复现");
+    }
+    return null;
+  }
+  progress.line("保存可重放复现");
+  if (!input.reproduction) throw new Error("reproduced 必须提供期望、实际和证据");
+  assertExpectedBoolean(
+    input.reproduction.expected,
+    "terminalOpen",
+    input.reproduction.assertions.terminalOpen,
+  );
+  assertExpectedBoolean(
+    input.reproduction.expected,
+    "queryAccepted",
+    input.reproduction.assertions.queryAccepted,
+  );
+  if (context.task.state === "awaiting_approval") {
+    throw new Error("核心补丁仍在等待确认，不能同时覆盖复现状态");
+  }
+  if (context.task.state !== "active") {
+    await context.store.transition(context.task, "active");
+  }
+  const driver = context.currentDriver();
+  if (!driver) throw new Error("浏览器不可用，不能保存运行时复现");
+  const reproduction = await saveReproduction(
+    context.store,
+    context.evidence,
+    context.task,
+    driver.trace,
+    {
+      title: input.reproduction.title,
+      expected: input.reproduction.expected,
+      actual: input.reproduction.actual,
+      evidence: input.reproduction.evidence,
+      assertions: input.reproduction.assertions,
+    },
+  );
+  return reproduction.id;
+}
+
+async function handleProposed(
+  context: FinishToolContext,
+  input: FinishInput & { plan: NonNullable<FinishInput["plan"]> },
+  summary: string,
+  risk: string,
+  extensionContext: ExtensionContext,
+  progress: ProgressReporter,
+): Promise<Pick<FinishOutcome, "executionApproved" | "planSummary" | "evidenceWarnings">> {
+  progress.line("整理方案并等待确认");
+  const title = plain(input.plan.title, 160);
+  const steps = input.plan.steps.map((step) => plain(
+    typeof step === "string" ? step : step.text,
+    300,
+  ));
+  const verification = plain(input.plan.verification, 600);
+  if (UNRESOLVED_PLAN_PATTERN.test([summary, risk, title, ...steps].join(" "))) {
+    throw new Error(
+      "完整修复方案仍包含未确认推测；请删除未证实的顺手修改，只保留现有证据直接证明的最小修复后重新 proposed。",
+    );
+  }
+  const allowedPaths = await validateWriteScopePaths(
+    context.task.worktreeRoot,
+    input.plan.allowedPaths,
+  );
+  const evidenceWarnings = await proposedEvidenceWarnings(context.evidence);
+  const planSummary = [
+    "方案：" + title,
+    ...steps.map((step, index) => String(index + 1) + ". " + step),
+    "验证：" + verification,
+    "允许修改文件：" + allowedPaths.join(", "),
+  ].join("\n");
+  const approvalMessage = [
+    "病因：" + summary,
+    "",
+    planSummary,
+    evidenceWarnings.length > 0
+      ? "\n证据提示（软提示，不会阻止批准）：\n" + evidenceWarnings.map((warning) => "- " + warning).join("\n")
+      : "",
+    "",
+    "风险：" + risk,
+    "",
+    "确认后将为当前 Agent 运行开放受限 edit，并在 detached worktree 一次执行完整方案。",
+  ].join("\n");
+  const factLinks = (await context.evidence.active())
+    .filter((record) => ["source", "game", "check", "reproduction"].includes(record.kind))
+    .map((record) => record.id);
+  await context.evidence.capture(claimEvidence({
+    status: input.status,
+    summary,
+    risk,
+    planTitle: title,
+    planSteps: steps,
+    verification,
+    allowedPaths,
+    links: factLinks,
+  }));
+  const executionApproved = await extensionContext.ui.confirm(
+    "是否执行完整修复方案",
+    approvalMessage,
+  );
+  const digest = createHash("sha256")
+    .update(context.task.id + ":" + context.task.baseHead + ":" + approvalMessage)
+    .digest("hex");
+  await appendEvent(context.store, context.task.id, "execution.approval", {
+    digest: digest.slice(0, 16),
+    approved: executionApproved,
+  });
+  if (executionApproved) {
+    await context.store.approveWriteScope(context.task, allowedPaths, digest);
+    context.approveExecution();
+  } else {
+    await context.store.closeWriteScope(context.task);
+    context.completeExecution();
+  }
+  return { executionApproved, planSummary, evidenceWarnings };
+}
+
+async function handleResult(
+  context: FinishToolContext,
+  signal: AbortSignal | undefined,
+  progress: ProgressReporter,
+): Promise<VerificationResult> {
+  context.assertVerificationReady?.();
+  progress.line("运行直接改动检查和复现");
+  if (!context.isExecutionApproved()) {
+    throw new Error("当前 Agent 运行没有已批准的修复方案；请使用 /verify 人工重试旧修改");
+  }
+  let verification: VerificationResult;
+  try {
+    verification = await context.verifyTask(signal, (line) => progress.line(line));
+  } catch (error) {
+    await appendEvent(context.store, context.task.id, "tool.finish", {
+      status: "result",
+      verificationPassed: false,
+    });
+    throw new Error(
+      "自动验证未通过；保留修改权限，请继续修复后再次提交 result："
+      + verificationFailure(error),
+    );
+  }
+  progress.line("候选验证通过");
+  if (context.task.state !== "ready_to_apply" || verification.changedPaths.length === 0) {
+    throw new Error("自动验证没有生成绑定当前变更的可应用结果");
+  }
+  context.completeExecution();
+  await context.store.closeWriteScope(context.task);
+  return verification;
+}
+
+async function captureTerminalClaim(
+  context: FinishToolContext,
+  status: FinishInput["status"],
+  summary: string,
+  risk: string,
+): Promise<void> {
+  if (status !== "result" && status !== "blocked" && status !== "diagnosed") return;
+  const links = status === "result"
+    ? (await context.evidence.active("verification")).map((record) => record.id)
+    : (await context.evidence.active())
+      .filter((record) => record.kind !== "claim")
+      .map((record) => record.id);
+  await context.evidence.capture(claimEvidence({ status, summary, risk, links }));
+}
+
 /**
  * 向单个 Pi 会话注册 `finish`。
  *
@@ -231,7 +443,7 @@ export function registerFinishTool(
     parameters: FinishParameters,
     async execute(
       _toolCallId,
-      input,
+      input: FinishInput,
       signal,
       _onUpdate,
       extensionContext: ExtensionContext,
@@ -242,206 +454,33 @@ export function registerFinishTool(
         input,
         async (progress) => {
           progress.line("处理结论：" + input.status);
-          if (
-            context.task.state === "applied"
-            || context.task.state === "discarded"
-          ) {
-            throw new Error("终态任务不能继续提交诊断或复现结论");
-          }
-          const summary = plain(input.summary, 1_200);
-          const risk = plain(input.risk, 600);
-          if (input.status === "diagnosed" && context.repairRequested()) {
-            throw new Error(
-              "当前用户请求要求修复，diagnosed 不是终态；请继续提交 proposed，或在客观无法继续时提交 blocked。",
-            );
-          }
-          if (input.status === "proposed" && !input.plan) {
-            throw new Error("proposed 必须给出一次性完整方案和验证方法");
-          }
-          if (input.status !== "proposed" && input.plan) {
-            throw new Error("只有 proposed 状态可以携带执行方案");
-          }
-          let reproductionId: string | null = null;
-          if (input.status === "reproduced") {
-            progress.line("保存可重放复现");
-            if (!input.reproduction) {
-              throw new Error("reproduced 必须提供期望、实际和证据");
-            }
-            assertExpectedBoolean(
-              input.reproduction.expected,
-              "terminalOpen",
-              input.reproduction.assertions.terminalOpen,
-            );
-            assertExpectedBoolean(
-              input.reproduction.expected,
-              "queryAccepted",
-              input.reproduction.assertions.queryAccepted,
-            );
-            if (context.task.state === "awaiting_approval") {
-              throw new Error("核心补丁仍在等待确认，不能同时覆盖复现状态");
-            }
-            if (context.task.state !== "active") {
-              // 新复现会改变验证依据。即使旧代码曾 ready，也必须先回到 active，
-              // 让 VerificationRecord 失效后再保存新的语义动作窗口。
-              await context.store.transition(context.task, "active");
-            }
-            const driver = context.currentDriver();
-            if (!driver) throw new Error("浏览器不可用，不能保存运行时复现");
-            const reproduction = await saveReproduction(
-              context.store,
-              context.evidence,
-              context.task,
-              driver.trace,
-              {
-                title: input.reproduction.title,
-                expected: input.reproduction.expected,
-                actual: input.reproduction.actual,
-                evidence: input.reproduction.evidence,
-                assertions: input.reproduction.assertions,
-              },
-            );
-            reproductionId = reproduction.id;
-          } else if (input.reproduction) {
-            if (input.status !== "proposed" || !(await context.evidence.latest("reproduction"))) {
-              throw new Error("只有 reproduced 状态可以新建 reproduction；proposed 只能重复携带当前已保存的复现");
-            }
-          }
+          const { summary, risk } = validateFinishInput(context, input);
+          const outcome: FinishOutcome = {
+            reproductionId: await handleReproduction(context, input, progress),
+            executionApproved: null,
+            verification: null,
+            planSummary: "",
+            evidenceWarnings: [],
+          };
 
-          let executionApproved: boolean | null = null;
-          let verification: VerificationResult | null = null;
-          let planSummary = "";
-          let planTitle: string | undefined;
-          let planSteps: string[] | undefined;
-          let planVerification: string | undefined;
-          let planAllowedPaths: string[] | undefined;
-          let evidenceWarnings: string[] = [];
           if (input.status === "proposed" && input.plan) {
-            progress.line("整理方案并等待确认");
-            const title = plain(input.plan.title, 160);
-            const steps = input.plan.steps.map((step) => plain(
-              typeof step === "string" ? step : step.text,
-              300,
+            Object.assign(outcome, await handleProposed(
+              context,
+              { ...input, plan: input.plan },
+              summary,
+              risk,
+              extensionContext,
+              progress,
             ));
-            const verification = plain(input.plan.verification, 600);
-            if (UNRESOLVED_PLAN_PATTERN.test([
-              summary,
-              risk,
-              title,
-              ...steps,
-            ].join(" "))) {
-              throw new Error(
-                "完整修复方案仍包含未确认推测；请删除未证实的顺手修改，只保留现有证据直接证明的最小修复后重新 proposed。",
-              );
-            }
-            const allowedPaths = await validateWriteScopePaths(
-              context.task.worktreeRoot,
-              input.plan.allowedPaths,
-            );
-            planTitle = title;
-            planSteps = steps;
-            planVerification = verification;
-            planAllowedPaths = allowedPaths;
-            evidenceWarnings = await proposedEvidenceWarnings(context.evidence);
-            planSummary = [
-              "方案：" + title,
-              ...steps.map((step, index) => String(index + 1) + ". " + step),
-              "验证：" + verification,
-              "允许修改文件：" + allowedPaths.join(", "),
-            ].join("\n");
-            const approvalMessage = [
-              "病因：" + summary,
-              "",
-              planSummary,
-              evidenceWarnings.length > 0
-                ? "\n证据提示（软提示，不会阻止批准）：\n" + evidenceWarnings.map((warning) => "- " + warning).join("\n")
-                : "",
-              "",
-              "风险：" + risk,
-              "",
-              "确认后将为当前 Agent 运行开放受限 edit，并在 detached worktree 一次执行完整方案。",
-            ].join("\n");
-            const factLinks = (await context.evidence.active())
-              .filter((record) => (
-                record.kind === "source"
-                || record.kind === "game"
-                || record.kind === "check"
-                || record.kind === "reproduction"
-              ))
-              .map((record) => record.id);
-            await context.evidence.capture(claimEvidence({
-              status: input.status,
-              summary,
-              risk,
-              planTitle,
-              planSteps,
-              verification: planVerification,
-              allowedPaths: planAllowedPaths,
-              links: factLinks,
-            }));
-            executionApproved = await extensionContext.ui.confirm(
-              "是否执行完整修复方案",
-              approvalMessage,
-            );
-            const digest = createHash("sha256")
-              .update(context.task.id + ":" + context.task.baseHead + ":" + approvalMessage)
-              .digest("hex");
-            await appendEvent(context.store, context.task.id, "execution.approval", {
-              digest: digest.slice(0, 16),
-              approved: executionApproved,
-            });
-            if (executionApproved) {
-              await context.store.approveWriteScope(context.task, allowedPaths, digest);
-              context.approveExecution();
-            } else {
-              await context.store.closeWriteScope(context.task);
-              context.completeExecution();
-            }
           } else if (input.status === "result") {
-            progress.line("运行直接改动检查和复现");
-            if (!context.isExecutionApproved()) {
-              throw new Error("当前 Agent 运行没有已批准的修复方案；请使用 /verify 人工重试旧修改");
-            }
-            try {
-              verification = await context.verifyTask(signal, (line) => progress.line(line));
-              progress.line("候选验证通过");
-            } catch (error) {
-              await appendEvent(context.store, context.task.id, "tool.finish", {
-                status: "result",
-                verificationPassed: false,
-              });
-              throw new Error(
-                "自动验证未通过；保留修改权限，请继续修复后再次提交 result："
-                + verificationFailure(error),
-              );
-            }
-            if (
-              context.task.state !== "ready_to_apply"
-              || verification.changedPaths.length === 0
-            ) {
-              throw new Error("自动验证没有生成绑定当前变更的可应用结果");
-            }
-            context.completeExecution();
-            await context.store.closeWriteScope(context.task);
+            outcome.verification = await handleResult(context, signal, progress);
           } else if (input.status === "blocked") {
             progress.line("记录阻塞原因");
             context.completeExecution();
             await context.store.closeWriteScope(context.task);
           }
 
-          if (input.status === "result" || input.status === "blocked" || input.status === "diagnosed") {
-            const terminalLinks = input.status === "result"
-              ? (await context.evidence.active("verification")).map((record) => record.id)
-              : (await context.evidence.active())
-                .filter((record) => record.kind !== "claim")
-                .map((record) => record.id);
-            await context.evidence.capture(claimEvidence({
-              status: input.status,
-              summary,
-              risk,
-              links: terminalLinks,
-            }));
-          }
-
+          await captureTerminalClaim(context, input.status, summary, risk);
           if (input.status === "blocked" && context.task.state !== "blocked") {
             await context.store.transition(context.task, "blocked");
           } else {
@@ -449,43 +488,45 @@ export function registerFinishTool(
           }
           await appendEvent(context.store, context.task.id, "tool.finish", {
             status: input.status,
-            reproductionId,
-            verificationPassed: verification !== null,
+            reproductionId: outcome.reproductionId,
+            verificationPassed: outcome.verification !== null,
           });
+
           const visibleConclusion = [
             summary,
             input.status === "blocked" ? "阻塞：" + risk : "风险：" + risk,
-            input.status === "result" ? "候选聚焦验证通过；现在可以执行 /apply 写回已验证补丁。" : "",
-            executionApproved === false ? "用户未批准执行；worktree 保持不变。" : "",
+            input.status === "result"
+              ? "候选聚焦验证通过；现在可以执行 /apply 写回已验证补丁。"
+              : "",
+            outcome.executionApproved === false ? "用户未批准执行；worktree 保持不变。" : "",
           ].filter(Boolean).join("\n");
           if (
             input.status === "diagnosed"
             || input.status === "result"
             || input.status === "blocked"
-            || executionApproved === false
+            || outcome.executionApproved === false
           ) {
-            // 这些状态会 terminate，Pi 不会再生成 assistant 正文；必须在结束模型循环前
-            // 把已经脱敏的结论显式送到 Shell，否则用户只会看到“本轮处理完成”。
             extensionContext.ui.notify(
               visibleConclusion,
               input.status === "blocked" ? "warning" : "info",
             );
           }
+
           return {
             content: [{
-              type: "text",
+              type: "text" as const,
               text: [
                 summary,
-                planSummary,
+                outcome.planSummary,
                 "风险：" + risk,
-                executionApproved !== true && evidenceWarnings.length > 0
-                  ? "证据提示：" + evidenceWarnings.join(" ")
+                outcome.executionApproved !== true && outcome.evidenceWarnings.length > 0
+                  ? "证据提示：" + outcome.evidenceWarnings.join(" ")
                   : "",
-                executionApproved === true
+                outcome.executionApproved === true
                   ? "用户已批准方案，调查阶段结束；立即在 allowedPaths 内使用 edit 完整执行，不要再次询问或遍历 Evidence。只有缺少精确 oldText/baseHash 时才定向回读对应文件一次。"
                   : "",
-                executionApproved === false ? "用户未批准执行；worktree 保持不变。" : "",
-                reproductionId ? "复现：" + reproductionId : "",
+                outcome.executionApproved === false ? "用户未批准执行；worktree 保持不变。" : "",
+                outcome.reproductionId ? "复现：" + outcome.reproductionId : "",
                 context.task.state === "ready_to_apply"
                   ? "任务已验证，可由用户执行 /apply。"
                   : "任务尚未完成验证。",
@@ -494,20 +535,18 @@ export function registerFinishTool(
             details: {
               status: input.status,
               state: context.task.state,
-              reproductionId,
+              reproductionId: outcome.reproductionId,
               changedPaths: [...context.task.changedPaths],
-              executionApproved,
-              evidenceWarnings,
-              verification: verification ? {
-                worktreeHash: verification.record.worktreeHash,
-                checkIds: verification.record.checkIds,
-                replayPassed: verification.record.replayPassed,
+              executionApproved: outcome.executionApproved,
+              evidenceWarnings: outcome.evidenceWarnings,
+              verification: outcome.verification ? {
+                worktreeHash: outcome.verification.record.worktreeHash,
+                checkIds: outcome.verification.record.checkIds,
+                replayPassed: outcome.verification.record.replayPassed,
               } : null,
             },
-            // 复现和获批方案都在同一个 Pi Agent turn 内继续；拒绝、最终结果、诊断结论
-            // 或真实阻塞才结束本次自然请求，不创建隐藏的后继模型回合。
             terminate: input.status === "proposed"
-              ? executionApproved !== true
+              ? outcome.executionApproved !== true
               : input.status !== "reproduced",
           };
         },

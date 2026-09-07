@@ -373,60 +373,20 @@ export async function inspectReadRange(
   range: InspectReadRange,
   signal?: AbortSignal,
 ): Promise<{ text: string; details: InspectDetails; items: InspectItemDetails[] }> {
-  signal?.throwIfAborted();
-  const { target, startLine, lineCount, baseHash, existing, uncovered } = await prepareReadRange(
+  const preview = await previewReadRange(
     context,
     range,
+    signal,
+    MAX_INSPECT_BODY_BYTES,
   );
-  if (uncovered.length === 0) {
-    return coveredReadRange(target.relative, startLine, lineCount, baseHash, existing);
-  }
-
-  const outputs: string[] = [];
-  const items: InspectItemDetails[] = [];
-  const capturedDetails: InspectDetails[] = [];
-  for (const interval of uncovered) {
-    const requestedCount = interval.end - interval.start;
-    const readInput: InspectInput = {
-      action: "read",
-      path: target.relative,
-      startLine: interval.start,
-      lineCount: requestedCount,
-    };
-    const raw = await readPage(target, interval.start, requestedCount);
-    const captured = await captureInspectionText(context, readInput, raw, {
-      baseHash,
-      worktreeHash: null,
-    });
-    outputs.push(captured.text);
-    capturedDetails.push(captured.details);
-    items.push({
-      path: target.relative,
-      startLine: interval.start,
-      lineCount: captured.details.lines,
-      evidenceId: captured.details.evidenceId,
-      baseHash,
-      receiptOnly: captured.details.cacheKind !== "none",
-    });
-  }
-  const first = capturedDetails[0];
-  if (!first) throw new Error("inspect read 未生成源码证据");
-  return {
-    text: outputs.join("\n"),
-    details: {
-      ...first,
-      lines: capturedDetails.reduce((sum, details) => sum + details.lines, 0),
-      cacheKind: aggregateCacheKind(capturedDetails),
-      items,
-    },
-    items,
-  };
+  return await capturePreviewReadRange(context, preview);
 }
 
 export async function previewReadRange(
   context: InspectionContext,
   range: InspectReadRange,
   signal?: AbortSignal,
+  maximumBytes = MAX_BUNDLE_SOURCE_BYTES,
 ): Promise<ReadRangePreview> {
   signal?.throwIfAborted();
   const { target, startLine, lineCount, baseHash, existing, uncovered } = await prepareReadRange(
@@ -457,7 +417,7 @@ export async function previewReadRange(
       lineCount: requestedCount,
     };
     const raw = await readPage(target, interval.start, requestedCount);
-    const clipped = clipInspectionText(redactCredentials(raw), MAX_BUNDLE_SOURCE_BYTES);
+    const clipped = clipInspectionText(redactCredentials(raw), maximumBytes);
     const contentHash = hashBytes(Buffer.from(clipped.text, "utf8"));
     const evidenceId = "0000000000000000";
     const details: InspectDetails = {

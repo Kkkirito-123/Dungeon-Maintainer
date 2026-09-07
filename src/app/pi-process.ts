@@ -13,11 +13,13 @@ import { access, mkdir, open, readdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { requireApiKey, type MaintainerConfig } from "../config.js";
-import type { AgentRpcCommand } from "../agent/rpc.js";
-import { PiRpcProcess } from "../pi/rpc-process.js";
+import {
+  PiRpcProcess,
+  type PiRpcEvent,
+} from "../pi/rpc-process.js";
 import { FULL_CODING_TOOLS } from "../pi/tool-policy.js";
 import { startShellServer, type ShellHandle } from "../shell/server.js";
-import type { ShellTaskSwitchRequest } from "../shell/protocol.js";
+import type { ShellCoreCommand, ShellTaskSwitchRequest } from "../shell/protocol.js";
 import { TaskStore, createTaskId } from "../task/store.js";
 import type { TaskRecord } from "../task/types.js";
 import { EvidenceStore, hasTaskEvidence } from "../evidence/store.js";
@@ -55,7 +57,7 @@ export function resolvePiCliPath(): string {
 /**
  * 构造唯一允许的 Pi CLI 参数。
  *
- * @param task 当前 schema v4 任务。
+ * @param task 当前 schema v5 任务。
  * @param config `.env` 解析出的唯一 Provider 和模型配置。
  * @param loadedExtensionPath 编译后的维护器 Extension 路径；测试可显式注入。
  * @returns 不含 API Key 的参数数组。
@@ -123,7 +125,6 @@ export class AppController {
   private shell: ShellHandle | null = null;
   private switching = false;
   private closed = false;
-  private generation = 0;
   private resolveCompletion: (code: number) => void = () => undefined;
   private readonly completion = new Promise<number>((resolveCompletion) => {
     this.resolveCompletion = resolveCompletion;
@@ -154,7 +155,7 @@ export class AppController {
       readEvidenceSnapshot: async () => (
         await buildEvidenceSnapshot(new EvidenceStore(this.config.dataDir, this.activeTask))
       ),
-      sendPiCommand: async (command: AgentRpcCommand) => {
+      sendPiCommand: async (command: ShellCoreCommand) => {
         const result = await this.send(command);
         // 扩展命令在 Pi 内部等待 handler 完成后才返回 response；普通 prompt 仍等待 agent_settled。
         if (
@@ -212,7 +213,7 @@ export class AppController {
     return environment;
   }
 
-  private async send(command: AgentRpcCommand): Promise<unknown> {
+  private async send(command: ShellCoreCommand): Promise<unknown> {
     const rpc = this.rpc;
     if (!rpc) throw new Error("Pi RPC 尚未启动");
     if (command.type === "extension_ui_response") {
@@ -224,34 +225,25 @@ export class AppController {
 
   private handlePiEvent(
     rpc: PiRpcProcess,
-    generation: number,
-    event: unknown,
+    event: PiRpcEvent,
   ): void {
-    if (this.rpc !== rpc || generation !== this.generation || !this.shell) return;
+    if (this.rpc !== rpc || !this.shell) return;
     this.shell.handlePiEvent(event);
-    if (event && typeof event === "object" && !Array.isArray(event)) {
-      const type = (event as Record<string, unknown>).type;
-      if (type === "tool_execution_end" || type === "agent_settled") {
-        void this.shell.syncEvidence().catch(() => undefined);
-      }
+    if (event.type === "tool_execution_end" || event.type === "agent_settled") {
+      void this.shell.syncEvidence().catch(() => undefined);
     }
-    if (event && typeof event === "object" && !Array.isArray(event)) {
-      const record = event as Record<string, unknown>;
-      if (record.type === "message_update" && record.usage) {
-        this.shell.updateTurnUsage(record.usage);
-      }
-      if (record.type === "agent_settled" || record.type === "compaction_end") {
-        void this.shell.syncPiState().catch(() => undefined);
-      }
-      if (record.type === "pi_stderr" || record.type === "pi_protocol_error") {
-        this.shell.publish({
-          type: "notice",
-          level: "error",
-          text: record.type === "pi_protocol_error"
-            ? "Pi RPC 输出协议异常"
-            : "Pi RPC 进程报告错误输出",
-        });
-      }
+    if (event.type === "message_update") this.shell.updateTurnUsage(event.usage);
+    if (event.type === "agent_settled" || event.type === "compaction_end") {
+      void this.shell.syncPiState().catch(() => undefined);
+    }
+    if (event.type === "pi_stderr" || event.type === "pi_protocol_error") {
+      this.shell.publish({
+        type: "notice",
+        level: "error",
+        text: event.type === "pi_protocol_error"
+          ? "Pi RPC 输出协议异常"
+          : "Pi RPC 进程报告错误输出",
+      });
     }
     const activeTaskId = this.activeTask.id;
     void this.store.read(activeTaskId)
@@ -267,12 +259,11 @@ export class AppController {
   private async startActivePi(): Promise<void> {
     if (!this.shell) throw new Error("统一 Shell 尚未启动");
     if (this.rpc) throw new Error("已有活动 Pi 进程");
-    const generation = ++this.generation;
     const rpc = new PiRpcProcess(
       resolvePiCliPath(),
       buildPiArguments(this.activeTask, this.config, extensionPath()),
       this.environment(this.activeTask),
-      (event) => this.handlePiEvent(rpc, generation, event),
+      (event) => this.handlePiEvent(rpc, event),
     );
     this.rpc = rpc;
     try {
@@ -286,10 +277,7 @@ export class AppController {
       throw error;
     }
     void rpc.waitForExit().then((code) => {
-      if (
-        this.rpc !== rpc
-        || generation !== this.generation
-      ) return;
+      if (this.rpc !== rpc) return;
       this.rpc = null;
       if (this.switching || this.closed) return;
       this.closed = true;

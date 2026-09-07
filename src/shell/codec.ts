@@ -7,7 +7,7 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-type JsonRecord = Record<string, unknown>;
+export type JsonRecord = Record<string, unknown>;
 
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -38,16 +38,6 @@ export function modelSummary(value: unknown): {
     contextWindow: typeof value.contextWindow === "number" ? value.contextWindow : null,
     maxOutputTokens: typeof value.maxTokens === "number" ? value.maxTokens : null,
   };
-}
-
-/** 提取上下文压缩后的 Token 估算。 */
-export function compactionEstimate(value: unknown): number | null {
-  if (!isRecord(value)) return null;
-  return typeof value.estimatedTokensAfter === "number"
-    && Number.isFinite(value.estimatedTokensAfter)
-    && value.estimatedTokensAfter >= 0
-    ? Math.floor(value.estimatedTokensAfter)
-    : null;
 }
 
 /** 删除凭据模式并限制可展示文本长度。 */
@@ -102,11 +92,6 @@ export function writeText(response: ServerResponse, value: string, statusCode = 
     "cache-control": "no-store",
   });
   response.end(value);
-}
-
-/** 过滤出带类型字段的 Pi RPC 事件。 */
-export function parseRpcEvent(value: unknown): JsonRecord | null {
-  return isRecord(value) && typeof value.type === "string" ? value : null;
 }
 
 /** 提取 assistant 文本增量事件。 */

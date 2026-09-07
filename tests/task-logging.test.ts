@@ -29,7 +29,7 @@ describe("1.0 任务状态、证据与审批", () => {
         worktreeRoot: join(repository.temporaryRoot, "worktree"),
         piSessionDir: join(repository.temporaryRoot, "data", "tasks", "task-state", "pi"),
       });
-      assert.equal(task.schemaVersion, 4);
+      assert.equal(task.schemaVersion, 5);
       assert.equal(task.modelProfileId, "default");
       assert.equal(task.thinkingLevel, "off");
       assert.equal(task.writeScope.state, "unapproved");
@@ -75,7 +75,7 @@ describe("1.0 任务状态、证据与审批", () => {
 
       const persisted = await store.read(task.id);
       assert.equal(persisted.id, task.id);
-      assert.equal(persisted.schemaVersion, 4);
+      assert.equal(persisted.schemaVersion, 5);
       assert.equal(persisted.state, "created");
     } finally {
       await repository.dispose();
@@ -101,7 +101,7 @@ describe("1.0 任务状态、证据与审批", () => {
 
       await assert.rejects(
         store.read(task.id),
-        /任务记录格式、ID 或状态非法/u,
+        /任务 schema 版本不支持/u,
       );
       const missingField = { ...current };
       delete missingField.displayName;

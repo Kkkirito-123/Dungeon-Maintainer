@@ -2,14 +2,13 @@
  * 基于 baseHash 的精确文本补丁。
  *
  * patch 只支持唯一旧文本替换或创建新文本文件，不支持删除、移动、模糊匹配、整仓库
- * 格式化和任意覆盖。所有文件先完成路径、真实路径、Hash、预算、隐私和唯一匹配校验，
- * 核心路径再通过 Pi 确认框绑定本次精确补丁摘要。确认拒绝时不会写入任何字节。
+ * 格式化和任意覆盖。所有文件先完成路径、真实路径、Hash、预算、隐私和唯一匹配校验；
+ * 用户授权由调用它的 edit 工具在进入本模块前完成。
  *
  * beforePatch 必须在第一字节写入前建立浏览器复现检查点；afterPatch 在写入后等待 Vite
  * 并执行刷新重放。回调失败会保留 worktree 改动和事件证据，但绝不会触碰正式仓库。
  */
 
-import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { appendEvent } from "../logging/events.js";
@@ -20,11 +19,7 @@ import { containsCredentialText } from "../logging/redact.js";
 import type { TaskStore } from "../task/store.js";
 import type { TaskRecord } from "../task/types.js";
 import { hashBytes, hashFile, hashWorktree, pathExists } from "./git.js";
-import {
-  classifyPath,
-  decidePatch,
-  resolveProjectPath,
-} from "./policy.js";
+import { resolveProjectPath } from "./policy.js";
 import { assertWritePathAllowed } from "./write-scope.js";
 
 const MAX_FILES = 3;
@@ -38,7 +33,6 @@ export interface PreciseEdit {
   oldText: string;
   newText: string;
 }
-
 /** 一次 patch 调用。 */
 export interface PrecisePatchInput {
   edits: PreciseEdit[];
@@ -51,12 +45,11 @@ export interface PrecisePatchResult {
   changedLines: number;
 }
 
-/** patch 所需的任务、审批和浏览器生命周期依赖。 */
+/** patch 所需的任务和浏览器生命周期依赖。授权由上层 edit 在调用前完成。 */
 export interface PatchExecutionContext {
   task: TaskRecord;
   store: TaskStore;
   evidence?: EvidenceStore;
-  confirmCore(paths: readonly string[], changedLines: number): Promise<boolean>;
   beforePatch(): Promise<void>;
   afterPatch(): Promise<void>;
 }
@@ -115,23 +108,6 @@ function replacementWithLocalNewlines(
   return newText.replace(/\r\n|\r|\n/gu, newline);
 }
 
-function patchDigest(
-  task: TaskRecord,
-  edits: readonly PreciseEdit[],
-): string {
-  const safeShape = edits.map((edit) => ({
-    path: edit.path,
-    baseHash: edit.baseHash,
-    oldHash: hashBytes(Buffer.from(edit.oldText, "utf8")),
-    newHash: hashBytes(Buffer.from(edit.newText, "utf8")),
-  }));
-  return createHash("sha256").update(JSON.stringify({
-    taskId: task.id,
-    baseHead: task.baseHead,
-    edits: safeShape,
-  })).digest("hex");
-}
-
 /**
  * 在 detached worktree 中应用一批精确修改。
  *
@@ -168,10 +144,6 @@ export async function applyPrecisePatch(
   const rawPaths = input.edits.map((edit) => assertWritePathAllowed(task, edit.path));
   if (new Set(rawPaths).size !== rawPaths.length) {
     throw new Error("同一批 patch 不能重复修改同一路径");
-  }
-  const decision = decidePatch(rawPaths);
-  if (decision.kind === "deny") {
-    throw new Error("补丁越权：" + decision.paths.join(", "));
   }
   const changedLines = input.edits.reduce(
     (total, edit) => total + lineCost(edit.oldText, edit.newText),
@@ -258,24 +230,6 @@ export async function applyPrecisePatch(
     throw new Error("PATCH_BUDGET_EXCEEDED: 单任务最多修改 3 个文件");
   }
 
-  if (decision.kind === "approval") {
-    const digest = patchDigest(task, input.edits);
-    await store.requestApproval(task, decision.paths, digest);
-    const approved = await context.confirmCore(decision.paths, changedLines);
-    await store.resolveApproval(task, approved);
-    if (!approved) {
-      await appendEvent(store, task.id, "approval.rejected", {
-        pathCount: decision.paths.length,
-      });
-      throw new Error("用户拒绝核心路径修改");
-    }
-    await store.consumeApproval(task, digest);
-    await appendEvent(store, task.id, "approval.used", {
-      pathCount: decision.paths.length,
-      digest: digest.slice(0, 12),
-    });
-  }
-
   // 检查点必须先于第一字节源码写入。即使 Vite 立即观察到文件变化，后续 reload
   // 也只能从这份已确认的复现起点恢复，避免用重置后的楼层伪造修复成功。
   await context.beforePatch();
@@ -308,8 +262,7 @@ export async function applyPrecisePatch(
       links,
     ));
   }
-  // 核心审批无论批准或拒绝都会回到 active；非核心补丁从入口起也保持 active。
-  // 此处只持久化补丁元数据，避免制造一个实际上不可达的重复状态分支。
+  // 这里只持久化补丁元数据；授权已经在 edit 入口完成。
   await store.save(task);
   await appendEvent(store, task.id, "tool.patch", {
     pathCount: staged.length,
@@ -321,9 +274,4 @@ export async function applyPrecisePatch(
     hashes,
     changedLines,
   };
-}
-
-/** 判断新核心文件是否已经经过当前补丁审批，供测试和诊断使用。 */
-export function isCorePath(path: string): boolean {
-  return classifyPath(path, "write") === "core";
 }

@@ -38,6 +38,7 @@ export interface CheckToolContext {
   task: TaskRecord;
   store: TaskStore;
   evidence: EvidenceStore;
+  assertVerificationReady(): void;
 }
 
 /**
@@ -75,6 +76,7 @@ export function registerCheckTool(
         "check",
         input,
         async (progress) => {
+          context.assertVerificationReady();
           progress.line("运行固定检查：" + input.id);
           const result = await runCheck(
             context.store,

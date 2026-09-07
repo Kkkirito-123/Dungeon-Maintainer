@@ -20,7 +20,7 @@ import { removeTaskWorktree } from "../workspace/worktree.js";
 /**
  * 验证任务记录中的本地路径仍绑定当前维护器数据目录。
  *
- * @param task 从 task.json 读取并通过 schema v4 校验的任务。
+ * @param task 从 task.json 读取并通过 schema v5 校验的任务。
  * @param store 当前维护器任务存储。
  * @throws 路径逃逸或 baseHead 格式非法时拒绝恢复。
  */

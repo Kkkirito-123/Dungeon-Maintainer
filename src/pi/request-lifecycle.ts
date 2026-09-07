@@ -3,7 +3,7 @@
  *
  * 本模块持有当前自然语言目标和“是否要求修复”这一请求级状态，负责会话恢复、请求
  * 切换、Prompt 追加、Agent 收敛和进程关闭。它不执行代码写入或刷新；请求结束时只
- * 通过注入的回调撤销授权并清理由写入协调器持有的临时归因。
+ * 撤销当前请求的写入授权。
  */
 
 import type {
@@ -56,7 +56,6 @@ export interface RequestLifecycleOptions {
   gameRuntime: RequestGameRuntime;
   isExecutionApproved: () => boolean;
   setExecutionApproved: (approved: boolean) => void;
-  clearWriteAttributions: () => void;
 }
 
 /** 与一个 Pi session 绑定的请求和会话处理函数。 */
@@ -114,20 +113,24 @@ export function createRequestLifecycle(
     gameRuntime,
     isExecutionApproved,
     setExecutionApproved,
-    clearWriteAttributions,
   } = options;
-  let latestNaturalRequest = "";
-  let repairRequested = false;
+  const request = { text: "", repairRequested: false };
+
+  const releaseWriteAccess = async (): Promise<void> => {
+    const hasScope = hasActiveWriteScope(task);
+    if (isExecutionApproved() || hasScope) setExecutionApproved(false);
+    if (hasScope) await store.closeWriteScope(task);
+  };
 
   const beginNaturalRequest = async (
     text: string,
     continuation = false,
   ): Promise<void> => {
-    latestNaturalRequest = normalizedRequest(text);
-    const publishOnly = isPublishOnlyRequest(latestNaturalRequest);
-    repairRequested = continuation || (!publishOnly && requiresRepair(latestNaturalRequest));
+    request.text = normalizedRequest(text);
+    const publishOnly = isPublishOnlyRequest(request.text);
+    request.repairRequested = continuation || (!publishOnly && requiresRepair(request.text));
     await evidence.load();
-    if (repairRequested && !continuation) {
+    if (request.repairRequested && !continuation) {
       // 一个 taskId 可以承载多次用户输入，但新的修复目标不能继承上一 Bug 的
       // reproduction/claim/verification；明确“继续”时完整复用同一 Goal 的检查点。
       // 证据用于记忆与审计，不规定模型的调查顺序。
@@ -165,7 +168,7 @@ export function createRequestLifecycle(
     }
     await evidence.load();
     if (task.objective !== INITIAL_TASK_OBJECTIVE) {
-      latestNaturalRequest = task.objective;
+      request.text = task.objective;
     }
     const restoredReproduction = await readActiveReproduction(store, evidence, task);
     if (restoredReproduction && reproductionNeedsSqlRefresh(restoredReproduction)) {
@@ -178,11 +181,8 @@ export function createRequestLifecycle(
         reason: "process-restart-sql-not-persisted",
       });
     }
-    if (hasActiveWriteScope(task)) {
-      // 方案授权只属于批准它的 Agent 运行；进程恢复不能静默继承写权限。
-      await store.closeWriteScope(task);
-    }
-    setExecutionApproved(false);
+    // 方案授权只属于批准它的 Agent 运行；进程恢复不能静默继承写权限。
+    await releaseWriteAccess();
     pi.setSessionName("SQL Dungeon · " + task.id.slice(0, 8));
     await gameRuntime.ensure();
     await appendEvent(store, task.id, "pi.session_start", {
@@ -221,19 +221,17 @@ export function createRequestLifecycle(
     ) {
       if (event.streamingBehavior !== undefined) {
         // steer/follow-up 沿用 Pi 当前回合，并更新本轮自然语言目标。
-        latestNaturalRequest = normalizedRequest([
-          latestNaturalRequest,
+        request.text = normalizedRequest([
+          request.text,
           "追加要求：",
           text,
         ].filter(Boolean).join(" "));
-        repairRequested = repairRequested || requiresRepair(text);
+        request.repairRequested ||= requiresRepair(text);
         return { action: "continue" };
       }
-      const inheritedWriteScope = hasActiveWriteScope(task);
       const publishOnlyRequest = isPublishOnlyRequest(text);
       // 新请求先撤销上一请求的运行时授权，再执行任何可能失败的日志或证据 I/O。
-      if (isExecutionApproved() || inheritedWriteScope) setExecutionApproved(false);
-      if (inheritedWriteScope) await store.closeWriteScope(task);
+      await releaseWriteAccess();
       if (task.state === "ready_to_apply" && !publishOnlyRequest) {
         // ready_to_apply 只证明上一请求的 worktree 已验证；新修复目标必须回到 active。
         // 唯一例外是用户明确要求发布同一补丁：publish 仍会重新校验当前 Hash，并在
@@ -250,7 +248,7 @@ export function createRequestLifecycle(
       }
       const continuation = isContinuationRequest(text)
         && (
-          repairRequested
+          request.repairRequested
           || task.state === "verifying"
           || task.changedPaths.length > 0
           || hasFailedCheck
@@ -261,13 +259,13 @@ export function createRequestLifecycle(
       );
       if (
         task.objective === INITIAL_TASK_OBJECTIVE
-        || (repairRequested && task.objective !== latestNaturalRequest)
+        || (request.repairRequested && task.objective !== request.text)
       ) {
-        task.objective = latestNaturalRequest;
+        task.objective = request.text;
         await store.save(task);
         await appendEvent(store, task.id, "task.objective_set", {
           length: task.objective.length,
-          repairRequest: repairRequested,
+          repairRequest: request.repairRequested,
         });
       }
     }
@@ -282,12 +280,7 @@ export function createRequestLifecycle(
   const onAgentSettled = async (): Promise<void> => {
     // 与 Pi 原生一致：没有下一次工具调用就结束当前回合。这里只回收本轮临时写权限，
     // 不自动刷新、运行测试或验证；模型若未提交 finish(result)，用户可稍后显式 /verify。
-    const inheritedWriteScope = hasActiveWriteScope(task);
-    // 收权是安全状态变化，必须早于日志和遥测 I/O。即使后续持久化失败，当前
-    // Extension 也不能继续持有上一请求的 edit 执行授权。
-    if (isExecutionApproved() || inheritedWriteScope) setExecutionApproved(false);
-    clearWriteAttributions();
-    if (inheritedWriteScope) await store.closeWriteScope(task);
+    await releaseWriteAccess();
   };
 
   const onToolResult = async (event: ToolResultEvent): Promise<void> => {
@@ -326,7 +319,7 @@ export function createRequestLifecycle(
   };
 
   return {
-    repairRequested: () => repairRequested,
+    repairRequested: () => request.repairRequested,
     onSessionStart,
     onBeforeAgentStart,
     onInput,

@@ -403,7 +403,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
   });
 
   it("并行 edit 事件不会中止当前请求", async () => {
-    const harness = await createExtensionHarness("parallel-native-write-attribution");
+    const harness = await createExtensionHarness("parallel-edit-events");
     try {
       const { abortCalls, call, context, input, pi, result, task } = harness;
       const noopPaths = Array.from({ length: 5 }, (_, index) => (
@@ -479,7 +479,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
     }
   });
 
-  it("turn_end 清理缺失的 edit 写前归因", async () => {
+  it("turn_end 不再维护 edit 写前归因或补写结果", async () => {
     const harness = await createExtensionHarness("missing-native-results");
     try {
       const { abortCalls, call, context, input, pi, result, store, task } = harness;
@@ -550,7 +550,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       const writeOutcomes = events
         .filter((event) => event.type === "tool.write_outcome")
         .map((event) => event.detail.outcome);
-      assert.equal(writeOutcomes.filter((outcome) => outcome === "mutated").length, 1);
+      assert.equal(writeOutcomes.filter((outcome) => outcome === "mutated").length, 0);
       assert.equal(writeOutcomes.filter((outcome) => outcome === "failed").length, 0);
       assert.equal(writeOutcomes.includes("mutated_replay_failed"), false);
     } finally {
@@ -579,15 +579,18 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
         await append(taskId, event);
       };
 
-      const blocked = await call({
-        type: "tool_call",
-        toolCallId: "denied-write-with-audit-failure",
-        toolName: "edit",
-        input: writeEditInput("README.md", "changed\n"),
-      }, context) as { block: boolean; terminate: boolean; reason: string };
-      assert.equal(blocked.block, true);
-      assert.equal(blocked.terminate, false);
-      assert.match(blocked.reason, /未批准/u);
+      const edit = harness.pi.toolDefinitions.get("edit");
+      assert.ok(edit?.execute);
+      await assert.rejects(
+        async () => await edit.execute?.(
+          "denied-write-with-audit-failure",
+          writeEditInput("README.md", "changed\n"),
+          undefined,
+          undefined,
+          context,
+        ),
+        /未批准/u,
+      );
       assert.equal(abortCalls(), 0);
       assert.equal(await call({
         type: "tool_call",
@@ -672,26 +675,26 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       assert.equal(task.writeScope.state, "closed");
 
       let confirmations = 0;
-      const blocked = await requireHook(pi, "tool_call")({
-        type: "tool_call",
-        toolCallId: "write-after-input-log-failure",
-        toolName: "edit",
-        input: writeEditInput("README.md", "changed\n"),
-      }, {
-        abort: () => undefined,
-        hasUI: true,
-        ui: {
-          notify: () => undefined,
-          confirm: async () => {
-            confirmations += 1;
-            return false;
+      const edit = pi.toolDefinitions.get("edit");
+      assert.ok(edit?.execute);
+      await assert.rejects(async () => await edit.execute?.(
+        "write-after-input-log-failure",
+        writeEditInput("README.md", "changed\n"),
+        undefined,
+        undefined,
+        {
+          abort: () => undefined,
+          hasUI: true,
+          ui: {
+            notify: () => undefined,
+            confirm: async () => {
+              confirmations += 1;
+              return false;
+            },
           },
         },
-      }) as { block: boolean; terminate: boolean; reason: string };
+      ), /未批准/u);
       assert.equal(confirmations, 1);
-      assert.equal(blocked.block, true);
-      assert.equal(blocked.terminate, false);
-      assert.match(blocked.reason, /未批准/u);
     } finally {
       await repository.dispose();
     }
@@ -1267,15 +1270,18 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
         input: { action: "search", query: "terminal" },
       }, hookContext);
       assert.equal(inspectGate, undefined);
-      const unapprovedWrite = await requireHook(pi, "tool_call")({
-        type: "tool_call",
-        toolCallId: "unapproved-write",
-        toolName: "edit",
-        input: writeEditInput("README.md", "forbidden\n"),
-      }, hookContext) as { block: boolean; terminate: boolean; reason: string };
-      assert.equal(unapprovedWrite.block, true);
-      assert.equal(unapprovedWrite.terminate, false);
-      assert.match(unapprovedWrite.reason, /用户未批准本次代码修改/u);
+      const editTool = pi.toolDefinitions.get("edit");
+      assert.ok(editTool?.execute);
+      await assert.rejects(
+        async () => await editTool.execute?.(
+          "unapproved-write",
+          writeEditInput("README.md", "forbidden\n"),
+          undefined,
+          undefined,
+          hookContext,
+        ),
+        /用户未批准本次代码修改/u,
+      );
 
       const finishTool = pi.toolDefinitions.get("finish");
       assert.ok(finishTool?.execute);
@@ -1326,7 +1332,15 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       });
       const pi = new RecordingExtensionApi();
       let reloadCount = 0;
+      const trace = new SemanticTrace(10);
+      trace.push({
+        action: "use",
+        arguments: { actionId: "terminal" },
+        ok: false,
+        summary: "action-not-available",
+      });
       const driver = {
+        trace,
         ensureReproductionCheckpoint: async () => undefined,
         reloadAndReplay: async () => {
           reloadCount += 1;
@@ -1354,6 +1368,24 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       const finishTool = pi.toolDefinitions.get("finish");
       assert.ok(finishTool?.execute);
       await finishTool.execute(
+        "save-refresh-reproduction",
+        {
+          status: "reproduced",
+          summary: "终端动作已稳定复现失败。",
+          risk: "无",
+          reproduction: {
+            title: "终端未打开",
+            expected: "修复后 terminalOpen=true",
+            actual: "当前终端未打开",
+            evidence: ["terminal action 返回 action-not-available"],
+            assertions: { terminalOpen: true },
+          },
+        },
+        undefined,
+        undefined,
+        { ui: {} },
+      );
+      await finishTool.execute(
         "approve-refresh-failure",
         {
           status: "proposed",
@@ -1363,7 +1395,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
             title: "写入后刷新",
             steps: ["修改测试文件。"],
             verification: "检查刷新门禁。",
-            allowedPaths: ["changed.txt", "fallback.txt"],
+            allowedPaths: ["changed.txt"],
           },
         },
         undefined,
@@ -1371,60 +1403,46 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
         { ui: { confirm: async () => true } },
       );
 
-      const toolCallHook = requireHook(pi, "tool_call");
-      const toolResultHook = requireHook(pi, "tool_result");
       const hookContext = {
         ui: { notify: () => undefined },
       };
       const failingInput = createEditInput("changed.txt", "changed\n");
-      assert.equal(await toolCallHook({
-        type: "tool_call",
-        toolCallId: "write-failing-refresh",
-        toolName: "edit",
-        input: failingInput,
-      }, hookContext), undefined);
-      await writeFile(join(task.worktreeRoot, "changed.txt"), "changed\n", "utf8");
-      const editResult = await toolResultHook({
-        type: "tool_result",
-        toolCallId: "write-failing-refresh",
-        toolName: "edit",
-        input: failingInput,
-        content: [{ type: "text", text: "bridge unavailable" }],
-        details: { replay: { passed: false, actionCount: 0, failure: "bridge unavailable" } },
-        isError: true,
-      }, hookContext);
-      assert.equal(editResult, undefined);
-      assert.equal(reloadCount, 0);
+      const editTool = pi.toolDefinitions.get("edit");
+      assert.ok(editTool?.execute);
+      await assert.rejects(
+        async () => await editTool.execute?.(
+          "write-failing-refresh",
+          failingInput,
+          undefined,
+          undefined,
+          hookContext,
+        ),
+        /bridge unavailable/u,
+      );
+      assert.equal(reloadCount, 1);
 
-      // 正常路径已经在 tool_result 刷新；turn_end 只兜底处理缺失的结果事件。
-      assert.equal(await toolCallHook({
-        type: "tool_call",
-        toolCallId: "write-without-result-event",
-        toolName: "edit",
-        input: createEditInput("fallback.txt", "fallback\n"),
-      }, hookContext), undefined);
-      await writeFile(join(task.worktreeRoot, "fallback.txt"), "fallback\n", "utf8");
-      await requireHook(pi, "turn_end")({}, hookContext);
-      assert.equal(reloadCount, 0);
-
-      const blockedCheck = await toolCallHook({
-        type: "tool_call",
-        toolCallId: "blocked-check",
-        toolName: "check",
-        input: { id: "rules-validate" },
-      }, hookContext) as { block: boolean; terminate: boolean; reason: string };
-      assert.equal(blockedCheck.block, true);
-      assert.equal(blockedCheck.terminate, false);
-      assert.match(blockedCheck.reason, /刷新门禁未通过/u);
-      const blockedResult = await toolCallHook({
-        type: "tool_call",
-        toolCallId: "blocked-result",
-        toolName: "finish",
-        input: { status: "result" },
-      }, hookContext) as { block: boolean; terminate: boolean; reason: string };
-      assert.equal(blockedResult.block, true);
-      assert.equal(blockedResult.terminate, false);
-      assert.match(blockedResult.reason, /继续修复后重试/u);
+      const checkTool = pi.toolDefinitions.get("check");
+      assert.ok(checkTool?.execute);
+      await assert.rejects(
+        async () => await checkTool.execute?.(
+          "blocked-check",
+          { id: "rules-validate" },
+          undefined,
+          undefined,
+          hookContext,
+        ),
+        /刷新门禁未通过/u,
+      );
+      await assert.rejects(
+        async () => await finishTool.execute?.(
+          "blocked-result",
+          { status: "result", summary: "声称修复完成。", risk: "无" },
+          undefined,
+          undefined,
+          hookContext,
+        ),
+        /继续修复后重试/u,
+      );
       assert.deepEqual(pi.activeTools, [...FULL_CODING_TOOLS]);
     } finally {
       await repository.dispose();
@@ -1537,10 +1555,32 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
         piSessionDir: join(store.taskDir("task-patch-refresh-recovery"), "pi"),
       });
       const pi = new RecordingExtensionApi();
+      const trace = new SemanticTrace(10);
+      trace.push({
+        action: "use",
+        arguments: { actionId: "terminal" },
+        ok: false,
+        summary: "action-not-available",
+      });
+      let failReplay = true;
       const driver = {
+        trace,
         ensureReproductionCheckpoint: async () => undefined,
         reloadAndReplay: async () => {
-          throw new Error("bridge unavailable");
+          if (failReplay) {
+            failReplay = false;
+            throw new Error("bridge unavailable");
+          }
+          return {
+            passed: true,
+            actionCount: 1,
+            finalView: { floor: 1, progress: { lessons: 0 }, terminal: null } as PlayView,
+            failure: null,
+            queryAccepted: null,
+            queryAcceptedSequence: [],
+            queryPlanSequence: [],
+            maxObservedStageIndex: null,
+          };
         },
       } as unknown as GameDriver;
       installDungeonMaintainerExtension(pi as unknown as ExtensionAPI, {
@@ -1561,6 +1601,24 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
       const finishTool = pi.toolDefinitions.get("finish");
       assert.ok(finishTool?.execute);
       await finishTool.execute(
+        "save-patch-refresh-reproduction",
+        {
+          status: "reproduced",
+          summary: "终端动作已稳定复现失败。",
+          risk: "无",
+          reproduction: {
+            title: "终端动作失败",
+            expected: "修复后保持在第一层",
+            actual: "当前动作不可用",
+            evidence: ["terminal action 返回 action-not-available"],
+            assertions: { floor: 1 },
+          },
+        },
+        undefined,
+        undefined,
+        { ui: {} },
+      );
+      await finishTool.execute(
         "approve-patch-refresh-recovery",
         {
           status: "proposed",
@@ -1578,75 +1636,37 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
         { ui: { confirm: async () => true } },
       );
 
-      const toolCallHook = requireHook(pi, "tool_call");
-      const toolResultHook = requireHook(pi, "tool_result");
       const hookContext = { ui: { notify: () => undefined } };
       const writeInput = createEditInput("changed.txt", "changed\n");
-      assert.equal(await toolCallHook({
-        type: "tool_call",
-        toolCallId: "write-before-patch-recovery",
-        toolName: "edit",
-        input: writeInput,
-      }, hookContext), undefined);
-      await writeFile(join(task.worktreeRoot, "changed.txt"), "changed\n", "utf8");
-      const failedWrite = await toolResultHook({
-        type: "tool_result",
-        toolCallId: "write-before-patch-recovery",
-        toolName: "edit",
-        input: writeInput,
-        content: [{ type: "text", text: "bridge unavailable" }],
-        details: { replay: { passed: false, actionCount: 0, failure: "bridge unavailable" } },
-        isError: true,
-      }, hookContext);
-      assert.equal(failedWrite, undefined);
-      const blockedBeforePatch = await toolCallHook({
-        type: "tool_call",
-        toolCallId: "check-before-patch-recovery",
-        toolName: "check",
-        input: { id: "rules-validate" },
-      }, hookContext) as { block: boolean };
-      assert.equal(blockedBeforePatch.block, true);
+      const editTool = pi.toolDefinitions.get("edit");
+      assert.ok(editTool?.execute);
+      await assert.rejects(
+        async () => await editTool.execute?.(
+          "write-before-patch-recovery",
+          writeInput,
+          undefined,
+          undefined,
+          hookContext,
+        ),
+        /bridge unavailable/u,
+      );
 
       const patchInput = {
         edits: [{
           mode: "replace",
           path: "README.md",
-          baseHash: "baseline-hash",
+          baseHash: await hashFile(task.worktreeRoot, "README.md"),
           oldText: "baseline",
           newText: "fixed",
         }],
       };
-      assert.equal(await toolCallHook({
-        type: "tool_call",
-        toolCallId: "patch-refresh-recovery",
-        toolName: "edit",
-        input: patchInput,
-      }, hookContext), undefined);
-      await writeFile(join(task.worktreeRoot, "README.md"), "fixed\n", "utf8");
-      await toolResultHook({
-        type: "tool_result",
-        toolCallId: "patch-refresh-recovery",
-        toolName: "edit",
-        input: patchInput,
-        content: [{ type: "text", text: "patch replay passed" }],
-        details: {
-          replay: { passed: true, actionCount: 0, failure: null },
-        },
-        isError: false,
-      }, hookContext);
-
-      assert.equal(await toolCallHook({
-        type: "tool_call",
-        toolCallId: "check-after-patch-recovery",
-        toolName: "check",
-        input: { id: "rules-validate" },
-      }, hookContext), undefined);
-      assert.equal(await toolCallHook({
-        type: "tool_call",
-        toolCallId: "result-after-patch-recovery",
-        toolName: "finish",
-        input: { status: "result" },
-      }, hookContext), undefined);
+      await editTool.execute(
+        "patch-refresh-recovery",
+        patchInput,
+        undefined,
+        undefined,
+        hookContext,
+      );
 
       const events = (await readFile(join(store.taskDir(task.id), "events.jsonl"), "utf8"))
         .split(/\r?\n/u)
@@ -1662,7 +1682,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
     }
   });
 
-  it("edit 自身重放失败后，统一刷新门禁阻断 check 和 result", async () => {
+  it("tool_result 不再推断 edit 写入或刷新结果", async () => {
     const repository = await createTemporaryGitRepository({
       "README.md": "baseline\n",
     });
@@ -1746,24 +1766,20 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
         isError: true,
       }, hookContext);
 
-      const blockedCheck = await toolCallHook({
+      const checkHookResult = await toolCallHook({
         type: "tool_call",
         toolCallId: "check-after-patch-refresh-failure",
         toolName: "check",
         input: { id: "rules-validate" },
-      }, hookContext) as { block: boolean; terminate: boolean; reason: string };
-      assert.equal(blockedCheck.block, true);
-      assert.equal(blockedCheck.terminate, false);
-      assert.match(blockedCheck.reason, /edit 已写入/u);
-      const blockedResult = await toolCallHook({
+      }, hookContext);
+      assert.equal(checkHookResult, undefined);
+      const finishHookResult = await toolCallHook({
         type: "tool_call",
         toolCallId: "result-after-patch-refresh-failure",
         toolName: "finish",
         input: { status: "result" },
-      }, hookContext) as { block: boolean; terminate: boolean; reason: string };
-      assert.equal(blockedResult.block, true);
-      assert.equal(blockedResult.terminate, false);
-      assert.match(blockedResult.reason, /bridge unavailable/u);
+      }, hookContext);
+      assert.equal(finishHookResult, undefined);
 
       const events = (await readFile(join(store.taskDir(task.id), "events.jsonl"), "utf8"))
         .split(/\r?\n/u)
@@ -1773,9 +1789,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
         event.type === "tool.write_outcome"
         && event.detail.toolName === "edit"
       ));
-      assert.ok(write);
-      assert.equal(write.detail.outcome, "mutated_replay_failed");
-      assert.equal(write.detail.reasonCode, "refresh-replay-failed");
+      assert.equal(write, undefined);
     } finally {
       await repository.dispose();
     }
@@ -1836,35 +1850,31 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
         undefined,
         { ui: { confirm: async () => true } },
       );
-      const toolCallHook = requireHook(pi, "tool_call");
-      const formalRepositoryPath = await toolCallHook({
-        type: "tool_call",
-        toolCallId: "formal-repo-write",
-        toolName: "edit",
-        input: writeEditInput(join(task.repoRoot, "README.md"), "forbidden\n"),
-      }, { abort: () => undefined, ui: { notify: () => undefined } }) as {
-        block: boolean;
-        terminate: boolean;
-        reason: string;
-      };
-      assert.equal(formalRepositoryPath.block, true);
-      assert.equal(formalRepositoryPath.terminate, false);
-      assert.match(formalRepositoryPath.reason, /项目相对路径|正式仓库绝对路径/u);
-      const parentTraversal = await toolCallHook({
-        type: "tool_call",
-        toolCallId: "parent-traversal-write",
-        toolName: "edit",
-        input: writeEditInput("../escape.txt", "b"),
-      }, { abort: () => undefined, ui: { notify: () => undefined } }) as {
-        block: boolean;
-        terminate: boolean;
-        reason: string;
-      };
-      assert.equal(parentTraversal.block, true);
-      assert.equal(parentTraversal.terminate, false);
-      assert.match(parentTraversal.reason, /路径不得离开项目根目录|不能包含 \.\./u);
+      const editTool = pi.toolDefinitions.get("edit");
+      assert.ok(editTool?.execute);
+      const editContext = { abort: () => undefined, ui: { notify: () => undefined } };
+      await assert.rejects(
+        async () => await editTool.execute?.(
+          "formal-repo-write",
+          writeEditInput(join(task.repoRoot, "README.md"), "forbidden\n"),
+          undefined,
+          undefined,
+          editContext,
+        ),
+        /项目相对路径|正式仓库绝对路径/u,
+      );
+      await assert.rejects(
+        async () => await editTool.execute?.(
+          "parent-traversal-write",
+          writeEditInput("../escape.txt", "b"),
+          undefined,
+          undefined,
+          editContext,
+        ),
+        /路径不得离开项目根目录|不能包含 \.\./u,
+      );
 
-      const outsideDirectory = join(repository.temporaryRoot, "outside-native-write");
+      const outsideDirectory = join(repository.temporaryRoot, "outside-edit");
       const linkedDirectory = join(task.worktreeRoot, "linked-outside");
       await mkdir(outsideDirectory, { recursive: true });
       await symlink(
@@ -1872,19 +1882,16 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
         linkedDirectory,
         process.platform === "win32" ? "junction" : "dir",
       );
-      const linkedEscape = await toolCallHook({
-        type: "tool_call",
-        toolCallId: "linked-escape-write",
-        toolName: "edit",
-        input: createEditInput("linked-outside/escape.txt", "forbidden\n"),
-      }, { abort: () => undefined, ui: { notify: () => undefined } }) as {
-        block: boolean;
-        terminate: boolean;
-        reason: string;
-      };
-      assert.equal(linkedEscape.block, true);
-      assert.equal(linkedEscape.terminate, false);
-      assert.match(linkedEscape.reason, /realpath|符号链接|junction/u);
+      await assert.rejects(
+        async () => await editTool.execute?.(
+          "linked-escape-write",
+          createEditInput("linked-outside/escape.txt", "forbidden\n"),
+          undefined,
+          undefined,
+          editContext,
+        ),
+        /realpath|符号链接|junction/u,
+      );
       assert.equal(runtimeEnsureCount, 0);
 
       // 三次路径安全失败都只拒绝当前调用，请求与写授权仍有效。下一个自然输入
@@ -1947,6 +1954,7 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
         worktreeRoot: repository.repoRoot,
         piSessionDir: join(store.taskDir("task-first-write"), "pi"),
       });
+      await store.transition(task, "active");
       const pi = new RecordingExtensionApi();
       installDungeonMaintainerExtension(pi as unknown as ExtensionAPI, {
         config: loadConfig({ LOCALAPPDATA: dataDir, MAINTAINER_API_KEY: "provider-secret" }),
@@ -1973,27 +1981,16 @@ describe("Pi Extension 单循环工具、命令和会话阻断", () => {
           notify: () => undefined,
         },
       };
-      const call = requireHook(pi, "tool_call");
-      const result = requireHook(pi, "tool_result");
-      const input = writeEditInput("README.md", "fixed\n");
-      assert.equal(await call({
-        type: "tool_call",
-        toolCallId: "first-write",
-        toolName: "edit",
-        input,
-      }, context), undefined);
+      const edit = pi.toolDefinitions.get("edit");
+      assert.ok(edit?.execute);
+      const input = writeEditInput(
+        "README.md",
+        "fixed\n",
+        await hashFile(task.worktreeRoot, "README.md"),
+      );
+      await edit.execute("first-write", input, undefined, undefined, context);
       assert.equal(confirmations, 1);
       assert.equal(task.writeScope.state, "approved");
-      await writeFile(join(task.worktreeRoot, "README.md"), "fixed\n", "utf8");
-      await result({
-        type: "tool_result",
-        toolCallId: "first-write",
-        toolName: "edit",
-        input,
-        content: [{ type: "text", text: "written" }],
-        details: undefined,
-        isError: false,
-      }, context);
       assert.equal(await readFile(join(task.worktreeRoot, "README.md"), "utf8"), "fixed\n");
     } finally {
       await repository.dispose();

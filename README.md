@@ -90,6 +90,8 @@ Dungeon Maintainer 是为 [SQL Dungeon（`SELECT * FROM DUNGEON`）](https://git
 
 完整判分边界、结果契约和断点恢复方式见 [内置 Eval 文档](docs/EVAL.md)。
 
+代码分层、请求链路、写入事务和面向甲方的讲解主线见 [轻量架构说明](docs/ARCHITECTURE.md)。
+
 ## 🧭 工作方式
 
 ```text
@@ -228,7 +230,7 @@ Pi 原生工具和 Bash 均不加载。维护器只向模型注册以下 9 个�
 <details>
 <summary><b>任务状态与本地数据</b></summary>
 
-任务记录固定为 schema v4，可处于 `created`、`active`、`awaiting_approval`、`verifying`、`paused`、`ready_to_apply`、`applied`、`blocked` 或 `discarded`。旧 schema 不迁移。
+任务记录固定为 schema v5，可处于 `created`、`active`、`awaiting_approval`、`verifying`、`paused`、`ready_to_apply`、`applied`、`blocked` 或 `discarded`。旧 schema 不迁移。
 
 ```text
 %LOCALAPPDATA%\dungeon-maintainer\

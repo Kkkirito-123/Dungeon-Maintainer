@@ -54,14 +54,13 @@ describe("Pi Eval baseline 来源", () => {
     }
   });
 
-  it("settled 后先停止 Pi 和游戏工具，再关闭 Shell", async () => {
+  it("settled 后只需停止 Pi，游戏工具随 session_shutdown 卸载", async () => {
     const lifecycle: string[] = [];
     const failures = await teardownMaintainerRuntime({
       stopPi: async () => { lifecycle.push("pi-and-game-tools-stopped"); },
-      closeShell: async () => { lifecycle.push("shell-closed"); },
     });
     assert.deepEqual(failures, []);
-    assert.deepEqual(lifecycle, ["pi-and-game-tools-stopped", "shell-closed"]);
+    assert.deepEqual(lifecycle, ["pi-and-game-tools-stopped"]);
 
     const failedLifecycle: string[] = [];
     assert.deepEqual(await teardownMaintainerRuntime({
@@ -69,9 +68,8 @@ describe("Pi Eval baseline 来源", () => {
         failedLifecycle.push("pi-stop-attempted");
         throw new Error("expected");
       },
-      closeShell: async () => { failedLifecycle.push("shell-still-closed"); },
     }), ["pi-stop-failed"]);
-    assert.deepEqual(failedLifecycle, ["pi-stop-attempted", "shell-still-closed"]);
+    assert.deepEqual(failedLifecycle, ["pi-stop-attempted"]);
   });
 
   it("区分写入尝试、真实 mutation 和最终保留变更", () => {

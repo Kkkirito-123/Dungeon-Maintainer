@@ -1,7 +1,7 @@
 /**
  * 项目路径与修改权限策略。
  *
- * 本模块在文件系统层落实自动修改、核心审批和永久禁止三类边界。提示词只能帮助
+ * 本模块在文件系统层落实允许访问和永久禁止两类边界。提示词只能帮助
  * Agent 理解规则，真正的访问必须经过 normalizeProjectPath、classifyPath 和
  * resolveProjectPath。真实路径检查会解析目标或最近存在的父目录，阻止仓库内符号
  * 链接指向外部路径。
@@ -11,14 +11,7 @@ import { lstat, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 /** 文件相对目标项目的权限类别。 */
-export type PathClass = "auto" | "core" | "denied";
-
-/** 一组补丁路径的权限判断。 */
-export interface PatchDecision {
-  kind: "allow" | "approval" | "deny";
-  paths: string[];
-  reason: string;
-}
+export type PathClass = "allowed" | "denied";
 
 const DENIED_SEGMENTS = new Set([
   ".git",
@@ -35,16 +28,6 @@ const LEGAL_FILES = new Set([
   "license.md",
   "copying",
   "attributions.md",
-]);
-const ROOT_CORE_FILES = new Set([
-  "package.json",
-  "pnpm-lock.yaml",
-  "pyproject.toml",
-  "tsconfig.json",
-  "vite.config.ts",
-  "agents.md",
-  "agents.zh-cn.md",
-  "architecture.md",
 ]);
 
 function slash(value: string): string {
@@ -101,7 +84,7 @@ async function assertNoLinkedWriteSegment(
  *
  * @param path 项目相对路径。
  * @param operation 读取或写入；法律文件只禁止写入。
- * @returns 自动、核心或永久禁止类别。
+ * @returns 允许或永久禁止类别。
  */
 export function classifyPath(
   path: string,
@@ -122,28 +105,7 @@ export function classifyPath(
     return "denied";
   }
   if (operation === "write" && LEGAL_FILES.has(name)) return "denied";
-  if (
-    lower.startsWith("game/docs/")
-    || lower.startsWith("game/tests/")
-    || lower.startsWith("game/src/presentation/")
-  ) {
-    return "auto";
-  }
-  if (
-    lower.startsWith("game/src/domain/")
-    || lower.startsWith("game/src/content/")
-    || lower.startsWith("game/src/contracts/")
-    || lower.startsWith("game/src/infrastructure/")
-    || lower.startsWith("game/src/application/")
-    || lower.startsWith("game/src/devtools/")
-    || lower.startsWith("agent/")
-    || lower.startsWith("scripts/")
-    || lower.startsWith(".github/")
-    || ROOT_CORE_FILES.has(lower)
-  ) {
-    return "core";
-  }
-  return "core";
+  return "allowed";
 }
 
 async function nearestExisting(path: string): Promise<string> {
@@ -194,39 +156,4 @@ export async function resolveProjectPath(
     throw new Error("路径通过符号链接离开项目：" + normalized);
   }
   return { absolute: candidate, relative: normalized };
-}
-
-/**
- * 判断一组文件的写权限。
- *
- * @param paths 计划修改的项目相对路径。
- * @returns 永久拒绝、需要 Pi 确认框或可自动修改。
- */
-export function decidePatch(paths: readonly string[]): PatchDecision {
-  const normalized = [...new Set(paths.map(normalizeProjectPath))].sort();
-  const denied = normalized.filter(
-    (path) => classifyPath(path, "write") === "denied",
-  );
-  if (denied.length > 0) {
-    return {
-      kind: "deny",
-      paths: denied,
-      reason: "包含永久禁止修改的路径",
-    };
-  }
-  const core = normalized.filter(
-    (path) => classifyPath(path, "write") === "core",
-  );
-  if (core.length > 0) {
-    return {
-      kind: "approval",
-      paths: core,
-      reason: "核心路径需要本次精确补丁审批",
-    };
-  }
-  return {
-    kind: "allow",
-    paths: normalized,
-    reason: "全部位于自动修改范围",
-  };
 }

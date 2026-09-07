@@ -211,9 +211,6 @@ describe("detached worktree 与显式 apply", () => {
       await applyPrecisePatch({
         task,
         store,
-        confirmCore: async () => {
-          throw new Error("presentation 路径不应请求核心审批");
-        },
         beforePatch: async () => undefined,
         afterPatch: async () => undefined,
       }, { edits: [{
@@ -378,7 +375,7 @@ describe("detached worktree 与显式 apply", () => {
       const taskDir = join(dataDir, "tasks", "task-discard");
       await writeFile(join(worktreeRoot, path), "export const status = 'discarded';\n", "utf8");
       const patchPath = await snapshotWorktreePatch({
-        schemaVersion: 4,
+        schemaVersion: 5,
         id: "task-discard",
         displayName: "丢弃测试",
         objective: "discard",
@@ -486,9 +483,6 @@ describe("detached worktree 与显式 apply", () => {
       await applyPrecisePatch({
         task,
         store,
-        confirmCore: async () => {
-          throw new Error("presentation 路径不应请求核心审批");
-        },
         beforePatch: async () => undefined,
         afterPatch: async () => undefined,
       }, { edits: [

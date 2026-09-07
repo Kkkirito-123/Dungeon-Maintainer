@@ -10,8 +10,15 @@
  */
 
 import type { TaskRecord, TaskState } from "../task/types.js";
-import { promptTokenLimit } from "../agent/token-control.js";
 import type { EvidenceNode } from "../evidence/view.js";
+
+/** Shell 仅展示 Pi 上下文安全线；是否压缩完全由 Pi 原生机制决定。 */
+export function promptTokenLimit(contextWindow: number, maxOutputTokens: number): number {
+  return Math.max(0, Math.min(
+    Math.floor(contextWindow * 0.75),
+    contextWindow - maxOutputTokens,
+  ));
+}
 
 /** Shell 请求 AppController 切换到来源工作树或可恢复任务。 */
 export interface ShellTaskSwitchRequest {
@@ -106,6 +113,23 @@ export type ShellUiResponse =
   | { id: string; confirmed: boolean }
   | { id: string; value: string }
   | { id: string; cancelled: true };
+
+/** Shell 可以交给运行核心的完整命令集；Pi SDK 类型只存在于 App 适配器。 */
+export type ShellCoreCommand =
+  | { id?: string; type: "prompt"; message: string; streamingBehavior?: "steer" }
+  | { id?: string; type: "abort" }
+  | { id?: string; type: "compact"; customInstructions?: string }
+  | { id?: string; type: "get_state" }
+  | { id?: string; type: "get_available_thinking_levels" }
+  | { id?: string; type: "get_session_stats" }
+  | { id?: string; type: "set_thinking_level"; level: TaskRecord["thinkingLevel"] }
+  | ({ type: "extension_ui_response" } & ShellUiResponse);
+
+/** RPC 边界已经确认存在 type 字段的中立事件。 */
+export interface ShellCoreEvent {
+  type: string;
+  [key: string]: unknown;
+}
 
 /** ShellServer 启动时需要的最小配置。 */
 export interface ShellStatusConfig {

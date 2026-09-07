@@ -10,6 +10,7 @@
  * 消费记录，供非模型调用和安全测试使用。
  */
 
+import { createHash } from "node:crypto";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -19,6 +20,7 @@ import { Type, type Static } from "typebox";
 import type { GameDriver, ReplayResult } from "../../game/driver.js";
 import type { EvidenceStore } from "../../evidence/store.js";
 import { appendEvent } from "../../logging/events.js";
+import { redactText } from "../../logging/redact.js";
 import { readActiveReproduction } from "../../repair/reproduction.js";
 import { replayReproduction } from "../../repair/replay.js";
 import type { TaskStore } from "../../task/store.js";
@@ -27,7 +29,10 @@ import {
   applyPrecisePatch,
   type PrecisePatchResult,
 } from "../../workspace/patch.js";
-import { assertWritePathAllowed } from "../../workspace/write-scope.js";
+import {
+  assertWritePathAllowed,
+  validateWriteScopePaths,
+} from "../../workspace/write-scope.js";
 import { hashWorktree } from "../../workspace/git.js";
 import { resolveProjectPath } from "../../workspace/policy.js";
 import { withProgress } from "../../progress/reporter.js";
@@ -68,25 +73,99 @@ export interface PatchToolContext {
   evidence: EvidenceStore;
   currentDriver(): GameDriver | null;
   ensureGame(): Promise<GameDriver>;
+  approveExecution(): void;
   isExecutionApproved(): boolean;
+  setRefreshFailure(failure: string | null): void;
 }
 
-async function confirmCorePatch(
-  context: ExtensionContext,
-  task: TaskRecord,
-  paths: readonly string[],
-  changedLines: number,
-): Promise<boolean> {
-  if (!context.hasUI) return false;
-  const message = [
-    "任务目标：" + task.objective,
-    "Git 基线：" + task.baseHead,
-    "精确路径：",
-    ...paths.map((path) => "  - " + path),
-    "修改规模：本次约 " + String(changedLines) + " 行补丁成本",
-    "授权只绑定本任务、本基线、本路径和本次正文 Hash，且仅可使用一次。",
-  ].join("\n");
-  return await context.ui.confirm("确认核心代码修改", message);
+class EditAuthorizationError extends Error {
+  readonly reasonCode: "authorization-denied" | "authorization-unavailable" | "path-rejected";
+
+  constructor(message: string, reasonCode: EditAuthorizationError["reasonCode"]) {
+    super(message);
+    this.reasonCode = reasonCode;
+  }
+}
+
+function safeFailure(error: unknown): string {
+  const message = error instanceof Error ? error.message : "未知写入错误";
+  return redactText(message).replace(/\s+/gu, " ").trim().slice(0, 400)
+    || "未知写入错误";
+}
+
+async function recordWriteOutcome(
+  context: PatchToolContext,
+  outcome: "rejected" | "failed" | "noop" | "mutated" | "mutated_replay_failed",
+  worktreeHash: string,
+  reasonCode: string,
+): Promise<void> {
+  await appendEvent(context.store, context.task.id, "tool.write_outcome", {
+    toolName: "edit",
+    outcome,
+    count: 1,
+    worktreeHash: worktreeHash.slice(0, 16),
+    reasonCode,
+  }).catch(() => undefined);
+}
+
+async function authorizeEdit(
+  context: PatchToolContext,
+  extensionContext: ExtensionContext,
+  input: EditInput,
+): Promise<void> {
+  let paths: string[];
+  try {
+    paths = await validateWriteScopePaths(
+      context.task.worktreeRoot,
+      input.edits.map((edit) => edit.path),
+    );
+  } catch (error) {
+    throw new EditAuthorizationError(safeFailure(error), "path-rejected");
+  }
+
+  if (!context.isExecutionApproved()) {
+    const message = [
+      "模型准备修改以下文件：",
+      ...paths.map((path) => "- " + path),
+      "",
+      "批准后，本轮只允许修改这些文件；代码仍只写入 detached worktree，最终验证通过后才可 /apply。",
+    ].join("\n");
+    const approved = extensionContext.hasUI
+      && await extensionContext.ui.confirm("是否允许本次代码修改", message);
+    const digest = createHash("sha256")
+      .update(context.task.id + ":" + context.task.baseHead + ":" + paths.join("\n"))
+      .digest("hex");
+    await appendEvent(context.store, context.task.id, "execution.approval", {
+      digest: digest.slice(0, 16),
+      approved,
+      pathCount: paths.length,
+      source: "first-write",
+    }).catch(() => undefined);
+    if (!approved) {
+      throw new EditAuthorizationError(
+        "用户未批准本次代码修改；worktree 保持不变。",
+        "authorization-denied",
+      );
+    }
+    try {
+      await context.store.approveWriteScope(context.task, paths, digest);
+      context.approveExecution();
+    } catch (error) {
+      throw new EditAuthorizationError(
+        "无法保存本次写入授权：" + safeFailure(error),
+        "authorization-unavailable",
+      );
+    }
+  }
+
+  try {
+    await Promise.all(paths.map(async (path) => {
+      const scoped = assertWritePathAllowed(context.task, path);
+      await resolveProjectPath(context.task.worktreeRoot, scoped, "write");
+    }));
+  } catch (error) {
+    throw new EditAuthorizationError(safeFailure(error), "path-rejected");
+  }
 }
 
 /**
@@ -112,15 +191,15 @@ export function registerEditTool(
     executionMode: "sequential",
     parameters: PatchParameters,
     async execute(_toolCallId, input: EditInput, signal, _onUpdate, extensionContext) {
-      return await withProgress(
-        extensionContext.ui,
-        "edit",
-        input,
-        async (progress) => {
+      const beforeHash = await hashWorktree(context.task.worktreeRoot);
+      try {
+        await authorizeEdit(context, extensionContext, input);
+        const response = await withProgress(
+          extensionContext.ui,
+          "edit",
+          input,
+          async (progress) => {
           progress.line("检查写入范围和基线");
-          if (!context.isExecutionApproved()) {
-            throw new Error("完整修复方案尚未获用户确认，不能修改代码。");
-          }
           const reproduction = await readActiveReproduction(
             context.store,
             context.evidence,
@@ -160,16 +239,6 @@ export function registerEditTool(
             task: context.task,
             store: context.store,
             evidence: context.evidence,
-            confirmCore: async (paths, changedLines) => {
-              // 已批准的方案直接复用授权；其它调用仍走一次性核心确认。
-              if (context.isExecutionApproved()) return true;
-              return await confirmCorePatch(
-                extensionContext,
-                context.task,
-                paths,
-                changedLines,
-              );
-            },
             beforePatch: async () => {
               // 已有复现时必须保留最初检查点，绝不能在症状发生后重新覆盖起点。
               await driver?.ensureReproductionCheckpoint();
@@ -213,7 +282,7 @@ export function registerEditTool(
           progress.line("补丁完成：" + result.paths.join(", "));
           return {
             content: [{
-              type: "text",
+              type: "text" as const,
               text: [
                 "已在 detached worktree 修改：" + result.paths.join(", "),
                 "正式游戏仓库尚未变化。",
@@ -226,8 +295,38 @@ export function registerEditTool(
             }],
             details,
           };
-        },
-      );
+          },
+        );
+        const afterHash = await hashWorktree(context.task.worktreeRoot);
+        const changed = afterHash !== beforeHash;
+        if (changed) context.setRefreshFailure(null);
+        await recordWriteOutcome(
+          context,
+          changed ? "mutated" : "noop",
+          afterHash,
+          changed ? "worktree-mutated" : "worktree-unchanged",
+        );
+        return response;
+      } catch (error) {
+        const afterHash = await hashWorktree(context.task.worktreeRoot);
+        const changed = afterHash !== beforeHash;
+        if (changed) {
+          context.setRefreshFailure(
+            "edit 已写入，但右侧刷新重放未通过：" + safeFailure(error),
+          );
+        }
+        await recordWriteOutcome(
+          context,
+          error instanceof EditAuthorizationError
+            ? "rejected"
+            : changed ? "mutated_replay_failed" : "failed",
+          afterHash,
+          error instanceof EditAuthorizationError
+            ? error.reasonCode
+            : changed ? "refresh-replay-failed" : "tool-execution-failed",
+        );
+        throw error;
+      }
     },
   });
 }
