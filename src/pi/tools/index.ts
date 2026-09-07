@@ -38,6 +38,10 @@ export interface MaintainerToolContext {
   completeExecution(): void;
   /** 当前 Agent 运行是否已经获得总方案执行授权。 */
   isExecutionApproved(): boolean;
+  /** edit 写入后的刷新失败状态；成功写入会清除旧失败。 */
+  setRefreshFailure(failure: string | null): void;
+  /** check/publish/result 之前拒绝尚未修复的刷新失败。 */
+  assertVerificationReady(): void;
   /** 当前自然语言请求是否明确要求落地修复。 */
   repairRequested(): boolean;
   /** 对当前 worktree 运行直接改动检查、重放和隐藏断言。 */

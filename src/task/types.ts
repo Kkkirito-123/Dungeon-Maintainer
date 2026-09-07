@@ -1,7 +1,7 @@
 /**
  * 维护任务的持久化契约。
  *
- * 这里定义 schema v4 的任务身份、状态机、写入权限和最终验证凭据，不执行文件、Git、
+ * 这里定义 schema v5 的任务身份、状态机、写入权限和最终验证凭据，不执行文件、Git、
  * 浏览器或模型操作。普通检查、复现、诊断和结论已经迁入 EvidenceStore，避免 task.json
  * 与 evidence.jsonl 同时维护两套事实。修改 schema 必须同步 TaskStore 读取校验与测试。
  */
@@ -58,9 +58,9 @@ export interface VerificationRecord {
   verifiedAt: string;
 }
 
-/** schema v4 的唯一任务记录。 */
+/** schema v5 的唯一任务记录。 */
 export interface TaskRecord {
-  schemaVersion: 4;
+  schemaVersion: 5;
   id: string;
   /** 用户可读的任务名称；不影响 taskId、Git worktree 或 Pi session 绑定。 */
   displayName: string;

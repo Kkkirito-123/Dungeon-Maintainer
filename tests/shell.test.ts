@@ -6,6 +6,7 @@ import { loadConfig } from "../src/config.js";
 import { EvidenceStore } from "../src/evidence/store.js";
 import { checkEvidence } from "../src/evidence/projector.js";
 import { startShellServer } from "../src/shell/server.js";
+import type { ShellCoreEvent } from "../src/shell/protocol.js";
 import { TaskStore } from "../src/task/store.js";
 import { INITIAL_TASK_OBJECTIVE } from "../src/task/types.js";
 import { createTemporaryGitRepository, runTestGit } from "./testSupport.js";
@@ -546,7 +547,7 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
         sendPiCommand: async (command) => {
           commands.push(command);
           if (command.type === "set_thinking_level") {
-            thinkingLevel = String(command.level);
+            thinkingLevel = command.level;
             return undefined;
           }
           if (command.type === "compact") {
@@ -641,27 +642,25 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
     }
   });
 
-  it("自然语言输入超出安全线时先同步压缩，压缩后仍超限则不发送 prompt", async () => {
+  it("自然语言输入直接交给 Pi，由原生自动压缩处理上下文上限", async () => {
     const repository = await createTemporaryGitRepository({ "README.md": "token control\n" });
     try {
       const dataDir = join(repository.temporaryRoot, "data");
       const store = new TaskStore(dataDir);
       const task = await store.create({
-        id: "shell-token-control",
+        id: "shell-context-display",
         objective: INITIAL_TASK_OBJECTIVE,
         repoRoot: repository.repoRoot,
         baseHead: repository.baseHead,
         worktreeRoot: repository.repoRoot,
-        piSessionDir: join(store.taskDir("shell-token-control"), "pi"),
+        piSessionDir: join(store.taskDir("shell-context-display"), "pi"),
       });
       const commands: Array<Record<string, unknown>> = [];
-      let contextTokens = 50_000;
-      let compactedTokens = 12_000;
       const sessionStats = () => ({
         contextUsage: {
-          tokens: contextTokens,
+          tokens: 50_000,
           contextWindow: 64_000,
-          percent: contextTokens / 640,
+          percent: 78.125,
         },
       });
       const shell = await startShellServer({
@@ -672,11 +671,6 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
         store,
         sendPiCommand: async (command) => {
           commands.push(command);
-          if (command.type === "get_session_stats") return sessionStats();
-          if (command.type === "compact") {
-            contextTokens = compactedTokens;
-            return { estimatedTokensAfter: compactedTokens };
-          }
           return undefined;
         },
         onClose: async () => undefined,
@@ -689,26 +683,17 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
           body: JSON.stringify({ text: "继续定位" }),
         });
         assert.equal(accepted.status, 200);
-        assert.deepEqual(
-          commands.map((command) => command.type),
-          ["get_session_stats", "compact", "get_session_stats", "prompt"],
-        );
+        assert.deepEqual(commands.map((command) => command.type), ["prompt"]);
 
         shell.handlePiEvent({ type: "agent_settled" });
-        contextTokens = 50_000;
-        compactedTokens = 50_000;
         shell.updateSessionStats(sessionStats());
-        const blocked = await fetch(shell.url.replace("/?", "/api/input?"), {
+        const acceptedAgain = await fetch(shell.url.replace("/?", "/api/input?"), {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ text: "继续定位" }),
         });
-        assert.equal(blocked.status, 409);
-        assert.match(
-          (await blocked.json() as { error: string }).error,
-          /压缩后仍预计使用/u,
-        );
-        assert.equal(commands.filter((command) => command.type === "prompt").length, 1);
+        assert.equal(acceptedAgain.status, 200);
+        assert.equal(commands.filter((command) => command.type === "prompt").length, 2);
       } finally {
         await shell.close();
       }
@@ -989,7 +974,7 @@ describe("统一 Chromium Shell HTTP/SSE 边界", () => {
       const commands: Array<Record<string, unknown>> = [];
       const editorText = "diff --git a/game.ts b/game.ts\n+fixed";
       let resolveDiffCommand: ((value: unknown) => void) | null = null;
-      let emitPiEvent: (event: unknown) => void = () => undefined;
+      let emitPiEvent: (event: ShellCoreEvent) => void = () => undefined;
       const shell = await startShellServer({
         task,
         model: config.model,

@@ -34,6 +34,7 @@ export interface PublishToolContext {
   task: TaskRecord;
   store: TaskStore;
   evidence: EvidenceStore;
+  assertVerificationReady(): void;
 }
 
 /**
@@ -73,6 +74,7 @@ export function registerPublishTool(
         "publish",
         undefined,
         async (progress) => {
+          context.assertVerificationReady();
           const result = await publishTask({
             task: context.task,
             store: context.store,

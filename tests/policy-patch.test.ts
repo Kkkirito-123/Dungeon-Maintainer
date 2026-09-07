@@ -6,11 +6,9 @@ import { TaskStore } from "../src/task/store.js";
 import { hashFile } from "../src/workspace/git.js";
 import {
   applyPrecisePatch,
-  isCorePath,
 } from "../src/workspace/patch.js";
 import {
   classifyPath,
-  decidePatch,
   normalizeProjectPath,
   resolveProjectPath,
 } from "../src/workspace/policy.js";
@@ -32,10 +30,9 @@ describe("项目路径和真实路径边界", () => {
     assert.equal(classifyPath("game/node_modules/pkg/index.js", "read"), "denied");
     assert.equal(classifyPath(".env", "write"), "denied");
     assert.equal(classifyPath("LICENSE", "write"), "denied");
-    assert.equal(classifyPath("game/src/presentation/view.ts", "write"), "auto");
-    assert.equal(classifyPath("game/src/domain/session.ts", "write"), "core");
-    assert.equal(isCorePath("game/src/devtools/dungeon-agent/bridge.ts"), true);
-    assert.deepEqual(decidePatch(["game/tests/view.test.ts"]).kind, "allow");
+    assert.equal(classifyPath("game/src/presentation/view.ts", "write"), "allowed");
+    assert.equal(classifyPath("game/src/domain/session.ts", "write"), "allowed");
+    assert.equal(classifyPath("game/src/devtools/dungeon-agent/bridge.ts", "write"), "allowed");
   });
 
   it("realpath 检查阻止仓库内 junction 指向仓库外", async () => {
@@ -79,8 +76,8 @@ describe("项目路径和真实路径边界", () => {
   });
 });
 
-describe("baseHash 精确补丁与一次性核心审批", () => {
-  it("拒绝审批时不写任何字节，批准后只修改 detached worktree", async () => {
+describe("baseHash 精确补丁与上层授权", () => {
+  it("已授权补丁只修改 detached worktree", async () => {
     const repository = await createTemporaryGitRepository({
       "game/src/domain/core.ts": "export const coreValue = 1;\n",
       "game/src/presentation/view.ts": "export const viewValue = 1;\n",
@@ -117,28 +114,9 @@ describe("baseHash 精确补丁与一次性核心审批", () => {
         newText: "export const coreValue = 2;",
       };
 
-      await assert.rejects(applyPrecisePatch({
-        task,
-        store,
-        confirmCore: async () => false,
-        beforePatch: async () => { checkpointCalls += 1; },
-        afterPatch: async () => { replayCalls += 1; },
-      }, { edits: [edit] }), /用户拒绝/u);
-      assert.equal(
-        await readTestFile(join(worktreeRoot, path)),
-        "export const coreValue = 1;\n",
-      );
-      assert.equal(checkpointCalls, 0);
-      assert.equal(replayCalls, 0);
-
       const result = await applyPrecisePatch({
         task,
         store,
-        confirmCore: async (paths, changedLines) => {
-          assert.deepEqual(paths, [path]);
-          assert.equal(changedLines, 2);
-          return true;
-        },
         beforePatch: async () => { checkpointCalls += 1; },
         afterPatch: async () => { replayCalls += 1; },
       }, { edits: [edit] });
@@ -146,7 +124,6 @@ describe("baseHash 精确补丁与一次性核心审批", () => {
       assert.deepEqual(result.paths, [path]);
       assert.equal(checkpointCalls, 1);
       assert.equal(replayCalls, 1);
-      assert.ok(task.approval?.usedAt);
       assert.equal(
         await readTestFile(join(worktreeRoot, path)),
         "export const coreValue = 2;\n",
@@ -203,7 +180,6 @@ describe("baseHash 精确补丁与一次性核心审批", () => {
       const context = {
         task,
         store,
-        confirmCore: async () => true,
         beforePatch: async () => { beforePatchCalled = true; },
         afterPatch: async () => undefined,
       };
@@ -283,7 +259,6 @@ describe("baseHash 精确补丁与一次性核心审批", () => {
       const context = {
         task,
         store,
-        confirmCore: async () => true,
         beforePatch: async () => undefined,
         afterPatch: async () => undefined,
       };

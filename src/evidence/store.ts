@@ -9,6 +9,8 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
+import { Type } from "typebox";
+import { Value } from "typebox/value";
 import { redactText } from "../logging/redact.js";
 import type { TaskRecord } from "../task/types.js";
 import type {
@@ -48,107 +50,45 @@ function safeArtifactText(value: string): { text: string; reusable: boolean } {
   return { text, reusable };
 }
 
-const EVIDENCE_RECORD_KEYS = [
-  "schemaVersion",
-  "id",
-  "taskId",
-  "kind",
-  "actionKey",
-  "fingerprint",
-  "actionAliases",
-  "status",
-  "summary",
-  "artifactRef",
-  "path",
-  "startLine",
-  "lineCount",
-  "baseHash",
-  "worktreeHash",
-  "validityKey",
-  "links",
-  "metadata",
-  "createdAt",
-] as const;
+const NullableString = Type.Union([Type.String(), Type.Null()]);
+const NullableInteger = (minimum: number) => Type.Union([
+  Type.Integer({ minimum }),
+  Type.Null(),
+]);
 
-function hasExactKeys(
-  value: Record<string, unknown>,
-  keys: readonly string[],
-): boolean {
-  return Object.keys(value).length === keys.length
-    && keys.every((key) => Object.hasOwn(value, key));
-}
-
-function isNullableString(value: unknown): value is string | null {
-  return value === null || typeof value === "string";
-}
-
-function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((item) => typeof item === "string");
-}
-
-function isMetadata(value: unknown): boolean {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  return Object.values(value).every((item) => (
-    item === null
-    || typeof item === "string"
-    || typeof item === "number"
-    || typeof item === "boolean"
-  ));
-}
+/** evidence.jsonl 每一行的唯一合法结构。 */
+export const EvidenceRecordSchema = Type.Object({
+  schemaVersion: Type.Literal(1),
+  id: Type.String(),
+  taskId: Type.String(),
+  kind: Type.Union([
+    Type.Literal("source"), Type.Literal("game"), Type.Literal("check"),
+    Type.Literal("reproduction"), Type.Literal("claim"), Type.Literal("change"),
+    Type.Literal("verification"),
+  ]),
+  actionKey: NullableString,
+  fingerprint: Type.String(),
+  actionAliases: Type.Array(Type.String()),
+  status: Type.Union([
+    Type.Literal("active"), Type.Literal("stale"), Type.Literal("superseded"),
+  ]),
+  summary: Type.String(),
+  artifactRef: NullableString,
+  path: NullableString,
+  startLine: NullableInteger(1),
+  lineCount: NullableInteger(0),
+  baseHash: NullableString,
+  worktreeHash: NullableString,
+  validityKey: Type.String(),
+  links: Type.Array(Type.String()),
+  metadata: Type.Record(Type.String(), Type.Union([
+    Type.String(), Type.Number(), Type.Boolean(), Type.Null(),
+  ])),
+  createdAt: Type.String(),
+}, { additionalProperties: false });
 
 function validRecord(value: unknown): value is EvidenceRecord {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const record = value as Record<string, unknown>;
-  return hasExactKeys(record, EVIDENCE_RECORD_KEYS)
-    && record.schemaVersion === 1
-    && typeof record.id === "string"
-    && typeof record.taskId === "string"
-    && (
-      record.kind === "source"
-      || record.kind === "game"
-      || record.kind === "check"
-      || record.kind === "reproduction"
-      || record.kind === "claim"
-      || record.kind === "change"
-      || record.kind === "verification"
-    )
-    && isNullableString(record.actionKey)
-    && typeof record.fingerprint === "string"
-    && isStringArray(record.actionAliases)
-    && (
-      record.status === "active"
-      || record.status === "stale"
-      || record.status === "superseded"
-    )
-    && typeof record.summary === "string"
-    && isNullableString(record.artifactRef)
-    && isNullableString(record.path)
-    && (
-      record.startLine === null
-      || (Number.isInteger(record.startLine) && (record.startLine as number) >= 1)
-    )
-    && (
-      record.lineCount === null
-      || (Number.isInteger(record.lineCount) && (record.lineCount as number) >= 0)
-    )
-    && isNullableString(record.baseHash)
-    && isNullableString(record.worktreeHash)
-    && typeof record.validityKey === "string"
-    && isStringArray(record.links)
-    && isMetadata(record.metadata)
-    && typeof record.createdAt === "string";
-}
-
-function semanticIndexKey(
-  kind: EvidenceRecord["kind"],
-  fingerprint: string,
-  validityKey: string,
-): string {
-  return [kind, fingerprint, validityKey].join("\0");
-}
-
-function actionIndexKey(actionKey: string, validityKey: string): string {
-  return actionKey + "\0" + validityKey;
+  return Value.Check(EvidenceRecordSchema, value);
 }
 
 function recordActionKeys(record: EvidenceRecord): string[] {
@@ -199,9 +139,6 @@ export class EvidenceStore {
   private records = new Map<string, EvidenceRecord>();
   /** 同一 ID 最后一条 JSONL 快照对应的单调账本序号。 */
   private recordRevisions = new Map<string, number>();
-  private actionIndex = new Map<string, string>();
-  /** 同一 kind、fingerprint 和有效版本下的 active 事实索引。 */
-  private fingerprintIndex = new Map<string, string>();
   private loaded = false;
   private loadPromise: Promise<void> | null = null;
   private currentRevision = 0;
@@ -229,21 +166,6 @@ export class EvidenceStore {
     return join(this.taskDirectory(), "evidence.jsonl");
   }
 
-  private rebuildIndexes(): void {
-    this.actionIndex.clear();
-    this.fingerprintIndex.clear();
-    for (const record of this.records.values()) {
-      if (record.status !== "active") continue;
-      this.fingerprintIndex.set(
-        semanticIndexKey(record.kind, record.fingerprint, record.validityKey),
-        record.id,
-      );
-      for (const actionKey of recordActionKeys(record)) {
-        this.actionIndex.set(actionIndexKey(actionKey, record.validityKey), record.id);
-      }
-    }
-  }
-
   private async serializeMutation<T>(operation: () => Promise<T>): Promise<T> {
     const pending = this.mutationBarrier.then(operation);
     this.mutationBarrier = pending.then(() => undefined, () => undefined);
@@ -266,7 +188,6 @@ export class EvidenceStore {
       }
       // revision 表示追加事件数，不是唯一证据 ID 数；状态失效也必须占一个序号。
       this.currentRevision = records.length;
-      this.rebuildIndexes();
       this.loaded = true;
     })();
     try {
@@ -287,7 +208,6 @@ export class EvidenceStore {
     this.records.set(record.id, record);
     this.currentRevision += 1;
     this.recordRevisions.set(record.id, this.currentRevision);
-    this.rebuildIndexes();
   }
 
   private recordId(candidate: EvidenceCandidate): string {
@@ -300,13 +220,12 @@ export class EvidenceStore {
   }
 
   private activeBySemantic(candidate: EvidenceCandidate): EvidenceRecord | null {
-    const id = this.fingerprintIndex.get(semanticIndexKey(
-      candidate.kind,
-      candidate.fingerprint,
-      candidate.validityKey,
-    ));
-    const record = id ? this.records.get(id) ?? null : null;
-    return record?.status === "active" ? record : null;
+    return [...this.records.values()].find((record) => (
+      record.status === "active"
+      && record.kind === candidate.kind
+      && record.fingerprint === candidate.fingerprint
+      && record.validityKey === candidate.validityKey
+    )) ?? null;
   }
 
   private async addActionAlias(
@@ -424,8 +343,11 @@ export class EvidenceStore {
   /** 查询相同动作在相同有效版本下的 active 证据。 */
   async findReusable(actionKey: string, validityKey: string): Promise<EvidenceRecord | null> {
     await this.load();
-    const id = this.actionIndex.get(actionIndexKey(actionKey, validityKey));
-    return id ? this.records.get(id) ?? null : null;
+    return [...this.records.values()].find((record) => (
+      record.status === "active"
+      && record.validityKey === validityKey
+      && recordActionKeys(record).includes(actionKey)
+    )) ?? null;
   }
 
   /** 查询相同 kind、结果指纹和有效版本下的 active 证据。 */
@@ -435,8 +357,12 @@ export class EvidenceStore {
     validityKey: string,
   ): Promise<EvidenceRecord | null> {
     await this.load();
-    const id = this.fingerprintIndex.get(semanticIndexKey(kind, fingerprint, validityKey));
-    return id ? this.records.get(id) ?? null : null;
+    return [...this.records.values()].find((record) => (
+      record.status === "active"
+      && record.kind === kind
+      && record.fingerprint === fingerprint
+      && record.validityKey === validityKey
+    )) ?? null;
   }
 
   async get(id: string): Promise<EvidenceRecord | null> {

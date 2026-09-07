@@ -12,10 +12,21 @@
 import { createInterface, type Interface } from "node:readline";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import type { AgentRpcCommand } from "../agent/rpc.js";
+import type {
+  JsonAgentSessionEvent,
+  RpcCommand,
+  RpcExtensionUIRequest,
+  RpcExtensionUIResponse,
+} from "@earendil-works/pi-coding-agent";
+
+export type PiRpcCommand = RpcCommand | RpcExtensionUIResponse;
+export type PiRpcEvent = JsonAgentSessionEvent
+  | RpcExtensionUIRequest
+  | { type: "extension_error"; extensionPath?: string; event?: string; error?: string }
+  | { type: "pi_first_session" | "pi_warning" | "pi_stderr" | "pi_protocol_error" };
 
 /** RPC 进程事件回调。 */
-export type PiRpcEventListener = (event: unknown) => void;
+export type PiRpcEventListener = (event: PiRpcEvent) => void;
 
 /** Pi RPC 子进程运行句柄。 */
 export class PiRpcProcess {
@@ -71,7 +82,7 @@ export class PiRpcProcess {
   }
 
   /** 向 Pi 发送 JSONL 命令，并等待对应 response。 */
-  async send(command: AgentRpcCommand): Promise<unknown> {
+  async send(command: RpcCommand): Promise<unknown> {
     const child = this.child;
     if (!child || !child.stdin.writable) throw new Error("Pi RPC 进程尚未就绪");
     const id = typeof command.id === "string" ? command.id : randomUUID();
@@ -88,10 +99,10 @@ export class PiRpcProcess {
   }
 
   /** 向 Pi 回复 Extension UI 请求，不等待 response。 */
-  respond(response: Record<string, unknown>): void {
+  respond(response: RpcExtensionUIResponse): void {
     const child = this.child;
     if (!child || !child.stdin.writable) throw new Error("Pi RPC 进程尚未就绪");
-    child.stdin.write(JSON.stringify({ type: "extension_ui_response", ...response }) + "\n", "utf8");
+    child.stdin.write(JSON.stringify(response) + "\n", "utf8");
   }
 
   /** 等待 Pi 进程结束。 */
@@ -161,6 +172,10 @@ export class PiRpcProcess {
       else pending.reject(new Error(typeof record.error === "string" ? record.error : "Pi RPC 请求失败"));
       return;
     }
-    this.onEvent(value);
+    if (typeof record.type !== "string") {
+      this.onEvent({ type: "pi_protocol_error" });
+      return;
+    }
+    this.onEvent(record as PiRpcEvent);
   }
 }
